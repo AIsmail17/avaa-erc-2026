@@ -203,6 +203,22 @@ ros2 topic pub --once /torso_controller/joint_trajectory trajectory_msgs/msg/Joi
 
 The robot URDF is generated from PAL's xacro sources with Gazebo Harmonic patches applied and saved to `src/erc_description/urdf/tiago_pro.urdf` which is accessible on the host for inspection. Because the workspace is built with `--symlink-install`, the URDF is picked up immediately when created with no rebuild required.
 
+## Reporting issues
+
+If you notice a bug, an error in the documentation, or anything in the code that needs changing, please submit an issue on the repository rather than reporting it elsewhere. This keeps all known issues visible and traceable for both participants and organisers.
+
+<img src="docs/assets/issue_submission.png" width="500"/>
+
+1. In the "Title" field, type a title for your issue.
+2. In the comment body field, type a description of your issue. To cross-reference a related discussion, paste the discussion's URL into the issue description.
+
+Before opening a new issue, search existing issues to check whether it has already been reported. When describing your issue, include:
+
+- Steps to reproduce the problem
+- Expected vs. actual behaviour
+- Relevant terminal output or logs
+- Your host environment (OS, GPU, `ROS_DOMAIN_ID` if changed from default)
+
 ## Troubleshooting
 
 **CycloneDDS serialization warnings** (`serdata.cpp` errors about null-terminated strings) — these are harmless noise from large message serialization. They don't affect functionality.
