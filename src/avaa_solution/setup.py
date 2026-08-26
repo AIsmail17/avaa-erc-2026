@@ -16,6 +16,7 @@ setup(
         # Without this the launch file is not installed and
         # `ros2 launch avaa_solution solution.launch.py` fails with "file not found".
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
+        (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
