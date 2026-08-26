@@ -11,6 +11,7 @@ because publishing a wrong column or row is worse than publishing nothing.
 """
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Int32
 
@@ -78,7 +79,8 @@ def main(args=None) -> None:
     node = MissionNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # Ordinary shutdown (Ctrl-C, or SIGTERM from `ros2 launch`), not a fault.
         pass
     finally:
         node.destroy_node()

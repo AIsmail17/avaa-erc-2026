@@ -8,6 +8,7 @@ package_name = "avaa_solution"
 setup(
     name=package_name,
     version="0.1.0",
+    # find_packages picks up avaa_solution and avaa_solution.vision.
     packages=find_packages(exclude=["test"]),
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
@@ -26,6 +27,7 @@ setup(
     entry_points={
         "console_scripts": [
             "mission = avaa_solution.mission_node:main",
+            "perception = avaa_solution.perception_node:main",
         ],
     },
 )
