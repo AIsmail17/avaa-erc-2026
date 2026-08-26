@@ -163,6 +163,11 @@ def group_by_anchors(books: Sequence[Book], anchor_xs: Sequence[float],
             spacings = [abs(b - a) for a, b in zip(sorted(anchor_xs), sorted(anchor_xs)[1:])]
             max_dx = 0.5 * float(np.median(spacings))
         else:
+            # A single anchor gives no spacing to measure. An unbounded radius would sweep
+            # every book in the frame into that one column -- observed as
+            # "column 0 shows 12 of 4 books" once the robot drove close enough that only
+            # one marker remained in view. The caller should pass a scale-derived max_dx
+            # (see column_max_dx); this is only a last resort.
             max_dx = float("inf")
 
     for book in books:

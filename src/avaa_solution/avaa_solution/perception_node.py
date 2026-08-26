@@ -19,13 +19,14 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 import cv2
+import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image
-from std_msgs.msg import Int32
+from std_msgs.msg import Float32, Int32
 from vision_msgs.msg import (
     BoundingBox2D,
     Detection2D,
@@ -40,6 +41,7 @@ TOPIC_RGB = "/head_front_camera/head_front_camera/color/image_raw"
 TOPIC_DETECTIONS = "/avaa/perception/books"
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_TARGET_COLUMN = "/avaa/perception/target_column"
+TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
 
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
@@ -87,6 +89,7 @@ class PerceptionNode(Node):
         self.pub_detections = self.create_publisher(Detection2DArray, TOPIC_DETECTIONS, 10)
         self.pub_row = self.create_publisher(Int32, TOPIC_TARGET_ROW, 10)
         self.pub_column = self.create_publisher(Int32, TOPIC_TARGET_COLUMN, 10)
+        self.pub_column_x = self.create_publisher(Float32, TOPIC_TARGET_COLUMN_X, 10)
 
         self.create_timer(float(self.get_parameter("detect_period_sec").value), self._process)
 
@@ -125,7 +128,9 @@ class PerceptionNode(Node):
             # The markers define the columns. Falling back to gap clustering only when
             # none are visible, since that cannot identify a target column anyway.
             if markers:
-                columns = bd.group_by_anchors(books, [m.cx for m in markers])
+                columns = bd.group_by_anchors(
+                    books, [m.cx for m in markers], column_max_dx(markers)
+                )
             else:
                 columns = bd.group_into_columns(books)
         except Exception as exc:  # noqa: BLE001
@@ -145,6 +150,15 @@ class PerceptionNode(Node):
             )
             self.reported_column = column_index
         self.pub_column.publish(Int32(data=column_index))
+
+        # Where the target column sits in the image, for the approach controller.
+        #
+        # The index above is frame-relative: it counts the columns currently in view, so
+        # it changes as markers enter and leave the frame -- observed jumping 1, 2, 1, 0
+        # across consecutive frames while the robot drove. Anything downstream that
+        # treated it as the column's identity ended up tracking a different column each
+        # frame. The marker's image x is the stable thing to servo on.
+        self.pub_column_x.publish(Float32(data=float(markers[column_index].cx)))
         self._save_column_image(frame, books, columns, markers, column_index)
 
         if not self.book_colour:
@@ -260,6 +274,27 @@ class PerceptionNode(Node):
 
 
 # ---------------------------------------------------------------------- pure helpers
+
+
+def column_max_dx(markers: List[mr.Marker]) -> float:
+    """How far from its marker a book may sit and still belong to that column, in pixels.
+
+    With two or more markers the spacing between them measures a column directly. With
+    only one -- which happens as soon as the robot is close enough that the others leave
+    the frame -- there is no spacing to measure, so the marker's own apparent width
+    provides the scale instead.
+
+    The marker plate is 0.30 m wide and a shelf column is 1.05 m, so a column is 3.5
+    marker-widths across and half of that is the radius wanted. Being a ratio of two
+    lengths in the same image, it holds at any distance.
+    """
+    if len(markers) >= 2:
+        xs = sorted(m.cx for m in markers)
+        spacings = [b - a for a, b in zip(xs, xs[1:])]
+        return 0.5 * float(np.median(spacings))
+    if markers:
+        return 1.75 * float(markers[0].w)
+    return float("inf")
 
 
 def column_bbox(column: List[bd.Book],

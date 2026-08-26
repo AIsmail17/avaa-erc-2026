@@ -28,6 +28,7 @@ setup(
     entry_points={
         "console_scripts": [
             "mission = avaa_solution.mission_node:main",
+            "approach = avaa_solution.approach_node:main",
             "perception = avaa_solution.perception_node:main",
         ],
     },

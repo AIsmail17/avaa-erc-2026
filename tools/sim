@@ -28,7 +28,11 @@ container_running() {
 }
 
 sim_running() {
-    docker exec "$CONTAINER" pgrep -f '[g]z sim server' >/dev/null 2>&1
+    # Two shapes to match. With the GUI, Gazebo forks a process literally named
+    # "gz sim server". Headless, there is no such fork -- it is a single "gz sim -r -s".
+    # Matching only the first made a healthy headless simulation look dead.
+    docker exec "$CONTAINER" pgrep -f '[g]z sim server' >/dev/null 2>&1 && return 0
+    docker exec "$CONTAINER" pgrep -f '[g]z sim -r -s' >/dev/null 2>&1
 }
 
 # A launch that has been issued but whose Gazebo has not appeared yet. Checking only for
@@ -96,13 +100,34 @@ cmd_start() {
     stop_orphans
 
     local launch_args=""
-    if [ "${1:-}" = "--fast" ]; then
-        # depth_to_cloud rebuilds the point cloud from the depth image and costs about a
-        # full core. Perception currently uses RGB only, so for development this is pure
-        # overhead. Leave it enabled for scored runs if manipulation needs the cloud.
-        launch_args="depth_cloud:=false"
-        ylw "Fast mode: depth point cloud disabled."
-    fi
+    local want_window=1
+    for arg in "$@"; do
+        case "$arg" in
+            --fast)
+                # depth_to_cloud rebuilds the point cloud from the depth image and costs
+                # about a full core. Perception currently uses RGB only, so for
+                # development this is pure overhead. Leave it enabled for scored runs if
+                # manipulation needs the cloud.
+                launch_args="$launch_args depth_cloud:=false"
+                ylw "Fast mode: depth point cloud disabled."
+                ;;
+            --headless)
+                # No Gazebo GUI. Worth knowing why this exists: the GUI's Qt/GLX OpenGL
+                # context is what dies when WSL drops the virtual GPU
+                # ("D3D12: Removing Device" followed by a fallback to swrast and an
+                # abort). The server keeps rendering camera images through EGL, so
+                # perception still works. It also frees the ~120% CPU the GUI uses.
+                # Use the GUI for recording the deliverable video, headless for
+                # development.
+                launch_args="$launch_args headless:=true"
+                want_window=0
+                ylw "Headless: no Gazebo window."
+                ;;
+            *)
+                ylw "Ignoring unknown option: $arg"
+                ;;
+        esac
+    done
 
     ylw "Launching Gazebo..."
     docker exec -d "$CONTAINER" /entrypoint.sh bash -c \
@@ -116,6 +141,9 @@ cmd_start() {
         return 1
     fi
     grn "Gazebo is running."
+    if [ "$want_window" -eq 0 ]; then
+        return 0
+    fi
     # WSLg maps the window minimized when Gazebo is launched from a detached
     # process, and the taskbar button does not reliably restore it. Un-minimize
     # it from the Windows side.
@@ -161,8 +189,13 @@ stop_orphans() {
 
 cmd_stop() {
     container_running || { ylw "Container is not running."; return 0; }
-    if ! sim_running; then
-        ylw "Simulation was not running."
+    if ! sim_running && ! sim_launching; then
+        # Still sweep up strays. A launch whose Gazebo crashed leaves the launch process
+        # and its bridge children alive, and the next 'sim start' then refuses to run
+        # because it sees a launch already in progress.
+        ylw "Simulation was not running (clearing any strays)."
+        docker exec "$CONTAINER" pkill -f '[r]os2 launch erc_bringup' >/dev/null 2>&1
+        stop_orphans
         return 0
     fi
     # SIGTERM first so Gazebo shuts down cleanly. It can take several seconds,
