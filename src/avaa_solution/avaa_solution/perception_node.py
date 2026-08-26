@@ -22,11 +22,15 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
+from geometry_msgs.msg import PointStamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32, Int32
+from tf2_ros import Buffer, TransformListener
+
+from avaa_solution.vision import depth_locator as dl
 from vision_msgs.msg import (
     BoundingBox2D,
     Detection2D,
@@ -40,8 +44,14 @@ from avaa_solution.vision import marker_reader as mr
 TOPIC_RGB = "/head_front_camera/head_front_camera/color/image_raw"
 TOPIC_DETECTIONS = "/avaa/perception/books"
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
+TOPIC_DEPTH = "/head_front_camera/head_front_camera/depth/image_rect_raw"
+TOPIC_DEPTH_INFO = "/head_front_camera/head_front_camera/depth/camera_info"
 TOPIC_TARGET_COLUMN = "/avaa/perception/target_column"
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
+TOPIC_TARGET_BOOK_POINT = "/avaa/perception/target_book_point"
+
+# Where the grasp controller wants the book expressed.
+GRASP_FRAME = "base_link"
 
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
@@ -85,7 +95,17 @@ class PerceptionNode(Node):
         if self.save_images:
             os.makedirs(self.image_dir, exist_ok=True)
 
+        self.depth_image = None
+        self.intrinsics: Optional[dl.Intrinsics] = None
+        self.depth_frame: Optional[str] = None
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         self.create_subscription(Image, TOPIC_RGB, self._on_image, SENSOR_QOS)
+        self.create_subscription(Image, TOPIC_DEPTH, self._on_depth, SENSOR_QOS)
+        self.create_subscription(CameraInfo, TOPIC_DEPTH_INFO, self._on_info, SENSOR_QOS)
+        self.pub_book_point = self.create_publisher(
+            PointStamped, TOPIC_TARGET_BOOK_POINT, 10)
         self.pub_detections = self.create_publisher(Detection2DArray, TOPIC_DETECTIONS, 10)
         self.pub_row = self.create_publisher(Int32, TOPIC_TARGET_ROW, 10)
         self.pub_column = self.create_publisher(Int32, TOPIC_TARGET_COLUMN, 10)
@@ -116,6 +136,56 @@ class PerceptionNode(Node):
             self.latest_header = msg.header
         except Exception as exc:  # noqa: BLE001 - a bad frame must not kill the node
             self.get_logger().warn(f"could not convert frame: {exc}")
+
+    def _on_depth(self, msg: Image) -> None:
+        try:
+            # 32FC1, metres. passthrough keeps the float values as they are.
+            self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            self.depth_frame = msg.header.frame_id
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"could not convert depth frame: {exc}")
+
+    def _on_info(self, msg: CameraInfo) -> None:
+        if self.intrinsics is None:
+            self.intrinsics = dl.Intrinsics.from_k(msg.k)
+            self.get_logger().info(
+                f"depth intrinsics: fx={self.intrinsics.fx:.1f} "
+                f"cx={self.intrinsics.cx:.1f} cy={self.intrinsics.cy:.1f}"
+            )
+
+    def _publish_book_point(self, target: bd.Book) -> None:
+        """Publish the target book's 3D position in base_link, for the grasp controller.
+
+        The RGB and depth streams share intrinsics and dimensions exactly, so the box
+        found in colour indexes the depth image directly.
+        """
+        if self.depth_image is None or self.intrinsics is None or self.depth_frame is None:
+            return
+        point_optical = dl.locate(target.bbox, self.depth_image, self.intrinsics)
+        if point_optical is None:
+            self.get_logger().warn(
+                "no usable depth over the target book", throttle_duration_sec=5.0
+            )
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                GRASP_FRAME, self.depth_frame, rclpy.time.Time()
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                f"no transform {self.depth_frame} -> {GRASP_FRAME}: {exc}",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        point = dl.transform_point(
+            point_optical, tf.transform.rotation, tf.transform.translation
+        )
+        msg = PointStamped()
+        msg.header.frame_id = GRASP_FRAME
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.point.x, msg.point.y, msg.point.z = (float(v) for v in point)
+        self.pub_book_point.publish(msg)
 
     def _process(self) -> None:
         if self.latest_frame is None:
@@ -178,6 +248,7 @@ class PerceptionNode(Node):
 
         target = bd.find_book(columns, column_index, self.book_colour)
         if target is not None:
+            self._publish_book_point(target)
             self._save_book_image(frame, books, target, row)
 
     # ------------------------------------------------------------------ helpers
