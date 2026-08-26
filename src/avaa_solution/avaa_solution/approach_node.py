@@ -32,7 +32,15 @@ from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReli
 from sensor_msgs.msg import LaserScan
 from builtin_interfaces.msg import Duration
 from std_msgs.msg import Float32, String
+from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+BASE_FRAME = "base_footprint"
+
+# Scan returns inside this radius of base_footprint are the robot itself, not obstacles.
+# The base is 0.717 x 0.497 m, so its circumscribed radius is 0.437 m; this sits just
+# outside that.
+SELF_FILTER_RADIUS = 0.45
 
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
@@ -78,9 +86,13 @@ class ApproachNode(Node):
     def __init__(self) -> None:
         super().__init__("avaa_approach")
 
-        # Distance from the shelf face to stop at. The books sit at X=2.90 and the shelf
-        # unit is centred at X=3.0 and 0.30 m deep, so the face is at about 2.85.
-        self.declare_parameter("standoff_m", 0.60)
+        # Distance to stop at, measured from base_footprint -- not from the laser, which
+        # sits 0.275 m further forward. The base is 0.717 m long, so 0.75 m from the
+        # origin leaves about 0.39 m of clearance ahead of the bumper.
+        #
+        # Provisional. The right value is whatever puts the books inside the arm's working
+        # envelope, which cannot be settled until grasping exists.
+        self.declare_parameter("standoff_m", 0.75)
         self.declare_parameter("centre_tolerance_px", 12.0)
         self.declare_parameter("standoff_tolerance_m", 0.05)
         self.declare_parameter("square_tolerance_rad", 0.05)
@@ -88,7 +100,9 @@ class ApproachNode(Node):
         self.declare_parameter("max_forward", 0.22)
         # Refuse to drive closer than this whatever the standoff says, so a bad reading
         # cannot push the base into the shelf. A collision costs 0.5 points each time.
-        self.declare_parameter("min_safe_range_m", 0.40)
+        # Also measured from base_footprint: the bumper is 0.36 m out, so 0.55 m leaves
+        # roughly 0.19 m of margin.
+        self.declare_parameter("min_safe_range_m", 0.55)
         self.declare_parameter("state_timeout_sec", 45.0)
         self.declare_parameter("image_width_px", 640)
         self.declare_parameter("tuck_time_sec", 5.0)
@@ -114,6 +128,11 @@ class ApproachNode(Node):
         # perception publishes is frame-relative -- it counts the columns currently in
         # view, so it changes as markers enter and leave the frame, and anything treating
         # it as the column's identity tracks a different column each frame.
+        # Scan points must be transformed into the robot frame, not read as if the laser
+        # were aligned with it -- it is mounted rotated. See _scan_points_base.
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         self.create_subscription(Float32, TOPIC_TARGET_COLUMN_X, self._on_column_x, 10)
         self.create_subscription(LaserScan, TOPIC_SCAN, self._on_scan, SENSOR_QOS)
         self.pub_cmd = self.create_publisher(Twist, TOPIC_CMD, 10)
@@ -157,19 +176,57 @@ class ApproachNode(Node):
 
     # ------------------------------------------------------------------ geometry
 
-    def _forward_points(self, half_angle: float = 0.30) -> List[Tuple[float, float]]:
-        """LiDAR returns within +/- half_angle of straight ahead, as (x, y) in the scan frame."""
+    def _scan_points_base(self) -> List[Tuple[float, float]]:
+        """All scan returns as (x, y) in base_footprint.
+
+        The scan frame is NOT aligned with the robot. The front laser is mounted at
+        roll -180 deg, yaw -45 deg relative to base_footprint, so scan angle zero points
+        45 degrees off to the side and the roll mirrors the direction of increasing angle.
+        Treating scan angles as robot-relative bearings therefore measures a cone pointing
+        somewhere else entirely -- which is why the shelf-squaring fit reported the face
+        2.5 degrees off while the robot was actually sitting 35 degrees away from square.
+        """
         if self.scan is None:
             return []
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                BASE_FRAME, self.scan.header.frame_id, rclpy.time.Time()
+            )
+        except Exception:  # noqa: BLE001 - transform may not be available yet
+            return []
+
+        q = tf.transform.rotation
+        t = tf.transform.translation
+        # Rotation matrix from the quaternion; only the rows producing x and y are needed.
+        xx, yy, zz = q.x * q.x, q.y * q.y, q.z * q.z
+        xy, xz, yz = q.x * q.y, q.x * q.z, q.y * q.z
+        wx, wy, wz = q.w * q.x, q.w * q.y, q.w * q.z
+        r00, r01, r02 = 1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)
+        r10, r11, r12 = 2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)
+
         points = []
         for i, r in enumerate(self.scan.ranges):
             if not math.isfinite(r) or not (self.scan.range_min < r < self.scan.range_max):
                 continue
             angle = self.scan.angle_min + i * self.scan.angle_increment
-            if abs(angle) > half_angle:
+            lx, ly, lz = r * math.cos(angle), r * math.sin(angle), 0.0
+            bx = r00 * lx + r01 * ly + r02 * lz + t.x
+            by = r10 * lx + r11 * ly + r12 * lz + t.y
+            # Discard the robot's own body. The laser plane sits at z = 0.209 m and the
+            # tucked arm reaches 0.319 m forward, so the stowed arm is unavoidably inside
+            # the scan -- it read as an obstacle 0.35 m ahead and tripped the safety stop
+            # the instant driving began. Nothing external can be this close without the
+            # robot already being in contact, so anything inside the footprint radius is
+            # the robot seeing itself.
+            if math.hypot(bx, by) < SELF_FILTER_RADIUS:
                 continue
-            points.append((r * math.cos(angle), r * math.sin(angle)))
+            points.append((bx, by))
         return points
+
+    def _forward_points(self, half_angle: float = 0.30) -> List[Tuple[float, float]]:
+        """Returns within +/- half_angle of straight ahead, as (x, y) in base_footprint."""
+        return [(x, y) for x, y in self._scan_points_base()
+                if x > 0.0 and abs(math.atan2(y, x)) <= half_angle]
 
     def _range_ahead(self) -> Optional[float]:
         points = self._forward_points(half_angle=0.12)

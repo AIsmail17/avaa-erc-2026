@@ -65,17 +65,33 @@ def generate_launch_description() -> LaunchDescription:
     column_as_int = ParameterValue(shelf_column_number, value_type=int)
     save_as_bool = ParameterValue(save_images, value_type=bool)
 
+    # Every node must run on simulation time. Gazebo stamps TF and sensor messages with
+    # /clock, which is far behind wall time and advances at the real-time factor. A node
+    # on wall time sees every transform as ancient -- tf2 floods with
+    # "TF_OLD_DATA ignoring data from the past" and lookups fail, so anything using TF
+    # silently gets nothing.
+    sim_time = {"use_sim_time": True}
+
     perception = Node(
         package="avaa_solution",
         executable="perception",
         name="avaa_perception",
         output="screen",
         emulate_tty=True,
-        parameters=[{
+        parameters=[sim_time, {
             "shelf_column_number": column_as_int,
             "book_colour": book_colour,
             "save_images": save_as_bool,
         }],
+    )
+
+    approach = Node(
+        package="avaa_solution",
+        executable="approach",
+        name="avaa_approach",
+        output="screen",
+        emulate_tty=True,
+        parameters=[sim_time],
     )
 
     mission = Node(
@@ -84,7 +100,7 @@ def generate_launch_description() -> LaunchDescription:
         name="avaa_mission",
         output="screen",
         emulate_tty=True,
-        parameters=[{
+        parameters=[sim_time, {
             "shelf_column_number": column_as_int,
             "book_colour": book_colour,
         }],
@@ -99,5 +115,6 @@ def generate_launch_description() -> LaunchDescription:
             "  book colour=", book_colour,
         ]),
         perception,
+        approach,
         mission,
     ])
