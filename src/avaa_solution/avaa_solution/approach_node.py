@@ -30,9 +30,13 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import LaserScan
+from builtin_interfaces.msg import Duration
 from std_msgs.msg import Float32, String
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
+TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
+TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
 TOPIC_STATE = "/avaa/approach/state"
 TOPIC_CMD = "/cmd_vel"
@@ -45,8 +49,24 @@ SENSOR_QOS = QoSProfile(
 )
 
 
+# Arm posture for driving, measured rather than guessed (see try_tuck.py).
+#
+# The arms spawn with every joint at zero, which for this arm is fully extended: the
+# gripper reaches 0.838 m forward, 0.478 m beyond the front of the base. Driving at the
+# shelf in that posture wedges the arm against it -- observed as six simultaneous contacts
+# between both grippers, both arm_6 links and erc_shelf, with the base unable to advance
+# while the LiDAR still read 0.94 m of clear space ahead. Each contact event costs half a
+# point.
+#
+# This pose measured 0.319 m forward and 0.174 m lateral, both inside the base footprint
+# (0.36 m half-length, 0.249 m half-width), with no contacts. Joint 2 does most of the
+# work; the elbow pulls the forearm in laterally, and joint 1 finishes the job.
+TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
+
+
 class State(Enum):
     WAITING = "waiting"
+    TUCK = "tucking"
     CENTRE = "centring"
     APPROACH = "approaching"
     SQUARE = "squaring"
@@ -71,6 +91,7 @@ class ApproachNode(Node):
         self.declare_parameter("min_safe_range_m", 0.40)
         self.declare_parameter("state_timeout_sec", 45.0)
         self.declare_parameter("image_width_px", 640)
+        self.declare_parameter("tuck_time_sec", 5.0)
 
         self.standoff = float(self.get_parameter("standoff_m").value)
         self.centre_tol = float(self.get_parameter("centre_tolerance_px").value)
@@ -81,6 +102,7 @@ class ApproachNode(Node):
         self.min_safe = float(self.get_parameter("min_safe_range_m").value)
         self.timeout = float(self.get_parameter("state_timeout_sec").value)
         self.image_width = int(self.get_parameter("image_width_px").value)
+        self.tuck_time = float(self.get_parameter("tuck_time_sec").value)
 
         self.column_cx: Optional[float] = None
         self.column_cx_at: Optional[float] = None
@@ -96,6 +118,8 @@ class ApproachNode(Node):
         self.create_subscription(LaserScan, TOPIC_SCAN, self._on_scan, SENSOR_QOS)
         self.pub_cmd = self.create_publisher(Twist, TOPIC_CMD, 10)
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
+        self.pub_arm_left = self.create_publisher(JointTrajectory, TOPIC_ARM_LEFT, 10)
+        self.pub_arm_right = self.create_publisher(JointTrajectory, TOPIC_ARM_RIGHT, 10)
 
         self.create_timer(0.1, self._tick)
         self.get_logger().info(
@@ -112,7 +136,9 @@ class ApproachNode(Node):
         self.column_cx = float(msg.data)
         self.column_cx_at = self._now()
         if self.state is State.WAITING:
-            self._enter(State.CENTRE)
+            # Stow the arms before any driving happens.
+            self._send_tuck()
+            self._enter(State.TUCK)
 
     def _column_cx_fresh(self, max_age: float = 1.5) -> Optional[float]:
         """The target column's image x, or None if perception has gone quiet.
@@ -213,12 +239,48 @@ class ApproachNode(Node):
             self._enter(State.SQUARE)
             return
 
-        if self.state is State.CENTRE:
+        if self.state is State.TUCK:
+            self._do_tuck()
+        elif self.state is State.CENTRE:
             self._do_centre()
         elif self.state is State.APPROACH:
             self._do_approach()
         elif self.state is State.SQUARE:
             self._do_square()
+
+    def _send_tuck(self) -> None:
+        """Command both arms to the driving posture."""
+        for pub, side in ((self.pub_arm_left, "left"), (self.pub_arm_right, "right")):
+            traj = JointTrajectory()
+            traj.joint_names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
+            point = JointTrajectoryPoint()
+            pose = list(TUCK_POSE)
+            if side == "right":
+                # Mirror the shoulder pan and upper-arm roll.
+                pose[0] = -pose[0]
+                pose[2] = -pose[2]
+            point.positions = [float(v) for v in pose]
+            point.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
+            traj.points = [point]
+            pub.publish(traj)
+        self.get_logger().info("stowing arms for driving")
+
+    def _do_tuck(self) -> None:
+        self._stop()  # no driving until the arms are in
+        elapsed = self._now() - self.state_since
+
+        # Repeat only during the first moment, to cover the controller not yet being
+        # subscribed. Repeating later is actively harmful: each JointTrajectory replaces
+        # the one in progress and restarts its time_from_start, so a trajectory re-sent
+        # every two seconds never finishes. That left the arm permanently mid-sweep, and
+        # since the tuck path crosses the LiDAR plane the moving arm registered as an
+        # obstacle 0.08 m ahead the instant driving began.
+        if elapsed < 0.6:
+            self._send_tuck()
+
+        # Wait out the full trajectory plus settling before allowing any motion.
+        if elapsed >= self.tuck_time + 2.0:
+            self._enter(State.CENTRE)
 
     def _do_centre(self) -> None:
         column_cx = self._column_cx_fresh()
@@ -240,9 +302,14 @@ class ApproachNode(Node):
     def _do_approach(self) -> None:
         ahead = self._range_ahead()
         if ahead is None:
+            self.get_logger().warn("no forward LiDAR returns; holding", throttle_duration_sec=3.0)
             self._stop()
             return
         remaining = ahead - self.standoff
+        self.get_logger().info(
+            f"ahead={ahead:.2f} m  remaining={remaining:+.2f} m",
+            throttle_duration_sec=3.0,
+        )
         if remaining <= self.standoff_tol:
             self._stop()
             self._enter(State.SQUARE)
