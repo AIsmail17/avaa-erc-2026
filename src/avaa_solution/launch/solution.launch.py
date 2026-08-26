@@ -21,6 +21,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 VALID_COLUMNS = ["1", "2", "3", "4", "5"]
 VALID_COLOURS = ["red", "blue", "green", "yellow"]
@@ -58,6 +59,12 @@ def generate_launch_description() -> LaunchDescription:
         ),
     )
 
+    # Launch substitutions are strings. Both nodes declare shelf_column_number as an
+    # integer, so the type has to be stated explicitly or the declaration is rejected at
+    # startup -- which would fail the run before it began.
+    column_as_int = ParameterValue(shelf_column_number, value_type=int)
+    save_as_bool = ParameterValue(save_images, value_type=bool)
+
     perception = Node(
         package="avaa_solution",
         executable="perception",
@@ -65,8 +72,9 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
         emulate_tty=True,
         parameters=[{
+            "shelf_column_number": column_as_int,
             "book_colour": book_colour,
-            "save_images": save_images,
+            "save_images": save_as_bool,
         }],
     )
 
@@ -77,7 +85,7 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
         emulate_tty=True,
         parameters=[{
-            "shelf_column_number": shelf_column_number,
+            "shelf_column_number": column_as_int,
             "book_colour": book_colour,
         }],
     )

@@ -140,6 +140,41 @@ def group_into_columns(books: Sequence[Book]) -> List[List[Book]]:
     return columns
 
 
+def group_by_anchors(books: Sequence[Book], anchor_xs: Sequence[float],
+                     max_dx: Optional[float] = None) -> List[List[Book]]:
+    """Assign each book to the nearest anchor x, one list per anchor.
+
+    Preferred over :func:`group_into_columns` whenever the column markers are visible.
+    Gap-based clustering has to guess where one column ends and the next begins, and that
+    guess is scale-dependent: at an oblique viewing angle two adjacent columns can sit
+    closer together in the image than the books within a single column do at close range,
+    which silently merges them into one group of eight.
+
+    The markers remove the guess. Each marker sits above exactly one column, so the anchor
+    positions *are* the column positions, and the returned index lines up with the marker
+    order.
+    """
+    columns: List[List[Book]] = [[] for _ in anchor_xs]
+    if not anchor_xs:
+        return columns
+
+    if max_dx is None:
+        if len(anchor_xs) >= 2:
+            spacings = [abs(b - a) for a, b in zip(sorted(anchor_xs), sorted(anchor_xs)[1:])]
+            max_dx = 0.5 * float(np.median(spacings))
+        else:
+            max_dx = float("inf")
+
+    for book in books:
+        index = min(range(len(anchor_xs)), key=lambda i: abs(book.cx - anchor_xs[i]))
+        if abs(book.cx - anchor_xs[index]) <= max_dx:
+            columns[index].append(book)
+
+    for column in columns:
+        column.sort(key=lambda b: b.cy)
+    return columns
+
+
 def row_of(column: Sequence[Book], colour: str) -> Optional[int]:
     """Row (1-based, counting from the top) of the given colour within one column.
 
