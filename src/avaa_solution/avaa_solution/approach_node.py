@@ -8,18 +8,33 @@ estimate of where the book is.
 
 Sequence:
 
-    CENTRE   rotate until the target column sits in the middle of the image
-    APPROACH drive forward, holding the column centred, until the shelf face is at standoff
-    SQUARE   rotate to sit perpendicular to the shelf face, fitted from the LiDAR
+    TUCK     fold both arms in, so the base strafes cleanly and the LiDAR sees the shelf
+    SEARCH   turn on the spot until the target column marker is read
+    CENTRE   rotate until that column sits in the middle of the image
+    ACQUIRE  hold at a working range, square to the shelf, and line up by strafing
+    APPROACH drive in, holding the target centred, until the shelf face is at standoff
+    SQUARE   sit perpendicular to the shelf face, fitted from the LiDAR
+    VERIFY   confirm the book is still held in view before handing over to the grasp
+    RETREAT  back off and re-acquire when it is not; twice, then give up
     DONE
 
-Lateral motion is never commanded. Measured on this base, a pure vy command yaws the robot
-by roughly the same magnitude as it strafes, so the approach is built from the two motions
-that behave: forward drive and rotation. Rotating to face the column and then driving
-straight at it arrives laterally centred by construction.
+Lateral motion is commanded, and turning is not, once the arms are tucked. Rotating to
+chase a bearing while driving turns a small angular error into a large lateral excursion --
+one run ended at y = -2.25, past the end of the shelf unit, having started centred --
+whereas the base strafes cleanly with the arms stowed: vy = +0.20 measured dy = +0.233 with
+dyaw = 0.000. An earlier belief that strafing yaws the base came from measuring it with the
+arms extended.
+
+Two things here exist because they failed silently first, and both are worth keeping:
+
+    * SQUARE will not hand an unsquared base to the grasp, which reaches along base x.
+    * The target is anchored in odom once measured from a range where the column marker is
+      legible, because that marker leaves the frame as the robot closes in and the bearing
+      it provides was measured jumping 310 px in a single step at 1 m out.
 """
 
 import math
+from collections import deque
 from enum import Enum
 from typing import List, Optional, Tuple
 
@@ -36,6 +51,7 @@ from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 BASE_FRAME = "base_footprint"
+ODOM_FRAME = "odom"
 CAMERA_FRAME = "head_front_camera_depth_optical_frame"
 
 # base_link sits this far above base_footprint. Row heights are quoted in base_link.
@@ -184,10 +200,30 @@ class ApproachNode(Node):
         self.approach_target = self.acquire_range
         # Retry budget for losing the book on the final drive.
         self.retreats = 0
-        # How deep a slab around the nearest return still counts as the shelf face.
-        # Wide enough for a face seen at a steep angle, narrow enough to exclude the
-        # wall behind the shelf.
-        self.face_band = 0.60
+        # The book position, held in odom once it has been measured from a range
+        # where the marker above the column is still legible.
+        self.target_odom = None
+        # How far a later sighting may sit from that anchor and still be believed.
+        # Column spacing is about 0.95 m, so this stays well inside the distance to
+        # the neighbouring column while allowing for depth noise and odom drift.
+        self.anchor_gate = 0.30
+        # Sightings waiting to agree with each other before one of them is trusted, and
+        # sightings that disagreed with the anchor. Both need to be consistent among
+        # themselves before they are acted on. See _accept_sighting.
+        self.anchor_candidates = deque(maxlen=8)
+        self.anchor_disagree = deque(maxlen=20)
+        self.anchor_rejects = 0
+        # Lateral error worth correcting during the final drive, in metres.
+        self.centre_tol_m = 0.03
+        # How far off a fitted line a return may sit and still count as the same
+        # surface. The shelf face is not smooth: book edges and the frame scatter
+        # returns by about 0.05 m.
+        self.face_tolerance = 0.05
+        # What share of the forward returns must agree before the fit is believed.
+        # Comfortably over half, so that two surfaces of similar size are refused
+        # rather than squared to whichever happened to win. Real shelf faces measured
+        # 81 and 76 per cent.
+        self.face_consensus = 0.6
         # How long a bad scan is tolerated before treating it as a real obstruction.
         self.square_grace = 4.0
         self.square_lost_since = None
@@ -331,40 +367,43 @@ class ApproachNode(Node):
         xs = np.array([p[0] for p in points])
         ys = np.array([p[1] for p in points])
 
-        # Keep only the nearest surface before fitting. Close to the shelf this cone
-        # reaches past the end of it and picks up the far wall: measured in the pose
-        # that broke a run, 226 returns spanning x from 0.74 to 3.62 m, which dragged
-        # the fitted angle from -34 to -53 degrees and put the residual at 0.26 m. The
-        # guard below then refused, and the approach carried on unsquared into a grasp
-        # that assumes square. The same scan restricted to the face fits at -33.7 deg
-        # against a true -35.8, with a residual of 0.02 m.
-        near = float(np.percentile(xs, 10))
-        keep = xs <= near + self.face_band
-        xs, ys = xs[keep], ys[keep]
-        if len(xs) < 12:
+        # Fit the surface most of the returns agree on, not all of them at once.
+        # Two different scenes broke a plain least-squares line here. Far from the
+        # shelf the cone reaches past the end of it to the wall 2.5 m beyond, and
+        # those returns pulled the angle from -34 to -53 degrees. Close in, a flat
+        # face at x = 0.85 spanning the whole cone had one object sticking out to
+        # x = 0.55 in front of it, and 46 such points out of 207 held the residual at
+        # 0.10 m while the robot was in fact already square to within half a degree.
+        # Neither a nearest-return nor a median slab separates those two cases; a
+        # consensus fit does.
+        inliers = _largest_collinear_set(xs, ys, tolerance=self.face_tolerance)
+        if inliers is None:
             return None
-        # x as a function of y: the face is roughly parallel to the robot's y axis, so
-        # this avoids the vertical-line singularity of fitting y = f(x).
+        # Squaring to a minority surface is how the robot ends up facing a shelf
+        # upright, or one pulled-out book, instead of the shelf itself.
+        if int(inliers.sum()) < max(12, int(self.face_consensus * len(xs))):
+            return None
+        xs, ys = xs[inliers], ys[inliers]
+
+        # x as a function of y: the face is roughly parallel to the robot's y axis,
+        # so this avoids the vertical-line singularity of fitting y = f(x).
         slope, intercept = np.polyfit(ys, xs, 1)
 
-        # A shelf upright or a protruding book still skews a least-squares line, so
-        # drop the worst offenders once and refit on what is left.
-        spread = xs - (slope * ys + intercept)
-        keep = np.abs(spread) <= 3.0 * max(float(np.std(spread)), 0.01)
-        if 12 <= int(keep.sum()) < len(xs):
-            xs, ys = xs[keep], ys[keep]
-            slope, intercept = np.polyfit(ys, xs, 1)
-
-        # A flat face fits tightly. A scattered cloud -- books at different depths, or two
-        # surfaces at once -- does not, and squaring to it would be meaningless.
+        # The consensus step has already separated the surfaces, so what is left
+        # should be tight. A clean face measured 0.02 m.
         residual = float(np.std(xs - (slope * ys + intercept)))
-        if residual > 0.08:
+        if residual > 0.05:
             return None
         return float(math.atan(slope))
 
     # ------------------------------------------------------------------ control
 
     def _enter(self, state: State) -> None:
+        if state is State.RETREAT:
+            # Start the anchor again: if it had been right we would not be retreating.
+            self.target_odom = None
+            self.anchor_candidates.clear()
+            self.anchor_disagree.clear()
         if state is not self.state:
             self.get_logger().info(f"{self.state.value} -> {state.value}")
             self.state = state
@@ -541,8 +580,119 @@ class ApproachNode(Node):
         )
 
     def _on_book_point(self, msg: PointStamped) -> None:
+        point = np.array([msg.point.x, msg.point.y, msg.point.z])
+        if not self._accept_sighting(point, msg.header.frame_id):
+            return
         self.book_point_at = self._now()
-        self.book_x = float(msg.point.x)
+        self.book_x = float(point[0])
+
+    def _lookup(self, target_frame: str, source_frame: str):
+        try:
+            return self.tf_buffer.lookup_transform(
+                target_frame, source_frame, rclpy.time.Time())
+        except Exception:  # noqa: BLE001 - the transform may not be published yet
+            return None
+
+    @staticmethod
+    def _apply_transform(tf, point) -> np.ndarray:
+        """Apply a TransformStamped to an (x, y, z) point."""
+        q, t = tf.transform.rotation, tf.transform.translation
+        xx, yy, zz = q.x * q.x, q.y * q.y, q.z * q.z
+        xy, xz, yz = q.x * q.y, q.x * q.z, q.y * q.z
+        wx, wy, wz = q.w * q.x, q.w * q.y, q.w * q.z
+        rotation = np.array([
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+        ])
+        return rotation @ np.asarray(point, dtype=float) + np.array([t.x, t.y, t.z])
+
+    def _accept_sighting(self, point: np.ndarray, frame_id: str) -> bool:
+        """Decide whether a sighting is the book we set out for, and anchor it.
+
+        The column bearing comes from a marker mounted above the shelf, and that
+        marker leaves the camera as the robot closes in. One run had the bearing jump
+        310 px in a single step at 1 m out, which strafed the base into the divider
+        between two columns and left it facing neither: ground truth put the two
+        nearest red books at +33.5 and -39.6 degrees off the nose, both at the edge of
+        the frame, and perception reported no red book in view for the rest of the run.
+
+        So once the target has been measured from a range where the marker is still
+        legible, its position is held in odom, and later sightings are believed only
+        if they agree with it. Odom drift over the last metre is far smaller than the
+        error being rejected. This is not navigating to an odometry estimate, which the
+        arm could not be placed from -- the grasp still uses the live measurement. It
+        is refusing to be talked out of a good fix by a bad one.
+        """
+        if self.state not in (State.ACQUIRE, State.APPROACH,
+                              State.SQUARE, State.VERIFY):
+            return True
+        tf = self._lookup(ODOM_FRAME, frame_id)
+        if tf is None:
+            return True   # nothing to check against; a sighting beats none
+        in_odom = self._apply_transform(tf, point)
+
+        if self.target_odom is None:
+            # Do not anchor to a single sighting. With no marker in view perception picks
+            # one of several same-coloured books, and whichever it picked first would
+            # become the target for the whole run.
+            self.anchor_candidates.append(in_odom)
+            settled = self._agreeing(self.anchor_candidates)
+            if settled is None:
+                return False
+            self.target_odom = settled
+            self.get_logger().info(
+                "target anchored at odom [%.2f, %.2f, %.2f] from %d agreeing sightings"
+                % (settled[0], settled[1], settled[2], len(self.anchor_candidates)))
+            return True
+
+        drift = float(np.linalg.norm(in_odom[:2] - self.target_odom[:2]))
+        if drift > self.anchor_gate:
+            self.anchor_rejects += 1
+            self.anchor_disagree.append(in_odom)
+            # An outlier gate with no way out turns one bad fix into a permanent one. A
+            # run anchored to the wrong book and then rejected the right one 217 times in
+            # a row, all at the same 1.24 m, until the approach timed out. Sightings that
+            # disagree with the anchor but agree with each other are the better answer.
+            replacement = self._agreeing(self.anchor_disagree)
+            if replacement is not None:
+                self.get_logger().warn(
+                    "re-anchoring: %d sightings agree with each other %.2f m from the "
+                    "anchor, so the anchor was wrong"
+                    % (len(self.anchor_disagree), drift))
+                self.target_odom = replacement
+                self.anchor_disagree.clear()
+                return True
+            self.get_logger().warn(
+                "ignoring a sighting %.2f m from the anchored target (%d so far)"
+                % (drift, self.anchor_rejects), throttle_duration_sec=3.0)
+            return False
+
+        # Sightings that agree refine the anchor: the book has not moved, but the fix
+        # on it gets better as the robot closes in.
+        self.anchor_disagree.clear()
+        self.target_odom = 0.7 * self.target_odom + 0.3 * in_odom
+        return True
+
+    def _agreeing(self, sightings):
+        """Give the mean of a full buffer of sightings, if they agree; otherwise None."""
+        if len(sightings) < sightings.maxlen:
+            return None
+        points = np.array(list(sightings))
+        centre = points.mean(axis=0)
+        spread = float(np.max(np.linalg.norm(points[:, :2] - centre[:2], axis=1)))
+        if spread > self.anchor_gate:
+            return None
+        return centre
+
+    def _target_in_base(self):
+        """Give the anchored target as (x, y, z) in base_footprint, or None."""
+        if self.target_odom is None:
+            return None
+        tf = self._lookup(BASE_FRAME, ODOM_FRAME)
+        if tf is None:
+            return None
+        return self._apply_transform(tf, self.target_odom)
 
     def _distance_to_face(self) -> Optional[float]:
         """Distance to the shelf face, preferring the book over the LiDAR.
@@ -770,15 +920,26 @@ class ApproachNode(Node):
         # dy = +0.233 with dyaw = 0.000), so lateral error can be taken out directly while
         # the heading stays square to the shelf. The earlier belief that strafing yaws the
         # base was an artefact of measuring with the arms extended.
-        column_cx = self._column_cx_fresh()
-        bearing = "stale"
-        if column_cx is not None:
-            error_px = column_cx - self.image_width / 2.0
-            bearing = f"{error_px:+6.1f}px"
-            if abs(error_px) > self.centre_tol:
-                # Image x grows to the right; +y is to the robot's left.
-                cmd.linear.y = -math.copysign(
-                    min(self.max_lateral, 0.0012 * abs(error_px)), error_px)
+        # Steer to the anchored target while one is held, falling back to the live
+        # marker bearing only before there is one. The bearing is what jumped.
+        target = self._target_in_base()
+        if target is not None:
+            error_m = float(target[1])
+            bearing = f"{error_m:+.3f}m"
+            if abs(error_m) > self.centre_tol_m:
+                # +y is to the left of the base, and so is a positive error.
+                cmd.linear.y = math.copysign(
+                    min(self.max_lateral, 0.6 * abs(error_m) + 0.02), error_m)
+        else:
+            column_cx = self._column_cx_fresh()
+            bearing = "stale"
+            if column_cx is not None:
+                error_px = column_cx - self.image_width / 2.0
+                bearing = f"{error_px:+6.1f}px"
+                if abs(error_px) > self.centre_tol:
+                    # Image x grows to the right; +y is to the left of the base.
+                    cmd.linear.y = -math.copysign(
+                        min(self.max_lateral, 0.0012 * abs(error_px)), error_px)
         self.pub_cmd.publish(cmd)
 
         # Log what was commanded alongside what the range is doing. Range alone cannot
@@ -786,7 +947,7 @@ class ApproachNode(Node):
         # those have opposite fixes.
         self.get_logger().info(
             f"ahead={ahead:.2f} remaining={remaining:+.2f} "
-            f"cmd vx={cmd.linear.x:.3f} wz={cmd.angular.z:+.3f} bearing={bearing}",
+            f"cmd vx={cmd.linear.x:.3f} vy={cmd.linear.y:+.3f} bearing={bearing}",
             throttle_duration_sec=2.0,
         )
 
@@ -842,6 +1003,31 @@ class ApproachNode(Node):
             f"wz={cmd.angular.z:+.3f}",
             throttle_duration_sec=2.0,
         )
+
+
+def _largest_collinear_set(xs, ys, tolerance=0.05, iterations=60):
+    """Return a mask of the largest set of returns lying on one straight line.
+
+    RANSAC over x = slope * y + intercept, which is the right way round for a surface
+    roughly parallel to the robot's y axis. The seed is fixed so the same scan always
+    fits the same way: a squaring controller that answers differently on identical
+    input is not one you can debug.
+    """
+    n = len(xs)
+    if n < 12:
+        return None
+    rng = np.random.default_rng(0)
+    best = None
+    for _ in range(iterations):
+        i, j = rng.choice(n, size=2, replace=False)
+        if abs(ys[j] - ys[i]) < 1e-6:
+            continue
+        slope = (xs[j] - xs[i]) / (ys[j] - ys[i])
+        intercept = xs[i] - slope * ys[i]
+        inliers = np.abs(xs - (slope * ys + intercept)) <= tolerance
+        if best is None or int(inliers.sum()) > int(best.sum()):
+            best = inliers
+    return best
 
 
 def main(args=None) -> None:

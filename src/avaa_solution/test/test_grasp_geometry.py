@@ -63,6 +63,16 @@ def test_gripper_open_clears_a_book_and_clamp_closes_past_it():
     assert span(GRIPPER_CLAMP) < 0.030, "clamp must close past the book thickness"
 
 
-def test_torso_bias_is_within_the_measured_range():
-    # The torso settles 2.5-3 cm short of command, repeatably.
-    assert 0.020 <= TORSO_BIAS <= 0.035
+def test_torso_is_not_compensated_without_evidence():
+    """The torso tracks its command exactly, so nothing should be added to it.
+
+    This test previously asserted a 2.5-3 cm compensation, from a measurement taken while
+    orphaned processes were holding the simulation at a third of real time and no
+    trajectory had time to finish. Re-measured on a clean sim, commands of 0.15, 0.20,
+    0.25 and 0.30 all settle at exactly the commanded height, error 0.0000 m.
+
+    The stale compensation was putting the gripper 28 mm above the book, which on its own
+    is enough to close the fingers over the top corner of a 30 mm spine rather than round
+    it. It cost several runs that reported success.
+    """
+    assert TORSO_BIAS == pytest.approx(0.0, abs=0.005)

@@ -12,7 +12,10 @@ case the logs were clean and only the simulator's ground truth showed otherwise.
 So this records every book's true pose before the run, runs the trial, and records them
 again. A book that moved is the only evidence that counts.
 
-Output is deliberately blunt: MOVED or NOT MOVED, which book, and how far.
+Output is deliberately blunt: PICKED UP, DISTURBED, or NOT MOVED, which book, and
+how far. Displacement alone is not success -- a book swept onto its side travelled
+0.14 m with the fingers closed on air -- so the verdict checks that it is still the
+way up it started.
 """
 import json
 import subprocess
@@ -33,12 +36,14 @@ def book_models():
 
 
 def pose(model):
+    """Position and orientation. The orientation is what separates a pick from a sweep."""
     out = gz("model", "-m", model, "-p")
     lines = [l.strip() for l in out.splitlines()]
     for i, line in enumerate(lines):
         if line.startswith("[") and i + 1 < len(lines) and lines[i + 1].startswith("["):
             try:
-                return [float(v) for v in line.strip("[]").split()]
+                return ([float(v) for v in line.strip("[]").split()],
+                        [float(v) for v in lines[i + 1].strip("[]").split()])
             except ValueError:
                 return None
     return None
@@ -48,10 +53,40 @@ def snapshot(models):
     return {m: pose(m) for m in models}
 
 
-def distance(a, b):
-    if a is None or b is None:
-        return None
-    return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+UPRIGHT_TOL = 0.35      # radians of roll/pitch change that still counts as upright
+CARRIED_M = 0.05        # how far a book must travel before it counts as taken
+
+
+def classify(before, after):
+    """Say what actually happened to a book, not merely that something did.
+
+    Displacement alone is not a pick. One run swept a book over on the shelf -- it
+    travelled 0.14 m and ended lying on its side with the fingers fully closed on air --
+    and a harness that only measured distance called that a success. In the competition
+    that is a dropped book and a penalty, not a score.
+
+    So a pick has to be a book that moved AND is still the way up it started.
+    """
+    if before is None or after is None:
+        return "unknown", 0.0
+    moved = sum((a - b) ** 2 for a, b in zip(before[0][:3], after[0][:3])) ** 0.5
+    if moved <= MOVE_THRESHOLD_M:
+        return "still", moved
+    tipped = max(abs(_wrap(a - b)) for a, b in zip(before[1][:2], after[1][:2]))
+    if tipped > UPRIGHT_TOL:
+        return "knocked over", moved
+    if moved < CARRIED_M:
+        return "nudged", moved
+    return "taken", moved
+
+
+def _wrap(angle):
+    while angle > 3.14159265:
+        angle -= 2 * 3.14159265
+    while angle < -3.14159265:
+        angle += 2 * 3.14159265
+    return angle
+
 
 
 def run_node(executable, extra=(), log="/tmp/trial_node.log"):
@@ -119,29 +154,40 @@ def main():
     robot_after = pose("tiago_pro")
 
     print("\n=== judged against Gazebo ===")
-    moved = []
+    outcomes = []
     for model in models:
-        d = distance(before.get(model), after.get(model))
-        if d is not None and d > MOVE_THRESHOLD_M:
-            moved.append((model, d))
+        verdict, d = classify(before.get(model), after.get(model))
+        if verdict != "still":
+            outcomes.append((model, verdict, d))
 
-    if not moved:
+    taken = [o for o in outcomes if o[1] == "taken"]
+    spoiled = [o for o in outcomes if o[1] in ("knocked over", "nudged")]
+
+    if taken:
+        print("RESULT: PICKED UP")
+    elif spoiled:
+        print("RESULT: DISTURBED BUT NOT PICKED UP")
+    else:
         print("RESULT: NOT MOVED — no book shifted more than "
               f"{MOVE_THRESHOLD_M:.02f} m. The grasp did not pick anything up.")
-    else:
-        print("RESULT: MOVED")
-        for model, d in sorted(moved, key=lambda t: -t[1]):
-            print(f"  {model}: {d:.3f} m")
-            print(f"    before {before[model]}")
-            print(f"    after  {after[model]}")
+
+    for model, verdict, d in sorted(outcomes, key=lambda t: -t[2]):
+        print(f"  {model}: {verdict}, {d:.3f} m")
+        print(f"    before {before[model][0]} rpy {before[model][1]}")
+        print(f"    after  {after[model][0]} rpy {after[model][1]}")
+    if spoiled:
+        print(f"  ({len(spoiled)} book(s) disturbed — each one is a penalty in the run)")
 
     if robot_before and robot_after:
-        print(f"\nrobot moved {distance(robot_before, robot_after):.2f} m; "
-              f"final position {[round(v, 3) for v in robot_after[:2]]}")
+        travelled = sum((a - b) ** 2 for a, b in
+                        zip(robot_before[0][:2], robot_after[0][:2])) ** 0.5
+        print(f"\nrobot moved {travelled:.2f} m; "
+              f"final position {[round(v, 3) for v in robot_after[0][:2]]}")
 
     print(json.dumps({
         "column": column, "colour": colour,
-        "moved": [m for m, _ in moved],
+        "taken": [m for m, v, _ in outcomes if v == "taken"],
+        "disturbed": [m for m, v, _ in outcomes if v != "taken"],
     }))
 
 

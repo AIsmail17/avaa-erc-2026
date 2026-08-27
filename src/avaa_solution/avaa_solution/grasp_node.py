@@ -60,7 +60,13 @@ DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
 # The torso settles 2.5-3 cm short of whatever it is commanded, repeatably and in both
 # directions of travel (see MANIPULATION.md). Command past the target to land on it.
-TORSO_BIAS = 0.028
+# Measured, not assumed: commanded 0.15/0.20/0.25/0.30 all settle at exactly the
+# commanded height, error 0.0000 m. This was 0.028 to compensate an undershoot seen
+# earlier, which turns out to have been orphaned processes holding the simulation at
+# a third of real time so trajectories never finished. With those cleaned up the
+# torso tracks exactly, and the compensation was placing the gripper 28 mm above the
+# book -- enough on its own to close the fingers over the top corner of a 30 mm book.
+TORSO_BIAS = 0.0
 
 # Which way the hand must be held to take a book off a shelf, in base_link, for an
 # arm whose seven joints leave four degrees of freedom spare. Without these the

@@ -16,6 +16,7 @@ exactly one place responsible for what reaches the committee.
 
 import os
 from datetime import datetime
+from collections import Counter, deque
 from typing import List, Optional, Tuple
 
 import cv2
@@ -91,6 +92,9 @@ class PerceptionNode(Node):
         self.last_book_save: Optional[float] = None
         self.reported_column: Optional[int] = None
         self.reported_row: Optional[int] = None
+        # Confident row readings, voted on before anything is latched. See _publish_row.
+        self.row_votes = deque(maxlen=15)
+        self.row_majority = 0.7
 
         if self.save_images:
             os.makedirs(self.image_dir, exist_ok=True)
@@ -329,21 +333,43 @@ class PerceptionNode(Node):
                     "trusting it", throttle_duration_sec=5.0)
             row = None
 
+        # Vote, then latch, then never change it.
+        #
+        # The row cannot change during a run. The code above said exactly that in a
+        # comment while overwriting reported_row on every confident reading, and since the
+        # approach aims the head from the row we publish, that closed a loop: row 2 tilts
+        # the head up, which changes which books are in frame, which reads row 4, which
+        # tilts it back down. One run flipped between rows 2 and 4 several times a second
+        # for the whole approach, rejected 36 sightings as inconsistent with the anchored
+        # target, and ended 4.7 m from the shelf having never grasped anything.
+        #
+        # Publishing nothing until the vote settles is what breaks the loop: with no row,
+        # the head stops being re-aimed, the view holds still, and the readings converge.
+        # A split vote is reported rather than resolved -- an honest "cannot tell" that
+        # holds position is worth more than an answer that alternates.
         if row is not None:
-            if row != self.reported_row:
+            self.row_votes.append(row)
+
+        if self.reported_row is None:
+            if len(self.row_votes) < self.row_votes.maxlen:
                 self.get_logger().info(
-                    f"target {self.book_colour} book is on row {row} "
-                    f"({len(markers)} marker(s) in view)")
-                self.reported_row = row
-        elif self.reported_row is not None:
-            row = self.reported_row
-        else:
-            self.get_logger().warn(
-                f"row not resolvable yet: column {column_index} shows "
-                f"{len(columns[column_index])} of {bd.ROWS_PER_COLUMN} books",
-                throttle_duration_sec=5.0,
-            )
-            return
+                    f"reading the row ({len(self.row_votes)} of "
+                    f"{self.row_votes.maxlen} samples)",
+                    throttle_duration_sec=3.0)
+                return
+            tally = Counter(self.row_votes)
+            winner, count = tally.most_common(1)[0]
+            if count < self.row_majority * self.row_votes.maxlen:
+                self.get_logger().warn(
+                    f"row is ambiguous, holding: {dict(tally)}",
+                    throttle_duration_sec=5.0)
+                return
+            self.reported_row = winner
+            self.get_logger().info(
+                f"target {self.book_colour} book is on row {winner} "
+                f"({count} of {len(self.row_votes)} readings agree)")
+
+        row = self.reported_row
         self.pub_row.publish(Int32(data=row))
 
         target = bd.find_book(columns, column_index, self.book_colour)
