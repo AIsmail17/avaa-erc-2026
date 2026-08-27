@@ -41,6 +41,15 @@ MIN_INK_AREA = 15
 MIN_ASPECT = 0.6
 MAX_ASPECT = 4.0
 
+# Smallest credible marker, in pixels of digit height.
+#
+# The plate is 0.30 m and the camera has fx = 337, so a digit filling the plate spans
+# roughly 101/d pixels at d metres. The arena is 10 x 10 m, so nothing real can be much
+# under 10 px; below that the classifier is matching noise. This was not merely
+# theoretical: an 8 px blob on a blank wall was read as a confident "4", which stopped the
+# search dead facing away from the shelves and took the rest of the run down with it.
+MIN_MARKER_HEIGHT_PX = 12
+
 # Below this IoU the match is not trustworthy. Calibrated against measured readings: on a
 # frame where all four visible digits were read correctly, IoU ranged 0.43-0.75, the worst
 # being the nearest plate (viewed most obliquely, so most perspective-skewed). A threshold
@@ -239,7 +248,7 @@ def find_marker_candidates(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     boxes = []
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        if w < 3 or h < 5:
+        if w < 3 or h < MIN_MARKER_HEIGHT_PX:
             continue
         if cv2.contourArea(contour) < MIN_INK_AREA:
             continue

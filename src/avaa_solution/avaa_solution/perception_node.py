@@ -153,6 +153,41 @@ class PerceptionNode(Node):
                 f"cx={self.intrinsics.cx:.1f} cy={self.intrinsics.cy:.1f}"
             )
 
+    def _track_book_without_marker(self, frame, books: List[bd.Book]) -> None:
+        """Keep publishing the target book once the marker is out of frame.
+
+        Only valid after the column and row have been established, which is why it does
+        nothing until then. Of the target-coloured books in view, it takes the one nearest
+        the image centre: the robot has already centred and driven in on the target
+        column, so the closest to centre is the one in front of it.
+        """
+        if self.reported_row is None or not self.book_colour:
+            return
+        candidates = [b for b in books if b.colour == self.book_colour]
+        if not candidates:
+            self.get_logger().warn(
+                f"no {self.book_colour} book in view at close range",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        centre = frame.shape[1] / 2.0
+        target = min(candidates, key=lambda b: abs(b.cx - centre))
+        self.pub_row.publish(Int32(data=self.reported_row))
+
+        # Keep feeding a bearing as well as a point. The marker leaves the frame roughly a
+        # metre out, and without a bearing the approach drives the last stretch open-loop
+        # and drifts sideways -- one run finished at the end upright of the shelf unit,
+        # looking along it rather than at the target column. The book itself is the right
+        # thing to steer by once the marker is gone.
+        self.pub_column_x.publish(Float32(data=float(target.cx)))
+        self._publish_book_point(target)
+        self.get_logger().info(
+            f"tracking {self.book_colour} book without marker "
+            f"({len(candidates)} candidate(s), row {self.reported_row})",
+            throttle_duration_sec=5.0,
+        )
+
     def _publish_book_point(self, target: bd.Book) -> None:
         """Publish the target book's 3D position in base_link, for the grasp controller.
 
@@ -211,6 +246,12 @@ class PerceptionNode(Node):
 
         column_index = self._target_column_index(markers)
         if column_index is None:
+            # Close range: the markers sit at 2.26 m and the camera is tilted down onto
+            # the books, so they leave the frame entirely. That is expected, and by then
+            # the column has already been identified and the robot is parked in front of
+            # it -- so keep tracking the book itself rather than going silent exactly when
+            # the grasp controller needs a target.
+            self._track_book_without_marker(frame, books)
             return
 
         if column_index != self.reported_column:

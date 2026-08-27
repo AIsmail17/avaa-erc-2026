@@ -36,6 +36,17 @@ from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 BASE_FRAME = "base_footprint"
+CAMERA_FRAME = "head_front_camera_depth_optical_frame"
+
+# base_link sits this far above base_footprint. Row heights are quoted in base_link.
+BASE_LINK_Z = 0.186
+
+# head_2_joint: negative looks down, roughly one-for-one in radians. Limits from the URDF.
+HEAD_TILT_MIN = -1.047   # about 60 degrees down
+HEAD_TILT_MAX = 0.349    # about 20 degrees up
+
+# Gripper z in base_link for rows 1..4, top shelf first.
+DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
 # Scan returns inside this radius of base_footprint are the robot itself, not obstacles.
 # The base is 0.717 x 0.497 m, so its circumscribed radius is 0.437 m; this sits just
@@ -107,6 +118,7 @@ class ApproachNode(Node):
         self.declare_parameter("min_safe_range_m", 0.55)
         self.declare_parameter("state_timeout_sec", 45.0)
         self.declare_parameter("search_rate", 0.35)
+        self.declare_parameter("row_heights", DEFAULT_ROW_HEIGHTS)
         # Searching gets its own budget: a full turn at 0.35 rad/s is about 18 s of
         # simulation time, which at a real-time factor near 0.5 is well over half a minute
         # of wall clock. The ordinary state timeout would abort mid-sweep.
@@ -146,6 +158,12 @@ class ApproachNode(Node):
         # all four books of the column in frame, and at grasping range the column no
         # longer fits, so driving first and identifying later never succeeds.
         self.row_seen = False
+        self.target_row: Optional[int] = None
+        self.head_tilt: Optional[float] = None
+        self.row_heights = list(
+            self.get_parameter("row_heights").value or DEFAULT_ROW_HEIGHTS)
+        self.pub_head = self.create_publisher(
+            JointTrajectory, "/head_controller/joint_trajectory", 10)
         self.create_subscription(Int32, TOPIC_TARGET_ROW, self._on_row, 10)
         self.create_subscription(Float32, TOPIC_TARGET_COLUMN_X, self._on_column_x, 10)
         self.create_subscription(LaserScan, TOPIC_SCAN, self._on_scan, SENSOR_QOS)
@@ -398,6 +416,59 @@ class ApproachNode(Node):
 
     def _on_row(self, msg: Int32) -> None:
         self.row_seen = True
+        self.target_row = int(msg.data)
+
+    def _aim_head(self) -> None:
+        """Tilt the head to keep the target row in frame as the robot closes in.
+
+        Approaching with the head level loses the books out of the bottom of the image
+        well before grasping range, which is what stopped the book point being published
+        just when the grasp controller needed it.
+
+        head_2_joint is negative for down, essentially one-for-one in radians (measured:
+        -0.40 gives 22.9 degrees down, -0.80 gives 45.8), with 60 degrees of downward
+        travel available.
+        """
+        if self.target_row is None:
+            return
+        if not 1 <= self.target_row <= len(self.row_heights):
+            return
+        target_z = self.row_heights[self.target_row - 1]
+
+        distance = self._range_ahead()
+        if distance is None or distance < 0.05:
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                BASE_FRAME, CAMERA_FRAME, rclpy.time.Time())
+        except Exception:  # noqa: BLE001
+            return
+        camera_z = tf.transform.translation.z
+
+        # base_link sits above base_footprint, and row heights are quoted in base_link,
+        # so put both in the same frame before taking the difference.
+        drop = (camera_z - BASE_LINK_Z) - target_z
+        desired = -math.atan2(drop, distance)
+        desired = max(HEAD_TILT_MIN, min(HEAD_TILT_MAX, desired))
+
+        # Only re-send on a meaningful change. Every JointTrajectory replaces the one in
+        # progress and restarts its time_from_start, so a trajectory re-sent every tick
+        # never finishes and the head never actually arrives.
+        if self.head_tilt is not None and abs(desired - self.head_tilt) < 0.05:
+            return
+        self.head_tilt = desired
+
+        traj = JointTrajectory()
+        traj.joint_names = ["head_1_joint", "head_2_joint"]
+        point = JointTrajectoryPoint()
+        point.positions = [0.0, float(desired)]
+        point.time_from_start = Duration(sec=1, nanosec=0)
+        traj.points = [point]
+        self.pub_head.publish(traj)
+        self.get_logger().info(
+            f"head tilt -> {math.degrees(-desired):+.0f} deg down "
+            f"(row {self.target_row} at {distance:.2f} m)"
+        )
 
     def _do_centre(self) -> None:
         column_cx = self._column_cx_fresh()
@@ -435,6 +506,9 @@ class ApproachNode(Node):
             self._stop()
             self._enter(State.SQUARE)
             return
+
+        # Keep the target row in frame as the gap closes.
+        self._aim_head()
 
         cmd = Twist()
         cmd.linear.x = min(self.max_fwd, max(0.05, 0.5 * remaining))

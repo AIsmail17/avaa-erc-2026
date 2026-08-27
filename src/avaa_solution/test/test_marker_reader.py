@@ -65,6 +65,22 @@ def test_blank_scene_yields_nothing():
     assert mr.read_markers(np.full((200, 640, 3), 210, np.uint8)) == []
 
 
+def test_tiny_dark_blobs_are_not_read_as_digits(textures):
+    # A 0.30 m plate at 8 px implies about 12 m, past the arena diagonal. An 8 px blob on
+    # a blank wall was once read as a confident "4", which stopped the search facing away
+    # from the shelves and took the whole run with it.
+    img = scene([4], textures, height=8)
+    assert mr.read_markers(img) == []
+
+
+def test_a_marker_at_the_minimum_size_is_still_read(textures):
+    # The floor must reject noise without discarding genuinely distant markers.
+    img = scene([4], textures, height=mr.MIN_MARKER_HEIGHT_PX + 2)
+    markers = mr.read_markers(img)
+    assert len(markers) == 1
+    assert markers[0].digit == 4
+
+
 def test_saturated_books_are_not_mistaken_for_markers():
     # Books are strongly saturated; markers are dark and achromatic.
     img = np.full((200, 640, 3), 210, np.uint8)
