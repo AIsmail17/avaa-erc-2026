@@ -1,0 +1,115 @@
+# Team AVAA — project state
+
+**Read this first when resuming.** Written 2026-08-27. Phase 1 deadline **2026-09-15**.
+
+Nothing important lives in a chat transcript. Everything is in this folder, in the repo, or
+in the git history — which carries the reasoning, not just the diffs.
+
+---
+
+## Repository
+
+`https://github.com/AIsmail17/avaa-erc-2026` — branch **`avaa`**, private.
+Local: `~/erc/erc_sim_2026` inside WSL (physically on D: via the VHDX).
+
+The commit messages are the design record. `git log` is worth reading before changing
+anything, because most non-obvious decisions have a measurement behind them.
+
+## Documents in this folder
+
+| File | What it holds |
+|---|---|
+| `NOTES.md` | Competition rules, scoring, deliverables |
+| `SETUP.md` | Environment build, with every trap hit along the way |
+| `PERCEPTION.md` | Colour and marker detection, measured accuracy, 3D localisation |
+| `MANIPULATION.md` | Gripper curve, reach envelope, arm kinematics, tuck pose |
+| `ORGANISER_QUESTIONS.md` | Four questions; all answered internally, none confirmed by the committee |
+| `STATE.md` | This file |
+
+---
+
+## Where the work stands
+
+| Piece | State |
+|---|---|
+| Environment | ✅ WSL 2.9.9 + Docker + GPU, RTF ~0.5 |
+| Perception — column marker (1–5) | ✅ verified, 9 viewpoints, no misreads |
+| Perception — book colour and row | ✅ verified, 16/16 books, 0 false positives |
+| Scoring topics + annotated images | ✅ both written, timestamped |
+| Nav2 gross navigation | ✅ works to ~0.35 m tolerance |
+| Fine approach controller | ⚠️ **works sometimes** — not reliable |
+| Arm kinematics + IK | ✅ exact to 0.7 mm; all four rows reachable |
+| Grasp controller | ⚠️ **written and unit-tested, never run end to end** |
+| Place in bin | ❌ not started |
+| Video (D2) | ❌ not started |
+| Report (D3) | ❌ not started |
+
+**80 unit tests**, no simulator required:
+
+```bash
+sim shell
+cd /opt/erc_ws/src/avaa_solution && python3 -m pytest test/ -q
+```
+
+---
+
+## The next step
+
+**Get one clean end-to-end pick.** Everything upstream is measured; what has never happened
+is the whole chain running through in a single trial.
+
+```bash
+sim start --fast --headless
+# then, in the container, with use_sim_time on every node:
+ros2 run avaa_solution perception --ros-args -p use_sim_time:=true \
+    -p shelf_column_number:=3 -p book_colour:=blue
+ros2 run avaa_solution approach --ros-args -p use_sim_time:=true
+ros2 run avaa_solution grasp    --ros-args -p use_sim_time:=true
+```
+
+Two or three clean picks before trusting it. After that: placing in the bin (+2 dropped,
+**+4 gently placed** — the largest single scoring item in the task), then the video and
+report.
+
+---
+
+## What will bite you
+
+- **`use_sim_time:=true` on every node.** Gazebo stamps TF with `/clock`, hours behind wall
+  time. Without it tf2 floods with `TF_OLD_DATA` and lookups silently return nothing.
+- **Gazebo dies unpredictably.** WSL GPU device removal, roughly every 10–30 minutes under
+  load. `wsl --shutdown`, then recreate the container with `./docker/up-wsl.sh` — a
+  container *restart* is not enough, its mounts go stale.
+- **`sim start --fast --headless` is much more stable** than with the GUI. Use the GUI only
+  to watch or to record.
+- **Recreating the container wipes `install/` and `build/`.** Expected; rebuild takes 15 s.
+- **Re-publishing a `JointTrajectory` restarts it**, resetting `time_from_start`. A
+  trajectory re-sent on a timer never completes.
+- **The torso undershoots by 2.5–3 cm**, repeatably. `TORSO_BIAS` compensates.
+- **Don't read gripper state from `/joint_states`** — the linkage joints are not published
+  there. Use TF.
+- **The stowed arm sits in the LiDAR plane.** Returns within 0.45 m of `base_footprint` are
+  the robot seeing itself.
+
+## Known-unresolved
+
+1. **Depth has a systematic vertical bias of ~+0.108 m.** Occlusion, model origin and
+   frame mismatch all ruled out. Worked around by taking height from the identified row
+   and only x/y from depth. Worth revisiting if it shows up elsewhere.
+2. **The fine approach is not reliable.** It has completed a full run (2.95 m → 0.82 m,
+   squared up) and it has also crept and stalled. Suspect the target marker drifting to
+   the frame edge and the yaw correction dominating forward drive.
+3. **Nav2's DWB stops ~0.3 m short** of any goal and will not close further. Not
+   CPU-related — measured with zero control-loop rate misses. Hence the separate approach
+   controller.
+
+## Decisions taken, and why
+
+- **No MoveIt.** Installed but has no SRDF for this robot in the image, despite the Phase 1
+  document saying it is "configured". IK is solved directly from the URDF instead.
+- **No lateral base motion.** Commanding pure `vy` yaws the base by roughly the magnitude
+  it strafes. Rotate-then-drive avoids it.
+- **Map-less Nav2 in the `odom` frame.** No prior map, start pose not guaranteed, a trial
+  travels a few metres so drift stays well under the clearances.
+- **Row numbering is a launch parameter** (`rows_top_down`), not a baked-in assumption,
+  because the rules never state which end row 1 is.
