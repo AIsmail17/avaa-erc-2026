@@ -234,16 +234,27 @@ class PerceptionNode(Node):
         if not self.book_colour:
             return
         row = bd.row_of(columns[column_index], self.book_colour)
-        if row is None:
+
+        # Latch the row once resolved.
+        #
+        # Resolving it needs all four books of the column in frame, which only holds at a
+        # distance. By grasping range the column no longer fits in the image and row_of()
+        # correctly returns None -- so without a latch perception stops reporting the row
+        # exactly when the grasp controller starts needing it. The row cannot change
+        # during a run, so the first confident answer stands.
+        if row is not None:
+            if row != self.reported_row:
+                self.get_logger().info(f"target {self.book_colour} book is on row {row}")
+                self.reported_row = row
+        elif self.reported_row is not None:
+            row = self.reported_row
+        else:
             self.get_logger().warn(
-                f"row not resolvable: column {column_index} shows "
-                f"{len(columns[column_index])} of {bd.ROWS_PER_COLUMN} books"
+                f"row not resolvable yet: column {column_index} shows "
+                f"{len(columns[column_index])} of {bd.ROWS_PER_COLUMN} books",
+                throttle_duration_sec=5.0,
             )
             return
-
-        if row != self.reported_row:
-            self.get_logger().info(f"target {self.book_colour} book is on row {row}")
-            self.reported_row = row
         self.pub_row.publish(Int32(data=row))
 
         target = bd.find_book(columns, column_index, self.book_colour)

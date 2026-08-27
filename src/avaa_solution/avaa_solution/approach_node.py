@@ -31,7 +31,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import LaserScan
 from builtin_interfaces.msg import Duration
-from std_msgs.msg import Float32, String
+from std_msgs.msg import Float32, Int32, String
 from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -43,6 +43,7 @@ BASE_FRAME = "base_footprint"
 SELF_FILTER_RADIUS = 0.45
 
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
+TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
 TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
@@ -75,6 +76,7 @@ TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
 class State(Enum):
     WAITING = "waiting"
     TUCK = "tucking"
+    SEARCH = "searching"
     CENTRE = "centring"
     APPROACH = "approaching"
     SQUARE = "squaring"
@@ -104,6 +106,11 @@ class ApproachNode(Node):
         # roughly 0.19 m of margin.
         self.declare_parameter("min_safe_range_m", 0.55)
         self.declare_parameter("state_timeout_sec", 45.0)
+        self.declare_parameter("search_rate", 0.35)
+        # Searching gets its own budget: a full turn at 0.35 rad/s is about 18 s of
+        # simulation time, which at a real-time factor near 0.5 is well over half a minute
+        # of wall clock. The ordinary state timeout would abort mid-sweep.
+        self.declare_parameter("search_timeout_sec", 150.0)
         self.declare_parameter("image_width_px", 640)
         self.declare_parameter("tuck_time_sec", 5.0)
 
@@ -115,6 +122,8 @@ class ApproachNode(Node):
         self.max_fwd = float(self.get_parameter("max_forward").value)
         self.min_safe = float(self.get_parameter("min_safe_range_m").value)
         self.timeout = float(self.get_parameter("state_timeout_sec").value)
+        self.search_rate = float(self.get_parameter("search_rate").value)
+        self.search_timeout = float(self.get_parameter("search_timeout_sec").value)
         self.image_width = int(self.get_parameter("image_width_px").value)
         self.tuck_time = float(self.get_parameter("tuck_time_sec").value)
 
@@ -133,6 +142,11 @@ class ApproachNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        # The row has to be identified before closing in, not after. Resolving it needs
+        # all four books of the column in frame, and at grasping range the column no
+        # longer fits, so driving first and identifying later never succeeds.
+        self.row_seen = False
+        self.create_subscription(Int32, TOPIC_TARGET_ROW, self._on_row, 10)
         self.create_subscription(Float32, TOPIC_TARGET_COLUMN_X, self._on_column_x, 10)
         self.create_subscription(LaserScan, TOPIC_SCAN, self._on_scan, SENSOR_QOS)
         self.pub_cmd = self.create_publisher(Twist, TOPIC_CMD, 10)
@@ -154,10 +168,6 @@ class ApproachNode(Node):
     def _on_column_x(self, msg: Float32) -> None:
         self.column_cx = float(msg.data)
         self.column_cx_at = self._now()
-        if self.state is State.WAITING:
-            # Stow the arms before any driving happens.
-            self._send_tuck()
-            self._enter(State.TUCK)
 
     def _column_cx_fresh(self, max_age: float = 1.5) -> Optional[float]:
         """The target column's image x, or None if perception has gone quiet.
@@ -243,10 +253,16 @@ class ApproachNode(Node):
         return float(min(math.hypot(x, y) for x, y in points))
 
     def _shelf_angle(self) -> Optional[float]:
-        """Angle of the shelf face relative to the robot, 0 when square on.
+        """Yaw error against the shelf face: 0 when square on, positive when yawed CCW.
 
         Fits a line to the forward returns. The shelf front is flat and 5.25 m wide, so
-        within a narrow cone it is a clean straight edge.
+        within a narrow cone it is a clean straight edge. For a robot yawed by theta, a
+        surface of constant world x appears in the robot frame with dx/dy = tan(theta), so
+        the fitted slope is the yaw error directly.
+
+        Returns None when the fit is not credible, rather than squaring up to whatever
+        happens to be in front. Without that guard a robot that has turned away from the
+        shelf will happily square itself to the far wall.
         """
         points = self._forward_points(half_angle=0.45)
         if len(points) < 12:
@@ -255,7 +271,13 @@ class ApproachNode(Node):
         ys = np.array([p[1] for p in points])
         # x as a function of y: the face is roughly parallel to the robot's y axis, so
         # this avoids the vertical-line singularity of fitting y = f(x).
-        slope, _intercept = np.polyfit(ys, xs, 1)
+        slope, intercept = np.polyfit(ys, xs, 1)
+
+        # A flat face fits tightly. A scattered cloud -- books at different depths, or two
+        # surfaces at once -- does not, and squaring to it would be meaningless.
+        residual = float(np.std(xs - (slope * ys + intercept)))
+        if residual > 0.08:
+            return None
         return float(math.atan(slope))
 
     # ------------------------------------------------------------------ control
@@ -269,18 +291,29 @@ class ApproachNode(Node):
     def _publish_state(self) -> None:
         self.pub_state.publish(String(data=self.state.value))
 
+    def _elapsed(self) -> float:
+        return self._now() - self.state_since
+
     def _stop(self) -> None:
         self.pub_cmd.publish(Twist())
 
     def _tick(self) -> None:
         self._publish_state()
 
-        if self.state in (State.DONE, State.FAILED, State.WAITING):
-            if self.state is not State.WAITING:
-                self._stop()
+        if self.state in (State.DONE, State.FAILED):
+            self._stop()
             return
 
-        if (self._now() - self.state_since) > self.timeout:
+        if self.state is State.WAITING:
+            # Stow the arms before anything moves, then go looking for the marker. The
+            # robot's start pose is not guaranteed to face the shelves -- in practice it
+            # spawns facing a wall -- so searching is part of the task, not a fallback.
+            self._send_tuck()
+            self._enter(State.TUCK)
+            return
+
+        budget = self.search_timeout if self.state is State.SEARCH else self.timeout
+        if self._elapsed() > budget:
             self.get_logger().error(f"timed out in {self.state.value}")
             self._stop()
             self._enter(State.FAILED)
@@ -298,6 +331,8 @@ class ApproachNode(Node):
 
         if self.state is State.TUCK:
             self._do_tuck()
+        elif self.state is State.SEARCH:
+            self._do_search()
         elif self.state is State.CENTRE:
             self._do_centre()
         elif self.state is State.APPROACH:
@@ -337,7 +372,32 @@ class ApproachNode(Node):
 
         # Wait out the full trajectory plus settling before allowing any motion.
         if elapsed >= self.tuck_time + 2.0:
+            self._enter(State.SEARCH)
+
+    def _do_search(self) -> None:
+        """Rotate on the spot until the target column's marker comes into view.
+
+        The robot spawns facing a wall and the marker digits are randomised per run, so
+        the target may be anywhere around it. Rotating in place is the cheapest way to
+        cover the full circle without risking a collision, and with the arms stowed the
+        base turns cleanly on the spot.
+        """
+        if self._column_cx_fresh() is not None:
+            self._stop()
+            self.get_logger().info("target marker found")
             self._enter(State.CENTRE)
+            return
+
+        cmd = Twist()
+        cmd.angular.z = self.search_rate
+        self.pub_cmd.publish(cmd)
+        self.get_logger().info(
+            f"searching for marker... ({self._elapsed():.0f}s)",
+            throttle_duration_sec=5.0,
+        )
+
+    def _on_row(self, msg: Int32) -> None:
+        self.row_seen = True
 
     def _do_centre(self) -> None:
         column_cx = self._column_cx_fresh()
@@ -347,6 +407,14 @@ class ApproachNode(Node):
         error_px = column_cx - self.image_width / 2.0
         if abs(error_px) <= self.centre_tol:
             self._stop()
+            # Hold here until the row has been read. This is the last point at which the
+            # whole column is in frame; drive closer and the chance is gone.
+            if not self.row_seen:
+                self.get_logger().info(
+                    "centred; waiting for the row before closing in",
+                    throttle_duration_sec=5.0,
+                )
+                return
             self._enter(State.APPROACH)
             return
         # Positive error means the column is right of centre, so turn clockwise.
@@ -363,10 +431,6 @@ class ApproachNode(Node):
             self._stop()
             return
         remaining = ahead - self.standoff
-        self.get_logger().info(
-            f"ahead={ahead:.2f} m  remaining={remaining:+.2f} m",
-            throttle_duration_sec=3.0,
-        )
         if remaining <= self.standoff_tol:
             self._stop()
             self._enter(State.SQUARE)
@@ -376,16 +440,30 @@ class ApproachNode(Node):
         cmd.linear.x = min(self.max_fwd, max(0.05, 0.5 * remaining))
         # Keep the column centred while driving; small correction only.
         column_cx = self._column_cx_fresh()
+        bearing = "stale"
         if column_cx is not None:
             error_px = column_cx - self.image_width / 2.0
+            bearing = f"{error_px:+6.1f}px"
             if abs(error_px) > self.centre_tol:
                 cmd.angular.z = -math.copysign(min(0.15, 0.002 * abs(error_px)), error_px)
         self.pub_cmd.publish(cmd)
 
+        # Log what was commanded alongside what the range is doing. Range alone cannot
+        # distinguish "commanding zero" from "commanding motion and not getting it", and
+        # those have opposite fixes.
+        self.get_logger().info(
+            f"ahead={ahead:.2f} remaining={remaining:+.2f} "
+            f"cmd vx={cmd.linear.x:.3f} wz={cmd.angular.z:+.3f} bearing={bearing}",
+            throttle_duration_sec=2.0,
+        )
+
     def _do_square(self) -> None:
         angle = self._shelf_angle()
         if angle is None:
+            # No credible flat surface ahead. Stop where we are rather than turning
+            # towards whatever else is in view.
             self._stop()
+            self.get_logger().warn("no flat face to square against; finishing as-is")
             self._enter(State.DONE)
             return
         if abs(angle) <= self.square_tol:
@@ -398,9 +476,18 @@ class ApproachNode(Node):
             )
             self._enter(State.DONE)
             return
+
+        # Rotate AGAINST the error. The fitted angle is the yaw error itself, so turning
+        # by +angle drives further off square, not towards it -- which sent the robot
+        # 155 degrees around until the shelf left the cone and it squared to a wall.
         cmd = Twist()
-        cmd.angular.z = math.copysign(min(self.max_yaw, 0.8 * abs(angle) + 0.08), angle)
+        cmd.angular.z = -math.copysign(min(self.max_yaw, 0.8 * abs(angle) + 0.08), angle)
         self.pub_cmd.publish(cmd)
+        self.get_logger().info(
+            f"squaring: face angle {math.degrees(angle):+.1f} deg, "
+            f"wz={cmd.angular.z:+.3f}",
+            throttle_duration_sec=2.0,
+        )
 
 
 def main(args=None) -> None:
