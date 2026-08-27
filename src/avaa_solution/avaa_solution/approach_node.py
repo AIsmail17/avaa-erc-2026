@@ -187,7 +187,13 @@ class ApproachNode(Node):
         self.max_retreats = 2
         # Perception runs at 5 Hz and the head is still settling when the drive ends, so
         # allow a moment before concluding the book is lost.
-        self.verify_grace = 4.0
+        self.verify_grace = 12.0
+        # The head's own trajectory is one second; give it that plus margin to stop.
+        self.head_settle = 2.5
+        # How long the book must stay located before the view counts as trustworthy.
+        self.book_hold_time = 3.0
+        self.verify_aimed_at: Optional[float] = None
+        self.book_held_since: Optional[float] = None
         self.create_subscription(
             PointStamped, TOPIC_BOOK_POINT, self._on_book_point, 10)
         self.row_heights = list(
@@ -543,15 +549,39 @@ class ApproachNode(Node):
         of a stall.
         """
         self._stop()
-        self._aim_head()
 
-        if self._book_located():
-            ahead = self._distance_to_face()
-            self.get_logger().info(
-                "approach complete — book in view at "
-                f"{ahead:.2f} m" if ahead is not None else "approach complete")
-            self._enter(State.DONE)
+        # Aim the head once on entry and then leave it alone. _aim_head publishes a
+        # one-second trajectory; re-issuing it here would keep the camera moving through
+        # the very check that is supposed to establish a settled view.
+        if self.verify_aimed_at is None:
+            self._aim_head()
+            self.verify_aimed_at = self._now()
+        if (self._now() - self.verify_aimed_at) < self.head_settle:
             return
+
+        # Require the book to be HELD, not merely glimpsed.
+        #
+        # Checking for a single sighting passes while the head is still sweeping: the book
+        # crosses the frame, the check fires, and the head then settles somewhere the book
+        # is not. One run verified successfully and had lost the book again 95 seconds
+        # later with the robot completely stationary.
+        if self._book_located():
+            if self.book_held_since is None:
+                self.book_held_since = self._now()
+            held = self._now() - self.book_held_since
+            if held >= self.book_hold_time:
+                ahead = self._distance_to_face()
+                self.get_logger().info(
+                    f"approach complete — book held for {held:.1f}s at "
+                    f"{ahead:.2f} m" if ahead is not None
+                    else f"approach complete — book held for {held:.1f}s")
+                self._enter(State.DONE)
+            return
+
+        # Lost it again: the hold has to restart from zero, not resume.
+        if self.book_held_since is not None:
+            self.get_logger().warn("book lost during the hold; restarting the count")
+            self.book_held_since = None
 
         if self._elapsed() < self.verify_grace:
             return  # give perception a moment before giving up on it
@@ -566,6 +596,9 @@ class ApproachNode(Node):
         self.get_logger().warn(
             f"book not in view; backing off to re-acquire "
             f"(attempt {self.retreats} of {self.max_retreats})")
+        # Reset the settling state so the next verification starts clean.
+        self.verify_aimed_at = None
+        self.book_held_since = None
         self._enter(State.RETREAT)
 
     def _do_retreat(self) -> None:

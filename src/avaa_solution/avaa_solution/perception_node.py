@@ -305,9 +305,29 @@ class PerceptionNode(Node):
         # correctly returns None -- so without a latch perception stops reporting the row
         # exactly when the grasp controller starts needing it. The row cannot change
         # during a run, so the first confident answer stands.
+        # Only trust a row read from a genuinely resolved column.
+        #
+        # With a single marker in view, group_by_anchors has no spacing to measure and
+        # falls back to estimating the column width from the marker's own apparent size.
+        # That estimate can sweep in books from the neighbouring column, and four books
+        # drawn from two columns still look like a complete column to row_of(). It then
+        # gets latched and never revised: one run resolved "row 4" from a single-column
+        # view and drove to a book that was actually on row 1, the full height of the
+        # shelf away.
+        #
+        # Two markers give a measured spacing, which is the difference between knowing
+        # where the column ends and guessing.
+        if row is not None and len(markers) < 2 and self.reported_row is None:
+            self.get_logger().warn(
+                "row seen but only one marker in view; waiting for a second before "
+                "trusting it", throttle_duration_sec=5.0)
+            row = None
+
         if row is not None:
             if row != self.reported_row:
-                self.get_logger().info(f"target {self.book_colour} book is on row {row}")
+                self.get_logger().info(
+                    f"target {self.book_colour} book is on row {row} "
+                    f"({len(markers)} marker(s) in view)")
                 self.reported_row = row
         elif self.reported_row is not None:
             row = self.reported_row
