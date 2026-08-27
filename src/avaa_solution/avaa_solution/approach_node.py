@@ -92,6 +92,8 @@ class State(Enum):
     CENTRE = "centring"
     ACQUIRE = "acquiring"
     APPROACH = "approaching"
+    VERIFY = "verifying"
+    RETREAT = "retreating"
     SQUARE = "squaring"
     DONE = "done"
     FAILED = "failed"
@@ -180,6 +182,12 @@ class ApproachNode(Node):
         self.book_point_at: Optional[float] = None
         self.book_x: Optional[float] = None
         self.approach_target = self.acquire_range
+        # Retry budget for losing the book on the final drive.
+        self.retreats = 0
+        self.max_retreats = 2
+        # Perception runs at 5 Hz and the head is still settling when the drive ends, so
+        # allow a moment before concluding the book is lost.
+        self.verify_grace = 4.0
         self.create_subscription(
             PointStamped, TOPIC_BOOK_POINT, self._on_book_point, 10)
         self.row_heights = list(
@@ -375,6 +383,10 @@ class ApproachNode(Node):
             self._do_search()
         elif self.state is State.ACQUIRE:
             self._do_acquire()
+        elif self.state is State.VERIFY:
+            self._do_verify()
+        elif self.state is State.RETREAT:
+            self._do_retreat()
         elif self.state is State.CENTRE:
             self._do_centre()
         elif self.state is State.APPROACH:
@@ -520,6 +532,59 @@ class ApproachNode(Node):
         if self.book_point_at is None:
             return False
         return (self._now() - self.book_point_at) <= max_age
+
+    def _do_verify(self) -> None:
+        """Confirm the book is still being tracked before handing over to the grasp.
+
+        The final drive can lose the book -- it leaves the frame, or the robot ends up
+        beside its column rather than in front of it -- and the failure is silent: the
+        approach reports success, the grasp controller waits in IDLE for a target that
+        never comes, and nothing says why. Checking here turns that into a retry instead
+        of a stall.
+        """
+        self._stop()
+        self._aim_head()
+
+        if self._book_located():
+            ahead = self._distance_to_face()
+            self.get_logger().info(
+                "approach complete — book in view at "
+                f"{ahead:.2f} m" if ahead is not None else "approach complete")
+            self._enter(State.DONE)
+            return
+
+        if self._elapsed() < self.verify_grace:
+            return  # give perception a moment before giving up on it
+
+        if self.retreats >= self.max_retreats:
+            self.get_logger().error(
+                f"book still not in view after {self.retreats} retreat(s); giving up")
+            self._enter(State.FAILED)
+            return
+
+        self.retreats += 1
+        self.get_logger().warn(
+            f"book not in view; backing off to re-acquire "
+            f"(attempt {self.retreats} of {self.max_retreats})")
+        self._enter(State.RETREAT)
+
+    def _do_retreat(self) -> None:
+        """Back away far enough for the whole column to be in frame again."""
+        ahead = self._distance_to_face()
+        if ahead is not None and ahead >= self.acquire_range:
+            self._stop()
+            self.approach_target = self.acquire_range
+            self._enter(State.ACQUIRE)
+            return
+        if self._elapsed() > 20.0:
+            # Ranging may itself be the thing that is broken; do not reverse indefinitely.
+            self._stop()
+            self.approach_target = self.acquire_range
+            self._enter(State.ACQUIRE)
+            return
+        cmd = Twist()
+        cmd.linear.x = -0.12
+        self.pub_cmd.publish(cmd)
 
     def _do_acquire(self) -> None:
         """Hold at a working distance until the book is seen and centred.
@@ -670,18 +735,14 @@ class ApproachNode(Node):
             # No credible flat surface ahead. Stop where we are rather than turning
             # towards whatever else is in view.
             self._stop()
-            self.get_logger().warn("no flat face to square against; finishing as-is")
-            self._enter(State.DONE)
+            self.get_logger().warn("no flat face to square against; verifying as-is")
+            self._enter(State.VERIFY)
             return
         if abs(angle) <= self.square_tol:
             self._stop()
-            ahead = self._range_ahead()
             self.get_logger().info(
-                f"approach complete — shelf at {ahead:.2f} m, "
-                f"face angle {math.degrees(angle):+.1f} deg"
-                if ahead is not None else "approach complete"
-            )
-            self._enter(State.DONE)
+                f"squared to {math.degrees(angle):+.1f} deg; verifying the book")
+            self._enter(State.VERIFY)
             return
 
         # Rotate AGAINST the error. The fitted angle is the yaw error itself, so turning
