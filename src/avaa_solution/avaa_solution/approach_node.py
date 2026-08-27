@@ -178,6 +178,7 @@ class ApproachNode(Node):
         # Set once the book has actually been located in 3D, which is the signal that it
         # is genuinely visible rather than merely expected to be.
         self.book_point_at: Optional[float] = None
+        self.book_x: Optional[float] = None
         self.approach_target = self.acquire_range
         self.create_subscription(
             PointStamped, TOPIC_BOOK_POINT, self._on_book_point, 10)
@@ -495,6 +496,24 @@ class ApproachNode(Node):
 
     def _on_book_point(self, msg: PointStamped) -> None:
         self.book_point_at = self._now()
+        self.book_x = float(msg.point.x)
+
+    def _distance_to_face(self) -> Optional[float]:
+        """Distance to the shelf face, preferring the book over the LiDAR.
+
+        The LiDAR reads THROUGH the open shelf to the back panel, so its forward range
+        overstates the distance to the shelf face by roughly the shelf's depth. Acting on
+        it drives the base into the unit: one run reported 0.85 m of clearance while the
+        robot's front corner was about 8 cm from the face and could no longer move.
+
+        The book's depth position does not have that problem -- it is a measurement of the
+        thing we actually care about, good to 15-35 mm in x against ground truth. Fall
+        back to the LiDAR only before the book has been found, when a rough range is
+        enough to close the initial distance.
+        """
+        if self._book_located() and self.book_x is not None:
+            return self.book_x
+        return self._range_ahead()
 
     def _book_located(self, max_age: float = 1.5) -> bool:
         """Whether the book is currently being located in 3D, not merely expected."""
@@ -515,6 +534,25 @@ class ApproachNode(Node):
         self._stop()
         self._aim_head()
 
+        # 1. Square to the shelf FIRST.
+        #
+        # Centring turns to face the column and then drives along that bearing, so the
+        # robot arrives at whatever angle it started at -- measured repeatedly at about
+        # 34 degrees. From there the camera looks along the shelf rather than at it and
+        # the target book leaves the frame entirely. Squaring here, at a range where the
+        # shelf front still reads as a flat face, means the final drive runs along the
+        # shelf normal.
+        angle = self._shelf_angle()
+        if angle is not None and abs(angle) > self.square_tol:
+            cmd = Twist()
+            cmd.angular.z = -math.copysign(
+                min(self.max_yaw, 0.8 * abs(angle) + 0.08), angle)
+            self.pub_cmd.publish(cmd)
+            self.get_logger().info(
+                f"acquiring: squaring, face {math.degrees(angle):+.1f} deg",
+                throttle_duration_sec=3.0)
+            return
+
         bearing = self._column_cx_fresh()
         located = self._book_located()
 
@@ -523,14 +561,15 @@ class ApproachNode(Node):
                 "acquiring: no bearing", throttle_duration_sec=3.0)
             return
 
+        # 2. Line up by STRAFING, not turning, so the heading stays square.
         error_px = bearing - self.image_width / 2.0
         if abs(error_px) > self.acquire_tol:
             cmd = Twist()
-            cmd.angular.z = -math.copysign(
-                min(self.max_yaw, 0.003 * abs(error_px) + 0.06), error_px)
+            cmd.linear.y = -math.copysign(
+                min(self.max_lateral, 0.0015 * abs(error_px) + 0.02), error_px)
             self.pub_cmd.publish(cmd)
             self.get_logger().info(
-                f"acquiring: centring, error {error_px:+.0f}px",
+                f"acquiring: strafing, error {error_px:+.0f}px",
                 throttle_duration_sec=3.0)
             return
 
@@ -573,7 +612,7 @@ class ApproachNode(Node):
         self.pub_cmd.publish(cmd)
 
     def _do_approach(self) -> None:
-        ahead = self._range_ahead()
+        ahead = self._distance_to_face()
         if ahead is None:
             self.get_logger().warn("no forward LiDAR returns; holding", throttle_duration_sec=3.0)
             self._stop()

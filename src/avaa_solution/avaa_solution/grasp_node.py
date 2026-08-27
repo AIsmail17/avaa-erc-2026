@@ -111,7 +111,17 @@ class GraspNode(Node):
         # organisers clarify otherwise it is a launch argument, not a rewrite.
         self.declare_parameter("rows_top_down", True)
         self.declare_parameter("standoff_m", 0.12)      # pre-grasp gap from the spine
-        self.declare_parameter("grasp_depth_m", 0.02)   # how far past the face to close
+        # How far past the measured face to close the gripper.
+        #
+        # Larger than the book's own 0.03 m spine thickness on purpose, because the depth
+        # estimate reads NEAR at grasping range and the error grows as the robot closes
+        # in: measured against ground truth it was 0.035 m short at 2.8 m but 0.114 m
+        # short at grasping range with the head tilted down. A first attempt with 0.02 m
+        # ran the whole sequence and closed the gripper on air 11 cm from the book.
+        #
+        # Books are 0.16 m deep, so reaching well past the apparent face stays inside the
+        # book rather than striking the shelf behind it.
+        self.declare_parameter("grasp_depth_m", 0.11)
         self.declare_parameter("lift_m", 0.03)
         self.declare_parameter("move_time_sec", 4.0)
         self.declare_parameter("gripper_time_sec", 2.0)

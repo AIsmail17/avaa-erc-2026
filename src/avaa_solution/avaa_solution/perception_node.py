@@ -96,7 +96,16 @@ class PerceptionNode(Node):
             os.makedirs(self.image_dir, exist_ok=True)
 
         self.depth_image = None
-        self.intrinsics: Optional[dl.Intrinsics] = None
+        # Start from the measured intrinsics rather than waiting for CameraInfo.
+        #
+        # CameraInfo is not reliably received: the depth image streams at 13 Hz while
+        # camera_info can be absent entirely, and a node that starts after the initial
+        # publication never sees it. Waiting for it meant _publish_book_point returned at
+        # its first guard for the whole run -- silently, because the surrounding log said
+        # the book was being tracked. The values are fixed for this camera and identical
+        # between the colour and depth streams; a live CameraInfo still overrides them.
+        self.intrinsics: Optional[dl.Intrinsics] = dl.Intrinsics(
+            fx=337.2096, fy=337.2096, cx=320.0, cy=180.0)
         self.depth_frame: Optional[str] = None
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -146,11 +155,12 @@ class PerceptionNode(Node):
             self.get_logger().warn(f"could not convert depth frame: {exc}")
 
     def _on_info(self, msg: CameraInfo) -> None:
-        if self.intrinsics is None:
-            self.intrinsics = dl.Intrinsics.from_k(msg.k)
+        live = dl.Intrinsics.from_k(msg.k)
+        if live != self.intrinsics:
+            self.intrinsics = live
             self.get_logger().info(
-                f"depth intrinsics: fx={self.intrinsics.fx:.1f} "
-                f"cx={self.intrinsics.cx:.1f} cy={self.intrinsics.cy:.1f}"
+                f"depth intrinsics from CameraInfo: fx={live.fx:.1f} "
+                f"cx={live.cx:.1f} cy={live.cy:.1f}"
             )
 
     def _track_book_without_marker(self, frame, books: List[bd.Book]) -> None:
@@ -195,6 +205,11 @@ class PerceptionNode(Node):
         found in colour indexes the depth image directly.
         """
         if self.depth_image is None or self.intrinsics is None or self.depth_frame is None:
+            return
+        if self.depth_frame is None:
+            self.get_logger().warn(
+                "no depth frame yet; cannot place the book in 3D",
+                throttle_duration_sec=5.0)
             return
         point_optical = dl.locate(target.bbox, self.depth_image, self.intrinsics)
         if point_optical is None:
