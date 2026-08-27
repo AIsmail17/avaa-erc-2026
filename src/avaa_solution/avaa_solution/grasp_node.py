@@ -113,15 +113,18 @@ class GraspNode(Node):
         self.declare_parameter("standoff_m", 0.12)      # pre-grasp gap from the spine
         # How far past the measured face to close the gripper.
         #
-        # Larger than the book's own 0.03 m spine thickness on purpose, because the depth
-        # estimate reads NEAR at grasping range and the error grows as the robot closes
-        # in: measured against ground truth it was 0.035 m short at 2.8 m but 0.114 m
-        # short at grasping range with the head tilted down. A first attempt with 0.02 m
-        # ran the whole sequence and closed the gripper on air 11 cm from the book.
+        # The depth measurement is good. An earlier note here claimed a 0.114 m near bias
+        # at grasping range; that was wrong, and the error was mine. Depth sees a book's
+        # FRONT FACE, while the Gazebo pose is its CENTRE, and the book is 0.16 m deep
+        # along x -- so the face sits 0.08 m in front of the coordinate I was comparing
+        # against. Measured properly, sampled depth was 2.738 m against a true
+        # camera-to-face distance of 2.755 m: accurate to 17 mm.
         #
-        # Books are 0.16 m deep, so reaching well past the apparent face stays inside the
-        # book rather than striking the shelf behind it.
-        self.declare_parameter("grasp_depth_m", 0.11)
+        # So this only has to carry the gripper from the face into the book far enough to
+        # grip the spine. 0.05 m is comfortably inside the book's 0.16 m depth and clear
+        # of the shelf behind it. The 0.11 m that briefly stood here would have driven the
+        # gripper 8 cm into the book.
+        self.declare_parameter("grasp_depth_m", 0.05)
         self.declare_parameter("lift_m", 0.03)
         self.declare_parameter("move_time_sec", 4.0)
         self.declare_parameter("gripper_time_sec", 2.0)
