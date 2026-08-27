@@ -29,6 +29,7 @@ setup(
         "console_scripts": [
             "mission = avaa_solution.mission_node:main",
             "approach = avaa_solution.approach_node:main",
+            "grasp = avaa_solution.grasp_node:main",
             "perception = avaa_solution.perception_node:main",
         ],
     },
