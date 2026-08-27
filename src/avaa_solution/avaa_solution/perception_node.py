@@ -262,14 +262,21 @@ class PerceptionNode(Node):
             self.reported_column = column_index
         self.pub_column.publish(Int32(data=column_index))
 
-        # Where the target column sits in the image, for the approach controller.
+        # Where to steer, for the approach controller.
         #
-        # The index above is frame-relative: it counts the columns currently in view, so
-        # it changes as markers enter and leave the frame -- observed jumping 1, 2, 1, 0
-        # across consecutive frames while the robot drove. Anything downstream that
-        # treated it as the column's identity ended up tracking a different column each
-        # frame. The marker's image x is the stable thing to servo on.
-        self.pub_column_x.publish(Float32(data=float(markers[column_index].cx)))
+        # Not the column index: that is frame-relative, counting the columns currently in
+        # view, so it changes as markers enter and leave the frame -- observed jumping
+        # 1, 2, 1, 0 across consecutive frames while the robot drove.
+        #
+        # Steer by the target BOOK whenever it can be seen, and only fall back to the
+        # marker before it has been found. Aiming the head down to keep the books in frame
+        # is precisely what drives the markers out of it, so steering by the marker fails
+        # exactly when the alignment needs to be at its best. One run ended at the shelf's
+        # end upright, looking along the shelves rather than at its column.
+        target_book = (bd.find_book(columns, column_index, self.book_colour)
+                       if self.book_colour else None)
+        steer_x = target_book.cx if target_book is not None else markers[column_index].cx
+        self.pub_column_x.publish(Float32(data=float(steer_x)))
         self._save_column_image(frame, books, columns, markers, column_index)
 
         if not self.book_colour:

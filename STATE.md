@@ -58,6 +58,38 @@ cd /opt/erc_ws/src/avaa_solution && python3 -m pytest test/ -q
 **Get one clean end-to-end pick.** Everything upstream is measured; what has never happened
 is the whole chain running through in a single trial.
 
+### Exactly where it stops (as of 2026-08-27)
+
+The approach now works: it tucks the arms, searches for the marker from the spawn pose,
+centres, drives in to 0.80 m, and squares up to within about 2 degrees. That part is
+repeatable.
+
+What fails is the last step before grasping — **the target book is not reliably in frame at
+grasping range**, so the book point is never published and the grasp controller sits in
+IDLE waiting for a target it never gets.
+
+Two things are in tension, and this is the crux:
+
+- **The camera must see the book** to locate it, which wants distance and a level head.
+- **The arm must reach the book**, which wants closeness — the reachability map loses a
+  corner of the envelope beyond 0.85 m.
+
+Tilting the head down keeps the books in frame but pushes the *markers* out, which is what
+the robot had been steering by. Steering now switches to the book itself once it is seen,
+but the handover is not yet reliable: if the robot drifts before the book is acquired, it
+can arrive at the shelf's end upright with nothing recognisable in view.
+
+Ideas not yet tried, roughly in order of promise:
+
+1. **Acquire the book before closing in.** Stop at ~1.5 m, tilt the head, confirm the book
+   is seen and centred, and only then drive the final stretch. Turns a handover mid-drive
+   into a checkpoint.
+2. **Use the depth point rather than the image bearing for the final metre.** The book's
+   3D position is already published and is good to 15-35 mm in x and y; driving to a pose
+   relative to that is stronger than centring pixels.
+3. **Head pan.** `head_1_joint` has +/-75 degrees and is unused. The robot could keep the
+   book in view while the base is not perfectly aligned.
+
 ```bash
 sim start --fast --headless
 # then, in the container, with use_sim_time on every node:
