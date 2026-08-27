@@ -105,8 +105,11 @@ class ArmChain:
             axis = ([float(v) for v in axis_el.get("xyz").split()]
                     if axis_el is not None and axis_el.get("xyz") else None)
             limit = element.find("limit")
-            lower = float(limit.get("lower")) if limit is not None and limit.get("lower") else -math.pi
-            upper = float(limit.get("upper")) if limit is not None and limit.get("upper") else math.pi
+            has = limit is not None
+            lower = (float(limit.get("lower")) if has and limit.get("lower")
+                     else -math.pi)
+            upper = (float(limit.get("upper")) if has and limit.get("upper")
+                     else math.pi)
             raw[name] = Joint(
                 name=name,
                 kind=element.get("type"),
@@ -160,20 +163,47 @@ class ArmChain:
         return [j.clamp(float(v)) for j, v in zip(self.moving, values)]
 
     def ik(self, target: Sequence[float], seed: Optional[Sequence[float]] = None,
-           tolerance: float = 0.005) -> Optional[List[float]]:
-        """Joint values placing the gripper at ``target`` (x, y, z) in base_link.
+           tolerance: float = 0.005,
+           approach: Optional[Sequence[float]] = None,
+           closing: Optional[Sequence[float]] = None,
+           orientation_tolerance: float = 0.26) -> Optional[List[float]]:
+        """Joint values placing the gripper at target (x, y, z) in base_link.
 
-        Position only -- orientation is left free. For reaching into a shelf the approach
-        direction matters, but the arm has seven joints for three constraints, so pinning
-        orientation as well tends to make the solve fail outright rather than return
-        something workable. Orientation is handled by seeding from a posture that already
-        points the right way.
+        With approach and closing left out this solves position only, which is
+        fine for waypoints in free space. It is emphatically not fine for a grasp: the
+        arm has seven joints for three constraints, so the redundancy gets resolved
+        arbitrarily and the wrist will happily arrive at exactly the right point having
+        reached around from the far side. Measured on a real shelf target, a
+        position-only solve put the approach axis 78 degrees off and the finger travel
+        41 degrees off. The hand closed past the corner of the book without touching it
+        and every downstream check reported success.
 
-        Returns None when no solution reaches within ``tolerance``.
+        For a grasp, pass both directions, in base_link:
+
+            approach  where the gripper reaches, its local +x, so [1, 0, 0] to reach
+                      straight into a shelf the robot has squared up to
+            closing   where the fingers travel, its local +y, so [0, 1, 0] to close
+                      across a book standing spine-out
+
+        Those two axes come from the URDF: the fingers sit at y = +/-0.0288 offset
+        +0.0756 along z in gripper_left_base_link, and the grasping frame adds a -pi/2
+        pitch, which turns that into local x for the approach and local y for the
+        finger travel.
+
+        The closing axis is sign-agnostic -- the jaws are symmetric, so a solution with
+        the fingers swapped is the same grasp.
+
+        Returns None when nothing reaches within tolerance metres, or when an
+        orientation was requested and no solution holds both axes within
+        orientation_tolerance radians.
         """
         from scipy.optimize import least_squares
 
         target = np.asarray(target, dtype=float)
+        want_orientation = approach is not None or closing is not None
+        approach_v = _unit(approach) if approach is not None else None
+        closing_v = _unit(closing) if closing is not None else None
+
         seed = list(seed) if seed is not None else [
             0.5 * (lo + hi) for lo, hi in self.limits
         ]
@@ -181,13 +211,39 @@ class ArmChain:
         lower = [lo for lo, _ in self.limits]
         upper = [hi for _, hi in self.limits]
 
+        # Orientation error is dimensionless where position error is in metres. This
+        # scale makes a 10-degree axis error weigh about as much as 9 mm of position
+        # error, so the solver squares the wrist up before chasing the last millimetre.
+        weight = 0.05
+
         def residual(values):
-            return self.position(values) - target
+            pose = self.fk(values)
+            terms = [pose[:3, 3] - target]
+            if approach_v is not None:
+                terms.append(weight * (pose[:3, 0] - approach_v))
+            if closing_v is not None:
+                axis = pose[:3, 1]
+                sign = 1.0 if float(axis @ closing_v) >= 0.0 else -1.0
+                terms.append(weight * (axis - sign * closing_v))
+            return np.concatenate(terms)
+
+        def errors(values):
+            pose = self.fk(values)
+            position = float(np.linalg.norm(pose[:3, 3] - target))
+            angle = 0.0
+            if approach_v is not None:
+                angle = max(angle, _angle_between(pose[:3, 0], approach_v))
+            if closing_v is not None:
+                axis = pose[:3, 1]
+                sign = 1.0 if float(axis @ closing_v) >= 0.0 else -1.0
+                angle = max(angle, _angle_between(axis, sign * closing_v))
+            return position, angle
 
         best = None
         # A few restarts: the arm is redundant and the solver can settle in a local
-        # minimum that does not reach, particularly near the limits.
-        for attempt in range(6):
+        # minimum that does not reach, particularly near the limits. Pinning the wrist
+        # narrows the basin, so allow more attempts when orientation matters.
+        for attempt in range(20 if want_orientation else 6):
             start = seed if attempt == 0 else [
                 np.random.uniform(lo, hi) for lo, hi in self.limits
             ]
@@ -198,12 +254,34 @@ class ArmChain:
                 )
             except Exception:  # noqa: BLE001 - a failed attempt is not fatal
                 continue
-            error = float(np.linalg.norm(result.fun))
-            if best is None or error < best[0]:
-                best = (error, list(result.x))
-            if error <= tolerance:
+            position_error, angle_error = errors(result.x)
+            # Rank on position, but never prefer a pose whose wrist is out of spec over
+            # one that is within it, however close the out-of-spec one reaches.
+            key = (angle_error > orientation_tolerance, position_error)
+            if best is None or key < best[0]:
+                best = (key, list(result.x), position_error, angle_error)
+            if position_error <= tolerance and angle_error <= orientation_tolerance:
                 break
 
-        if best is None or best[0] > tolerance:
+        if best is None:
             return None
-        return best[1]
+        _, values, position_error, angle_error = best
+        if position_error > tolerance:
+            return None
+        if want_orientation and angle_error > orientation_tolerance:
+            return None
+        return values
+
+
+def _unit(vector: Sequence[float]) -> np.ndarray:
+    v = np.asarray(vector, dtype=float)
+    norm = float(np.linalg.norm(v))
+    if norm == 0.0:
+        raise ValueError("direction vector must be non-zero")
+    return v / norm
+
+
+def _angle_between(a: np.ndarray, b: np.ndarray) -> float:
+    """Angle in radians between two vectors, neither assumed to be normalised."""
+    cosine = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+    return math.acos(max(-1.0, min(1.0, cosine)))

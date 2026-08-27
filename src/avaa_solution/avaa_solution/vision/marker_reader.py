@@ -173,7 +173,7 @@ def _iou(a: np.ndarray, b: np.ndarray) -> float:
 def score_all(crop: np.ndarray,
               templates: Optional[Dict[int, np.ndarray]] = None
               ) -> Optional[Dict[int, float]]:
-    """IoU of one cropped marker against every digit template."""
+    """Score one cropped marker by IoU against every digit template."""
     templates = templates or load_templates()
     norm = _normalise(_ink_mask(crop))
     if norm is None:

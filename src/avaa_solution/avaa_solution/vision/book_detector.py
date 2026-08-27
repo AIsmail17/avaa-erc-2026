@@ -202,7 +202,7 @@ def row_of(column: Sequence[Book], colour: str) -> Optional[int]:
 
 def find_book(columns: Sequence[Sequence[Book]], column_index: int,
               colour: str) -> Optional[Book]:
-    """The book of ``colour`` in the given 0-based column, or None."""
+    """Return the book of ``colour`` in the given 0-based column, or None."""
     if not 0 <= column_index < len(columns):
         return None
     for book in columns[column_index]:

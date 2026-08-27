@@ -48,7 +48,7 @@ def sample_depth(depth_image: np.ndarray,
                  shrink: float = 0.4,
                  min_valid: int = 4,
                  max_range: float = 8.0) -> Optional[float]:
-    """A robust depth for one bounding box, or None if there is not enough signal.
+    """Measure a robust depth for one box, or None if there is too little signal.
 
     Takes the median over a shrunk central patch rather than the single centre pixel.
     Books are thin and stand against an open shelf, so a box edge often straddles the gap

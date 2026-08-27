@@ -25,7 +25,6 @@ in the competition image but has no SRDF for this robot, so there is no configur
 group to ask.
 """
 
-import math
 from enum import Enum
 from typing import List, Optional
 
@@ -62,6 +61,13 @@ DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 # The torso settles 2.5-3 cm short of whatever it is commanded, repeatably and in both
 # directions of travel (see MANIPULATION.md). Command past the target to land on it.
 TORSO_BIAS = 0.028
+
+# Which way the hand must be held to take a book off a shelf, in base_link, for an
+# arm whose seven joints leave four degrees of freedom spare. Without these the
+# solver picks a wrist at random: it reached the right point with the approach axis
+# 78 degrees out and closed the fingers past the corner of the book. See ArmChain.ik.
+GRASP_APPROACH = [1.0, 0.0, 0.0]   # reach straight into the shelf
+GRASP_CLOSING = [0.0, 1.0, 0.0]    # fingers close across the spine
 
 # Driving posture, measured to sit inside the base footprint.
 TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
@@ -206,7 +212,14 @@ class GraspNode(Node):
         return row_to_height(row, self.row_heights, self.rows_top_down)
 
     def _solve(self, target: np.ndarray, seed: Optional[List[float]] = None):
-        return self.chain.ik(target, seed=seed)
+        """Every solve in this node holds the same wrist, not just the grasp itself.
+
+        The lift and the withdraw run through here too, and they matter as much: a
+        wrist left free to rotate while the fingers are clamped twists the book back
+        out of the shelf instead of drawing it clear.
+        """
+        return self.chain.ik(target, seed=seed,
+                             approach=GRASP_APPROACH, closing=GRASP_CLOSING)
 
     def _plan(self) -> bool:
         """Work out the pre-grasp and grasp joint targets. False if unreachable."""

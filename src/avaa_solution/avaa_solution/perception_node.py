@@ -317,10 +317,16 @@ class PerceptionNode(Node):
         #
         # Two markers give a measured spacing, which is the difference between knowing
         # where the column ends and guessing.
-        if row is not None and len(markers) < 2 and self.reported_row is None:
-            self.get_logger().warn(
-                "row seen but only one marker in view; waiting for a second before "
-                "trusting it", throttle_duration_sec=5.0)
+        # This applies whether or not a row is already held. Guarding only the first
+        # reading was worse than useless: a good two-marker answer would be latched and
+        # then overwritten by a single-marker one a few frames later. Observed exactly
+        # that -- "on row 4 (2 marker(s) in view)" followed by "on row 3 (1 marker(s) in
+        # view)" -- and the grasp used the corrupted value. Row 4 had been correct.
+        if row is not None and len(markers) < 2:
+            if self.reported_row is None:
+                self.get_logger().warn(
+                    "row seen but only one marker in view; waiting for a second before "
+                    "trusting it", throttle_duration_sec=5.0)
             row = None
 
         if row is not None:

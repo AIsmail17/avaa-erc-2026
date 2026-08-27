@@ -184,6 +184,13 @@ class ApproachNode(Node):
         self.approach_target = self.acquire_range
         # Retry budget for losing the book on the final drive.
         self.retreats = 0
+        # How deep a slab around the nearest return still counts as the shelf face.
+        # Wide enough for a face seen at a steep angle, narrow enough to exclude the
+        # wall behind the shelf.
+        self.face_band = 0.60
+        # How long a bad scan is tolerated before treating it as a real obstruction.
+        self.square_grace = 4.0
+        self.square_lost_since = None
         self.max_retreats = 2
         # Perception runs at 5 Hz and the head is still settling when the drive ends, so
         # allow a moment before concluding the book is lost.
@@ -224,7 +231,7 @@ class ApproachNode(Node):
         self.column_cx_at = self._now()
 
     def _column_cx_fresh(self, max_age: float = 1.5) -> Optional[float]:
-        """The target column's image x, or None if perception has gone quiet.
+        """Give the target column image x, or None if perception has gone quiet.
 
         Acting on a stale bearing steers toward where the column used to be, so the
         controller stops rather than guessing.
@@ -288,7 +295,7 @@ class ApproachNode(Node):
         return points
 
     def _forward_points(self, half_angle: float = 0.30) -> List[Tuple[float, float]]:
-        """Returns within +/- half_angle of straight ahead, as (x, y) in base_footprint."""
+        """Return hits within +/- half_angle of ahead, as (x, y) in base_footprint."""
         return [(x, y) for x, y in self._scan_points_base()
                 if x > 0.0 and abs(math.atan2(y, x)) <= half_angle]
 
@@ -323,9 +330,30 @@ class ApproachNode(Node):
             return None
         xs = np.array([p[0] for p in points])
         ys = np.array([p[1] for p in points])
+
+        # Keep only the nearest surface before fitting. Close to the shelf this cone
+        # reaches past the end of it and picks up the far wall: measured in the pose
+        # that broke a run, 226 returns spanning x from 0.74 to 3.62 m, which dragged
+        # the fitted angle from -34 to -53 degrees and put the residual at 0.26 m. The
+        # guard below then refused, and the approach carried on unsquared into a grasp
+        # that assumes square. The same scan restricted to the face fits at -33.7 deg
+        # against a true -35.8, with a residual of 0.02 m.
+        near = float(np.percentile(xs, 10))
+        keep = xs <= near + self.face_band
+        xs, ys = xs[keep], ys[keep]
+        if len(xs) < 12:
+            return None
         # x as a function of y: the face is roughly parallel to the robot's y axis, so
         # this avoids the vertical-line singularity of fitting y = f(x).
         slope, intercept = np.polyfit(ys, xs, 1)
+
+        # A shelf upright or a protruding book still skews a least-squares line, so
+        # drop the worst offenders once and refit on what is left.
+        spread = xs - (slope * ys + intercept)
+        keep = np.abs(spread) <= 3.0 * max(float(np.std(spread)), 0.01)
+        if 12 <= int(keep.sum()) < len(xs):
+            xs, ys = xs[keep], ys[keep]
+            slope, intercept = np.polyfit(ys, xs, 1)
 
         # A flat face fits tightly. A scattered cloud -- books at different depths, or two
         # surfaces at once -- does not, and squaring to it would be meaningless.
@@ -765,12 +793,37 @@ class ApproachNode(Node):
     def _do_square(self) -> None:
         angle = self._shelf_angle()
         if angle is None:
-            # No credible flat surface ahead. Stop where we are rather than turning
-            # towards whatever else is in view.
+            # No credible flat surface ahead. Do NOT carry on: the grasp reaches
+            # along the base's own x axis, so handing it an unsquared base aims
+            # the hand across the book faces rather than into the shelf. One run did
+            # exactly that, ending 35.8 degrees off with the target 15 mm from where
+            # it believed it was, and still came away empty while every log said it
+            # had worked.
             self._stop()
-            self.get_logger().warn("no flat face to square against; verifying as-is")
-            self._enter(State.VERIFY)
+            if self.square_lost_since is None:
+                self.square_lost_since = self._now()
+            waited = self._now() - self.square_lost_since
+            if waited < self.square_grace:
+                self.get_logger().warn(
+                    "no flat face to square against; waiting for a clean scan",
+                    throttle_duration_sec=2.0)
+                return
+            if self.retreats >= self.max_retreats:
+                self.get_logger().error(
+                    "still no flat face after %d retreat(s); giving up rather "
+                    "than grasping unsquared" % self.retreats)
+                self._enter(State.FAILED)
+                return
+            self.retreats += 1
+            self.get_logger().warn(
+                "no flat face to square against; backing off to try again "
+                "(attempt %d of %d)" % (self.retreats, self.max_retreats))
+            self.square_lost_since = None
+            self.verify_aimed_at = None
+            self.book_held_since = None
+            self._enter(State.RETREAT)
             return
+        self.square_lost_since = None
         if abs(angle) <= self.square_tol:
             self._stop()
             self.get_logger().info(
