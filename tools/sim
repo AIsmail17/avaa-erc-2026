@@ -175,6 +175,12 @@ ORPHAN_PATTERNS=(
     '[r]obot_state_publisher'
     '[g]ripper_command_clamp'
     '[s]pawner'
+    # Our own nodes too. Restarting the simulation leaves them talking to a Gazebo that no
+    # longer exists, and the next run then stacks a second copy on top: two approach
+    # controllers fighting over /cmd_vel, two robot_state_publishers producing
+    # TF_OLD_DATA, and a real-time factor down at 0.08. Every measurement taken in that
+    # state is worthless, and it is not obvious from the logs that anything is wrong.
+    'avaa_solution/lib'
 )
 
 stop_orphans() {

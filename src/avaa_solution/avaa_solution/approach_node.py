@@ -25,7 +25,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PointStamped, Twist
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
@@ -55,6 +55,7 @@ SELF_FILTER_RADIUS = 0.45
 
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
+TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
 TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
@@ -89,6 +90,7 @@ class State(Enum):
     TUCK = "tucking"
     SEARCH = "searching"
     CENTRE = "centring"
+    ACQUIRE = "acquiring"
     APPROACH = "approaching"
     SQUARE = "squaring"
     DONE = "done"
@@ -111,6 +113,7 @@ class ApproachNode(Node):
         self.declare_parameter("square_tolerance_rad", 0.05)
         self.declare_parameter("max_yaw_rate", 0.45)
         self.declare_parameter("max_forward", 0.22)
+        self.declare_parameter("max_lateral", 0.10)
         # Refuse to drive closer than this whatever the standoff says, so a bad reading
         # cannot push the base into the shelf. A collision costs 0.5 points each time.
         # Also measured from base_footprint: the bumper is 0.36 m out, so 0.55 m leaves
@@ -119,6 +122,15 @@ class ApproachNode(Node):
         self.declare_parameter("state_timeout_sec", 45.0)
         self.declare_parameter("search_rate", 0.35)
         self.declare_parameter("row_heights", DEFAULT_ROW_HEIGHTS)
+        # Where to pause and confirm the book before committing to the final drive.
+        #
+        # Far enough back that the whole shelf column is still comfortably in frame, so
+        # the book can be found and centred without a race. Driving straight to grasping
+        # range instead means handing over from marker-steering to book-steering while
+        # moving, and if the book is not acquired in time the robot arrives beside its
+        # column with nothing recognisable in view.
+        self.declare_parameter("acquire_range_m", 1.50)
+        self.declare_parameter("acquire_tolerance_px", 25.0)
         # Searching gets its own budget: a full turn at 0.35 rad/s is about 18 s of
         # simulation time, which at a real-time factor near 0.5 is well over half a minute
         # of wall clock. The ordinary state timeout would abort mid-sweep.
@@ -132,6 +144,7 @@ class ApproachNode(Node):
         self.square_tol = float(self.get_parameter("square_tolerance_rad").value)
         self.max_yaw = float(self.get_parameter("max_yaw_rate").value)
         self.max_fwd = float(self.get_parameter("max_forward").value)
+        self.max_lateral = float(self.get_parameter("max_lateral").value)
         self.min_safe = float(self.get_parameter("min_safe_range_m").value)
         self.timeout = float(self.get_parameter("state_timeout_sec").value)
         self.search_rate = float(self.get_parameter("search_rate").value)
@@ -160,6 +173,14 @@ class ApproachNode(Node):
         self.row_seen = False
         self.target_row: Optional[int] = None
         self.head_tilt: Optional[float] = None
+        self.acquire_range = float(self.get_parameter("acquire_range_m").value)
+        self.acquire_tol = float(self.get_parameter("acquire_tolerance_px").value)
+        # Set once the book has actually been located in 3D, which is the signal that it
+        # is genuinely visible rather than merely expected to be.
+        self.book_point_at: Optional[float] = None
+        self.approach_target = self.acquire_range
+        self.create_subscription(
+            PointStamped, TOPIC_BOOK_POINT, self._on_book_point, 10)
         self.row_heights = list(
             self.get_parameter("row_heights").value or DEFAULT_ROW_HEIGHTS)
         self.pub_head = self.create_publisher(
@@ -351,6 +372,8 @@ class ApproachNode(Node):
             self._do_tuck()
         elif self.state is State.SEARCH:
             self._do_search()
+        elif self.state is State.ACQUIRE:
+            self._do_acquire()
         elif self.state is State.CENTRE:
             self._do_centre()
         elif self.state is State.APPROACH:
@@ -470,6 +493,58 @@ class ApproachNode(Node):
             f"(row {self.target_row} at {distance:.2f} m)"
         )
 
+    def _on_book_point(self, msg: PointStamped) -> None:
+        self.book_point_at = self._now()
+
+    def _book_located(self, max_age: float = 1.5) -> bool:
+        """Whether the book is currently being located in 3D, not merely expected."""
+        if self.book_point_at is None:
+            return False
+        return (self._now() - self.book_point_at) <= max_age
+
+    def _do_acquire(self) -> None:
+        """Hold at a working distance until the book is seen and centred.
+
+        This is a checkpoint, not a drive. Everything after it depends on the book being
+        genuinely in view, so it is worth a few seconds here rather than discovering at
+        grasping range that the target was lost on the way in.
+
+        The head is aimed at the row first: the books are well below the markers, and
+        without the tilt the target may not be in frame at all from here.
+        """
+        self._stop()
+        self._aim_head()
+
+        bearing = self._column_cx_fresh()
+        located = self._book_located()
+
+        if bearing is None:
+            self.get_logger().warn(
+                "acquiring: no bearing", throttle_duration_sec=3.0)
+            return
+
+        error_px = bearing - self.image_width / 2.0
+        if abs(error_px) > self.acquire_tol:
+            cmd = Twist()
+            cmd.angular.z = -math.copysign(
+                min(self.max_yaw, 0.003 * abs(error_px) + 0.06), error_px)
+            self.pub_cmd.publish(cmd)
+            self.get_logger().info(
+                f"acquiring: centring, error {error_px:+.0f}px",
+                throttle_duration_sec=3.0)
+            return
+
+        if not located:
+            self.get_logger().warn(
+                "acquiring: centred but the book is not located yet",
+                throttle_duration_sec=3.0)
+            return
+
+        self.get_logger().info(
+            f"book acquired at {self._range_ahead() or float('nan'):.2f} m; closing in")
+        self.approach_target = self.standoff
+        self._enter(State.APPROACH)
+
     def _do_centre(self) -> None:
         column_cx = self._column_cx_fresh()
         if column_cx is None:
@@ -486,6 +561,8 @@ class ApproachNode(Node):
                     throttle_duration_sec=5.0,
                 )
                 return
+            # Drive to the acquire checkpoint first, not straight to grasping range.
+            self.approach_target = self.acquire_range
             self._enter(State.APPROACH)
             return
         # Positive error means the column is right of centre, so turn clockwise.
@@ -501,10 +578,14 @@ class ApproachNode(Node):
             self.get_logger().warn("no forward LiDAR returns; holding", throttle_duration_sec=3.0)
             self._stop()
             return
-        remaining = ahead - self.standoff
+        remaining = ahead - self.approach_target
         if remaining <= self.standoff_tol:
             self._stop()
-            self._enter(State.SQUARE)
+            # Two-stage: pause at the acquire checkpoint, then commit to the final drive.
+            if self.approach_target > self.standoff:
+                self._enter(State.ACQUIRE)
+            else:
+                self._enter(State.SQUARE)
             return
 
         # Keep the target row in frame as the gap closes.
@@ -512,14 +593,27 @@ class ApproachNode(Node):
 
         cmd = Twist()
         cmd.linear.x = min(self.max_fwd, max(0.05, 0.5 * remaining))
-        # Keep the column centred while driving; small correction only.
+
+        # Correct sideways, not by turning.
+        #
+        # Turning to chase the bearing while driving converts a small angular error into a
+        # large lateral excursion: the robot yaws a little, then drives along the new
+        # heading. One run ended at y = -2.25, past the last column and off the end of the
+        # shelf unit, having started centred.
+        #
+        # The base strafes cleanly once the arms are stowed (measured: vy = +0.20 gives
+        # dy = +0.233 with dyaw = 0.000), so lateral error can be taken out directly while
+        # the heading stays square to the shelf. The earlier belief that strafing yaws the
+        # base was an artefact of measuring with the arms extended.
         column_cx = self._column_cx_fresh()
         bearing = "stale"
         if column_cx is not None:
             error_px = column_cx - self.image_width / 2.0
             bearing = f"{error_px:+6.1f}px"
             if abs(error_px) > self.centre_tol:
-                cmd.angular.z = -math.copysign(min(0.15, 0.002 * abs(error_px)), error_px)
+                # Image x grows to the right; +y is to the robot's left.
+                cmd.linear.y = -math.copysign(
+                    min(self.max_lateral, 0.0012 * abs(error_px)), error_px)
         self.pub_cmd.publish(cmd)
 
         # Log what was commanded alongside what the range is doing. Range alone cannot
