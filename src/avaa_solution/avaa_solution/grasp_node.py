@@ -71,7 +71,17 @@ GRIPPER_OPEN = 0.040     # 60.5 mm, twice the book thickness
 # is why a perfectly aimed grasp -- gripper 8 mm from plan, jaws centred on the spine and
 # 20 mm inside the front face -- still lifted nothing. -0.001 is the joint's lower limit,
 # about 27.7 mm, which actually squeezes.
-GRIPPER_CLAMP = -0.001
+# A light interference, not a crush.
+#
+# Watched through TF, the jaws close 60.5 -> 36.0 -> 27.1 mm around a book 30.0 mm
+# thick: at -0.001 they end up 1.5 mm inside it on each side. The fingers are
+# position-driven and do not stop on contact, so instead of gripping they squeeze
+# the book out like a pip -- it left with 2.93 rad of tip while the gripper sat
+# exactly where it was asked to, within a millimetre on every axis.
+#
+# 0.0009 puts the span near 29 mm: half a millimetre of interference a side, enough
+# for the contact solver to hold a 0.3 kg book at mu 5 and not enough to eject it.
+GRIPPER_CLAMP = 0.0009
 
 DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
@@ -151,7 +161,14 @@ class GraspNode(Node):
         # in depth -- inside tolerance, and dead on sideways and in height -- closed them
         # 9 mm in FRONT of the book. 0.11 puts them in the middle of a 160 mm book.
         self.declare_parameter("grasp_depth_m", 0.11)
-        self.declare_parameter("lift_m", 0.03)
+        # No lift before withdrawing.
+        #
+        # Lifting 30 mm off the shelf before pulling out is the textbook move and it
+        # is wrong here: placed to the millimetre with the jaws provably around the
+        # book, the book still came out at 90 degrees of tip. A grip this marginal
+        # topples the book the moment it is asked to carry its weight, where sliding
+        # it straight out leaves the shelf taking the weight the whole way.
+        self.declare_parameter("lift_m", 0.0)
         self.declare_parameter("gripper_time_sec", 2.0)
         self.declare_parameter("auto_start", True)
         # A Cartesian path that only gets part way is a blocked reach, not a failure to
@@ -167,6 +184,8 @@ class GraspNode(Node):
         self.declare_parameter("arrival_tol_depth_m", 0.030)
         self.declare_parameter("arrival_tol_height_m", 0.030)
         self.declare_parameter("reach_attempts", 6)
+        # How many postures that reach are compared before choosing one.
+        self.declare_parameter("posture_choices", 4)
         # The pre-grasp is a staging point 0.15 m in front of the book, not the
         # grasp. The Cartesian reach that follows targets the book in absolute
         # terms, so a centimetre of error here is corrected rather than carried,
@@ -212,6 +231,8 @@ class GraspNode(Node):
         self.tol_depth = float(self.get_parameter("arrival_tol_depth_m").value)
         self.tol_height = float(self.get_parameter("arrival_tol_height_m").value)
         self.reach_attempts = int(self.get_parameter("reach_attempts").value)
+        self.posture_choices = int(
+            self.get_parameter("posture_choices").value)
         self.pregrasp_tol = float(self.get_parameter("pregrasp_tol_m").value)
         self.max_torque = float(
             self.get_parameter("max_torque_fraction").value)
@@ -470,6 +491,20 @@ class GraspNode(Node):
                 return False
         return True
 
+    def _torque_share(self, solution) -> float:
+        """Worst joint load as a fraction of its rating, by the static estimate.
+
+        The absolute numbers are not trustworthy -- against measured effort this reads a
+        quarter of the load on one joint and six times it on another -- so it is no good
+        as a threshold. As an ordering between postures for the same target it does work:
+        the posture that put the gripper on the book to within a millimetre scored 82 per
+        cent, and one that stalled 2.2 rad short scored 159.
+        """
+        torques = self.chain.gravity_torque(solution)
+        limits = self.chain.effort_limits()
+        return max((t / l for n, t, l in zip(CHAIN_JOINTS, torques, limits)
+                    if n != "torso_lift_joint" and l > 0.0), default=0.0)
+
     def _worst_torque(self, solution) -> str:
         torques = self.chain.gravity_torque(solution)
         limits = self.chain.effort_limits()
@@ -519,6 +554,8 @@ class GraspNode(Node):
         failure that was intermittent and looked like bad luck.
         """
         best = None
+        usable = None
+        candidates = []
         rejected = 0
         expensive = 0
         # The first attempt is seeded from where the arm already is. Close to the shelf
@@ -549,20 +586,29 @@ class GraspNode(Node):
             if best is None or fraction > best[0]:
                 best = (fraction, solution)
             if fraction >= self.min_fraction:
-                # Take the first posture that reaches all the way, and stop.
+                # Collect a few that reach, then take the least loaded.
                 #
-                # Collecting several and picking the least extended was tried and is
-                # worse: the extension measure sums distances over every frame, so it is
-                # driven by how many links are past the shoulder rather than by how far
-                # the arm actually holds itself out, and it chose the ninth candidate
-                # over the first. The pre-grasp went from arriving within 2 mm to
-                # arriving 238 mm off. The first fully-clear posture is the one seeded
-                # from where the arm already is, and that is why it is a good one.
-                self.get_logger().info(
-                    "pre-grasp posture found on try %d; the reach in is %.0f%% clear, "
-                    "worst joint %s"
-                    % (attempt + 1, fraction * 100.0, self._worst_torque(solution)))
-                return solution
+                # Taking the first one that reaches is not enough: postures that reach
+                # perfectly well can still be ones the arm cannot hold, and the run that
+                # placed the gripper within a millimetre and the run that stalled 2.2 rad
+                # short both reported a fully clear reach. What separated them was load.
+                #
+                # Picking the least EXTENDED was tried instead and is worse -- that
+                # measure sums distances over every frame, so it counts links rather than
+                # reach, and it chose a posture that arrived 238 mm off.
+                share = self._torque_share(solution)
+                if usable is None or share < usable[0]:
+                    usable = (share, solution, attempt + 1)
+                if len(candidates) >= self.posture_choices:
+                    break
+                candidates.append(solution)
+        if usable is not None:
+            share, solution, tries = usable
+            self.get_logger().info(
+                "pre-grasp posture from try %d of %d that reached: worst joint at "
+                "%.0f%% of rated" % (tries, len(candidates) + 1, share * 100.0))
+            return solution
+
         if best is None:
             self.get_logger().error(
                 "no usable posture for the pre-grasp in %d tries: %d in collision, "
