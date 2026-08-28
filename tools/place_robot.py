@@ -42,8 +42,10 @@ def main():
     # diagonally to reach it.
     shoulder = float(sys.argv[3]) if len(sys.argv) > 3 else 0.159
 
+    # ``colour`` may instead be a full model name, so that a particular row can be
+    # tested rather than whichever row the randomiser put that colour on.
     names = [l.strip(" -") for l in gz("model", "--list").splitlines()
-             if "book_col" in l and colour in l]
+             if "book_col" in l and (colour in l or colour == l.strip(" -"))]
     if not names:
         print("no %s books" % colour)
         return

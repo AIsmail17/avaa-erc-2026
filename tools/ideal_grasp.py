@@ -67,8 +67,9 @@ def gz_pose_retry(model, attempts=4):
 def nearest_book(colour):
     listing = subprocess.run(["gz", "model", "--list"], capture_output=True,
                              text=True, timeout=25).stdout
+    # ``colour`` may be a full model name instead, so a specific row can be targeted.
     names = [l.strip(" -") for l in listing.splitlines()
-             if "book_col" in l and colour in l]
+             if "book_col" in l and (colour in l or colour == l.strip(" -"))]
     base, _ = gz_pose_retry("tiago_pro")
     if base is None:
         return None

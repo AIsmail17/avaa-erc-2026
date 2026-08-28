@@ -232,9 +232,11 @@ class GraspNode(Node):
         # spherical tolerance has to be set to the tightest axis, and a grasp that was
         # 17 mm out almost entirely in the forgiving directions never got to close.
         self.arrival_tol_lateral = 0.012
-        # Tightened from 0.040: the jaw offset means depth error eats into the margin
-        # twice over, once for the offset and once for the miss.
-        self.arrival_tol_depth = 0.030
+        # Set from the geometry rather than from ambition. With grasp_depth_m at 0.11
+        # the jaws land in the middle of a 160 mm deep book when the arm arrives
+        # exactly, so they are still 25 mm inside the face when it is 55 mm short.
+        # Sideways stays tight: that is the axis with only 15 mm of room.
+        self.arrival_tol_depth = 0.055
         self.arrival_tol_height = 0.040
         # The pre-grasp point only has to be close enough to advance from in a straight
         # line, so it does not need the tolerance the grasp itself does.
@@ -354,7 +356,8 @@ class GraspNode(Node):
         for index in range(1, steps + 1):
             fraction = index / float(steps)
             point = start_point + fraction * (end_point - start_point)
-            solution = self._solve(point, seed=seed, face_x=face_x, near=seed)
+            solution = self._solve(point, seed=seed, face_x=face_x, near=seed,
+                                   row_z=float(end_point[2]))
             if solution is None:
                 self.get_logger().warn(
                     "no IK %.0f%% of the way along the reach; pushing straight instead"
@@ -389,7 +392,8 @@ class GraspNode(Node):
         return row_to_height(row, self.row_heights, self.rows_top_down)
 
     def _solve(self, target: np.ndarray, seed: Optional[List[float]] = None,
-               face_x: Optional[float] = None, near=None):
+               face_x: Optional[float] = None, near=None,
+               row_z: Optional[float] = None):
         """Every solve in this node holds the same wrist, and keeps the elbow outside.
 
         The lift and the withdraw run through here too, and they matter as much: a
@@ -403,11 +407,12 @@ class GraspNode(Node):
         within 0.998 and still closing. Nothing in the logs said "blocked" -- the joints
         simply never arrived.
         """
-        prefer = None if face_x is None else self._clearance_cost(face_x, near=near)
+        prefer = (None if face_x is None else
+                  self._clearance_cost(face_x, near=near, row_z=row_z))
         return self.chain.ik(target, seed=seed, approach=GRASP_APPROACH,
                              closing=GRASP_CLOSING, prefer=prefer)
 
-    def _clearance_cost(self, face_x: float, near=None):
+    def _clearance_cost(self, face_x: float, near=None, row_z: float = None):
         """Score postures: out of the shelf, near where the arm already is, off the stops.
 
         Scoring on intrusion alone is not enough, and scoring on it alone was worse than
@@ -445,6 +450,19 @@ class GraspNode(Node):
             origins = self.chain.joint_origins(values)
             # The last two frames are the wrist and the gripper; they have to go in.
             intrusion = sum(max(0.0, float(p[0]) - face_x) for p in origins[:-2])
+
+            # Anything approaching the shelf has to come in through one opening, and the
+            # openings are 0.33 m apart with a book 0.25 m tall in each. An arm that
+            # arrives at the right point having dipped below the row on the way meets a
+            # shelf board: contact sensors caught arm_left_6 at world z=0.44, under the
+            # lowest shelf surface at 0.587, while its target was at 1.247. Charging for
+            # height error near the shelf keeps the whole reach inside the gap it is
+            # aiming through.
+            straying = 0.0
+            if row_z is not None:
+                for point in origins[-4:]:
+                    if float(point[0]) > face_x - 0.15:
+                        straying += max(0.0, abs(float(point[2]) - row_z) - 0.10)
             travel = (0.0 if current is None
                       else sum(abs(a - b) for a, b in zip(values, current)))
             # Weighted heavily and measured generously, because a joint near its stop
@@ -454,7 +472,8 @@ class GraspNode(Node):
             # exactly on target.
             crowding = sum(max(0.0, 0.45 - min(v - lo, hi - v)) ** 2
                            for v, (lo, hi) in zip(values, limits))
-            return 10.0 * intrusion + weight * travel + 20.0 * crowding
+            return (10.0 * intrusion + weight * travel + 20.0 * crowding
+                    + 15.0 * straying)
 
         return cost
 
@@ -583,7 +602,7 @@ class GraspNode(Node):
         grasp = np.array([face_x + self.grasp_depth, y, height])
         pre = np.array([face_x - self.standoff, y, height])
 
-        pre_solution = self._solve(pre, face_x=face_x)
+        pre_solution = self._solve(pre, face_x=face_x, row_z=height)
         if pre_solution is None:
             self.get_logger().error(
                 f"no IK for pre-grasp {np.round(pre, 3).tolist()}")
@@ -593,7 +612,7 @@ class GraspNode(Node):
         # Solved as a neighbour of the pre-grasp posture, so the advance is the short
         # straight push it is meant to be rather than a fresh choice of arm shape.
         grasp_solution = self._solve(grasp, seed=pre_solution, face_x=face_x,
-                                     near=pre_solution)
+                                     near=pre_solution, row_z=height)
         if grasp_solution is None:
             self.get_logger().error(f"no IK for grasp {np.round(grasp, 3).tolist()}")
             return False
@@ -610,7 +629,7 @@ class GraspNode(Node):
         # Staging near the body at the target height turns one long diagonal sweep into a
         # lift and then a reach, neither of which crosses the shelf.
         stage = np.array([self.stage_x, y, height])
-        stage_solution = self._solve(stage, face_x=face_x)
+        stage_solution = self._solve(stage, face_x=face_x, row_z=height)
         if stage_solution is None:
             self.get_logger().warn(
                 f"no IK for the staging point {np.round(stage, 3).tolist()}; "
