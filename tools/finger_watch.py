@@ -80,6 +80,22 @@ def main():
         except Exception:  # noqa: BLE001
             return None
 
+    def book_in_base():
+        # Re-read every sample. Computing it once and reusing it was wrong: the base
+        # moves while the arm works -- 2.5 degrees of yaw right after being placed
+        # square, and more as the arm swings out -- so a book position fixed at
+        # startup drifts by tens of millimetres and the straddling verdict below
+        # becomes a statement about where the book used to be.
+        now, nowrpy = pose("tiago_pro")
+        here, _ = pose(book_name)
+        if now is None or here is None:
+            return None
+        yaw = nowrpy[2]
+        dx, dy = here[0] - now[0], here[1] - now[1]
+        return (dx * math.cos(-yaw) - dy * math.sin(-yaw),
+                dx * math.sin(-yaw) + dy * math.cos(-yaw),
+                here[2] - BASE_Z)
+
     print("%-11s %-22s %-22s %7s  %s" %
           ("state", "left tip", "right tip", "span", "straddling the book?"))
     seen = set()
@@ -92,6 +108,9 @@ def main():
             continue
         span = math.dist(left, right)
         # Does the book sit between the jaws, in the axis they close along?
+        live = book_in_base()
+        if live is not None:
+            bx, by = live[0], live[1]
         lo, hi = sorted((left[1], right[1]))
         inside = lo < by - 0.015 and hi > by + 0.015
         deep = min(left[0], right[0]) > bx - 0.08

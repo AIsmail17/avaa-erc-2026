@@ -49,6 +49,7 @@ from geometry_msgs.msg import Pose, PointStamped, Quaternion
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from tf2_ros import Buffer, TransformListener
 from std_msgs.msg import Int32, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -83,10 +84,17 @@ GRIPPER_OPEN = 0.040     # 60.5 mm, twice the book thickness
 # joint. Both ends of the band fail, in opposite ways:
 #
 #   -0.0010   1.5 mm a side   ejects the book during the clamp, 2.9 rad of tip
+#
+# All of that was measured at position_proportional_gain 0.1, where the finger
+# controller could not resolve a contact: it crawled toward its target and the book
+# was flicked out on the way. At gain 5 the finger stops ON the book -- commanded to
+# a span of 29.2 mm it settles at 29.6 with the book undisturbed, which is the book
+# holding it open. So the clamp goes back to asking for a firm close, because now
+# the controller can push against something instead of sliding past it.
 #    0.0009   0.65 mm a side  ejects the book during the clamp, 1.2 rad of tip
 #    0.0015   0.25 mm a side  survives the clamp, slips during the withdraw and
 #                             topples after 78 mm
-GRIPPER_CLAMP = 0.0012
+GRIPPER_CLAMP = -0.0010
 
 DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
@@ -262,6 +270,18 @@ class GraspNode(Node):
         self.book_points = deque(maxlen=15)
         self.book_points_min = 8
         self.joints = {}
+        # The targets, held in odom as well as in base_link.
+        #
+        # The base does not stay where it is put. Measured, it reads 2.5 degrees of yaw
+        # immediately after being placed square, and it keeps moving while the arm swings
+        # out: a run that planned for the book at base y=+0.159 had it at +0.257 by the
+        # time the gripper was closing, a shift of nearly 0.1 m. Everything downstream
+        # aims at a target expressed in base_link, so a base that turns takes the target
+        # with it and the arm reaches confidently at where the book used to be.
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.pre_odom = None
+        self.grasp_odom = None
 
         self.pre_target = None
         self.grasp_target = None
@@ -374,6 +394,52 @@ class GraspNode(Node):
         except KeyError:
             return None
 
+    def _to_odom(self, point):
+        """Put a base_link point into odom, or None if there is no transform yet."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "odom", "base_link", rclpy.time.Time())
+        except Exception:  # noqa: BLE001 - the transform may not be up yet
+            return None
+        return self._apply(tf, point)
+
+    def _from_odom(self, point):
+        """Bring an odom point back into base_link, using the base pose as it is NOW."""
+        if point is None:
+            return None
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "base_link", "odom", rclpy.time.Time())
+        except Exception:  # noqa: BLE001
+            return None
+        return self._apply(tf, point)
+
+    @staticmethod
+    def _apply(tf, point):
+        q, t = tf.transform.rotation, tf.transform.translation
+        xx, yy, zz = q.x * q.x, q.y * q.y, q.z * q.z
+        xy, xz, yz = q.x * q.y, q.x * q.z, q.y * q.z
+        wx, wy, wz = q.w * q.x, q.w * q.y, q.w * q.z
+        rotation = np.array([
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+        ])
+        return rotation @ np.asarray(point, dtype=float) + np.array([t.x, t.y, t.z])
+
+    def _refresh_targets(self) -> None:
+        """Re-express the targets in base_link, for the base as it is now."""
+        pre = self._from_odom(self.pre_odom)
+        grasp = self._from_odom(self.grasp_odom)
+        if pre is None or grasp is None:
+            return
+        moved = float(np.linalg.norm(grasp - self.grasp_target))
+        if moved > 0.005:
+            self.get_logger().info(
+                "base has moved; target shifted %.0f mm in base_link" % (moved * 1000))
+        self.pre_target = pre
+        self.grasp_target = grasp
+
     def _gripper_now(self) -> Optional[np.ndarray]:
         """Where the gripper actually is, from the joints rather than from a promise."""
         try:
@@ -435,6 +501,12 @@ class GraspNode(Node):
         pre_x = max(face_x - self.standoff, self.min_pregrasp_x)
         self.pre_target = np.array([pre_x, y, height])
         self.grasp_target = np.array([face_x + self.grasp_depth, y, height])
+
+        self.pre_odom = self._to_odom(self.pre_target)
+        self.grasp_odom = self._to_odom(self.grasp_target)
+        if self.grasp_odom is None:
+            self.get_logger().warn(
+                "no odom transform; the target cannot be held against base movement")
 
         self.get_logger().info(
             f"row {self.row} at z={height:.3f}; book face at x={face_x:.3f} "
@@ -930,6 +1002,7 @@ class GraspNode(Node):
         waited = (self.get_clock().now() - self.open_at).nanoseconds / 1e9
         if waited < self.gripper_time + 0.5:
             return
+        self._refresh_targets()
         # Build the reach from the posture that was checked, not from where the arm
         # happens to have stopped. They are a centimetre apart, but the analytic solver
         # seeds from whatever it is given and a different seed lands on a different

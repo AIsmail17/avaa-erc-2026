@@ -180,12 +180,33 @@ def main():
     grasp = run_grasp(depth)
     time.sleep(4)
 
+    refreshed = [0.0]
     print("%-11s %6s  %-40s  %8s %8s %8s  %6s" %
           ("state", "torso", "arm 1..7", "fk x", "fk y", "fk z", "finger"))
     seen = set()
     start = time.time()
     try:
         while time.time() - start < 170:
+            # Recompute from live ground truth, the way perception would.
+            #
+            # Taking one snapshot at startup and publishing it forever is not what the
+            # real pipeline does, and it is not harmless: the base keeps moving after it
+            # is placed -- 2.5 degrees of yaw immediately, and around 7 by the time the
+            # arm is out -- so a target fixed in base_link at startup is 85 mm from the
+            # book by the time the gripper gets there. That is the fixture being wrong,
+            # not the grasp, and it was being read as the grasp being wrong.
+            if time.time() - refreshed[0] > 2.0:
+                refreshed[0] = time.time()
+                live, live_rpy = gz_pose_retry(name, attempts=1)
+                base, base_rpy = gz_pose_retry("tiago_pro", attempts=1)
+                if live is not None and base is not None:
+                    yaw_now = base_rpy[2]
+                    dx, dy = live[0] - base[0], live[1] - base[1]
+                    face_x = (dx * math.cos(-yaw_now) - dy * math.sin(-yaw_now)
+                              - BOOK_HALF_DEPTH)
+                    by = dx * math.sin(-yaw_now) + dy * math.cos(-yaw_now)
+                    bz = live[2] - BASE_Z
+
             msg = PointStamped()
             msg.header.frame_id = "base_link"
             msg.header.stamp = node.get_clock().now().to_msg()
