@@ -17,6 +17,11 @@ setup(
         # `ros2 launch avaa_solution solution.launch.py` fails with "file not found".
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
         (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
+        # The MoveIt configuration: an SRDF written by hand because the image ships
+        # none, plus the kinematics, limits, planner and controller settings that go
+        # with it. move_group reads these from the share directory at launch.
+        (os.path.join("share", package_name, "moveit"),
+         glob("moveit/*.srdf") + glob("moveit/*.yaml")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

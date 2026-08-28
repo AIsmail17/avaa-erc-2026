@@ -97,7 +97,19 @@ GRASP_APPROACH = [1.0, 0.0, 0.0]   # reach straight into the shelf
 GRASP_CLOSING = [0.0, 1.0, 0.0]    # fingers close across the spine
 
 # Driving posture, measured to sit inside the base footprint.
-TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
+# Folded, and collision free -- which the previous tuck was not.
+#
+# [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0] puts arm_left_2 through arm_left_5 against
+# torso_base_link and torso_lift_link. Gazebo never objected, because self-collision
+# is not checked there, so it went unnoticed for the whole project until MoveIt
+# refused to plan from it: the start state was invalid and every request came back
+# 'Motion planning start tree could not be initialized'.
+#
+# This one was found by sampling folded postures and asking /check_state_validity,
+# keeping the most compact one with at least 0.15 rad of room at every joint stop.
+# It is also tighter than the old one: the gripper sits 0.29 m from the base axis
+# rather than 0.49 m.
+TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
 
 
 def row_to_height(row: int, heights: List[float], top_down: bool = True) -> Optional[float]:

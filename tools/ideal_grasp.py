@@ -84,7 +84,7 @@ def nearest_book(colour):
     return best
 
 
-TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
+TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
 
 
 def tuck_the_arms(node):

@@ -108,7 +108,19 @@ SENSOR_QOS = QoSProfile(
 # This pose measured 0.319 m forward and 0.174 m lateral, both inside the base footprint
 # (0.36 m half-length, 0.249 m half-width), with no contacts. Joint 2 does most of the
 # work; the elbow pulls the forearm in laterally, and joint 1 finishes the job.
-TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
+# Folded, and collision free -- which the previous tuck was not.
+#
+# [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0] puts arm_left_2 through arm_left_5 against
+# torso_base_link and torso_lift_link. Gazebo never objected, because self-collision
+# is not checked there, so it went unnoticed for the whole project until MoveIt
+# refused to plan from it: the start state was invalid and every request came back
+# 'Motion planning start tree could not be initialized'.
+#
+# This one was found by sampling folded postures and asking /check_state_validity,
+# keeping the most compact one with at least 0.15 rad of room at every joint stop.
+# It is also tighter than the old one: the gripper sits 0.29 m from the base axis
+# rather than 0.49 m.
+TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
 
 
 class State(Enum):
