@@ -20,6 +20,7 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
+TUCK_TORSO = 0.15
 SENSOR_QOS = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                         durability=QoSDurabilityPolicy.VOLATILE,
                         history=QoSHistoryPolicy.KEEP_LAST, depth=1)
@@ -49,6 +50,18 @@ def main():
     for side, pub in publishers.items():
         if pub.get_subscription_count() == 0:
             print("nothing listening on the %s arm controller" % side)
+
+    # The torso is part of the tuck. Without it the folded arm sits inside base_link
+    # and MoveIt will not plan from that state at all.
+    torso_pub = node.create_publisher(
+        JointTrajectory, "/torso_controller/joint_trajectory", 10)
+    torso = JointTrajectory()
+    torso.joint_names = ["torso_lift_joint"]
+    lift = JointTrajectoryPoint()
+    lift.positions = [float(TUCK_TORSO)]
+    lift.time_from_start = Duration(sec=20, nanosec=0)
+    torso.points = [lift]
+    torso_pub.publish(torso)
 
     for side, pub in publishers.items():
         traj = JointTrajectory()

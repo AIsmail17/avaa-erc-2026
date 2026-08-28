@@ -56,6 +56,18 @@ def transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
     return t
 
 
+GRAVITY = np.array([0.0, 0.0, -9.81])
+
+
+@dataclass
+class Link:
+    """Just enough of a link to work out what it weighs and where that weight is."""
+
+    name: str
+    mass: float
+    com: np.ndarray          # centre of mass in the link frame
+
+
 @dataclass
 class Joint:
     name: str
@@ -64,6 +76,8 @@ class Joint:
     axis: Optional[np.ndarray]
     lower: float
     upper: float
+    child: str = ""
+    effort: float = 0.0
 
     @property
     def moving(self) -> bool:
@@ -81,9 +95,10 @@ class Joint:
 
 
 class ArmChain:
-    def __init__(self, joints: List[Joint]):
+    def __init__(self, joints: List[Joint], links: Optional[dict] = None):
         self.joints = joints
         self.moving = [j for j in joints if j.moving]
+        self.links = links or {}
 
     # ------------------------------------------------------------------ construction
 
@@ -117,7 +132,10 @@ class ArmChain:
                 axis=np.array(axis) if axis else None,
                 lower=lower,
                 upper=upper,
+                effort=(float(limit.get("effort"))
+                        if limit is not None and limit.get("effort") else 0.0),
             )
+            raw[name].child = child
             parent_of[child] = (name, element.find("parent").get("link"))
 
         chain: List[Joint] = []
@@ -130,7 +148,28 @@ class ArmChain:
             chain.append(raw[jname])
             link = parent_link
         chain.reverse()
-        return cls(chain)
+
+        # Link masses, for the static torque estimate. Without them a posture that the
+        # arm physically cannot hold looks exactly like one it can: measured on this
+        # robot, arm_left_3 and arm_left_4 sit at 25.8 and 25.0 Nm against a 26 Nm limit
+        # while reaching into a shelf, and the arm then stops short of every commanded
+        # position and sags onto its stops.
+        links = {}
+        for element in tree.getroot().findall("link"):
+            inertial = element.find("inertial")
+            if inertial is None:
+                continue
+            mass_el = inertial.find("mass")
+            if mass_el is None or not mass_el.get("value"):
+                continue
+            origin = inertial.find("origin")
+            com = [float(v) for v in (origin.get("xyz", "0 0 0")
+                                      if origin is not None else "0 0 0").split()]
+            links[element.get("name")] = Link(
+                name=element.get("name"),
+                mass=float(mass_el.get("value")),
+                com=np.array(com))
+        return cls(chain, links)
 
     # ------------------------------------------------------------------ kinematics
 
@@ -158,6 +197,62 @@ class ArmChain:
 
     def position(self, values: Sequence[float]) -> np.ndarray:
         return self.fk(values)[:3, 3]
+
+    def gravity_torque(self, values: Sequence[float]) -> List[float]:
+        """Estimate the torque each moving joint holds against gravity, in Nm.
+
+        A rigid-body sum, no dynamics: for every link out along the chain, the moment its
+        weight exerts about each joint upstream of it. That is what matters here, because
+        the arm fails while holding still rather than while accelerating.
+
+        Why it exists: reaching into a shelf, arm_left_3 and arm_left_4 were measured at
+        25.8 and 25.0 Nm against a 26 Nm limit. Saturated joints stop where they are, so
+        the arm stopped 100 mm short of the book, sagged onto its stops, and drifted
+        further away on every retry. Nothing in the planner or the kinematics can see
+        that; it is not a geometry problem and no amount of replanning fixes it. Postures
+        have to be chosen so it does not happen.
+
+        Prismatic joints get the force along their axis instead, in newtons; the torso
+        lift is rated 2000 and is nowhere near its limit, so the units being mixed in the
+        returned list costs nothing in practice.
+        """
+        transform_at = np.eye(4)
+        origins = []
+        axes = []
+        masses = []
+        centres = []
+
+        for joint in self.joints:
+            index = len(origins)
+            if joint.moving:
+                value = float(values[index]) if index < len(values) else 0.0
+                before = transform_at
+                transform_at = transform_at @ joint.transform_at(value)
+                origins.append(before[:3, 3].copy())
+                axes.append((before[:3, :3] @ joint.axis)
+                            if joint.axis is not None else np.zeros(3))
+            else:
+                transform_at = transform_at @ joint.origin
+            link = self.links.get(joint.child)
+            if link is not None and link.mass > 0.0:
+                masses.append(link.mass)
+                centres.append((transform_at @ np.append(link.com, 1.0))[:3])
+
+        torques = []
+        for position, axis, joint in zip(origins, axes, self.moving):
+            total = 0.0
+            for mass, centre in zip(masses, centres):
+                weight = mass * GRAVITY
+                if joint.kind == "prismatic":
+                    total += float(np.dot(axis, weight))
+                else:
+                    total += float(np.dot(axis, np.cross(centre - position, weight)))
+            torques.append(abs(total))
+        return torques
+
+    def effort_limits(self) -> List[float]:
+        """Rated effort per moving joint, from the URDF."""
+        return [j.effort for j in self.moving]
 
     def joint_origins(self, values: Sequence[float]) -> List[np.ndarray]:
         """Where every moving joint sits, in base_link, ending with the tip.

@@ -84,6 +84,7 @@ TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
 TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
+TOPIC_TORSO = "/torso_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
 TOPIC_STATE = "/avaa/approach/state"
 TOPIC_CMD = "/cmd_vel"
@@ -121,6 +122,12 @@ SENSOR_QOS = QoSProfile(
 # It is also tighter than the old one: the gripper sits 0.29 m from the base axis
 # rather than 0.49 m.
 TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
+# The tuck is an eight-joint posture, torso included, and only the eight together
+# are collision free. Commanding the arm alone and leaving the torso down folds
+# arm_left_5, arm_left_6 and the gripper into base_link -- MoveIt reports exactly
+# those three contacts -- and the planner then refuses every request from that
+# start state, in 0.4 s, with no indication that the torso is the reason.
+TUCK_TORSO = 0.15
 
 
 class State(Enum):
@@ -272,6 +279,7 @@ class ApproachNode(Node):
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
         self.pub_arm_left = self.create_publisher(JointTrajectory, TOPIC_ARM_LEFT, 10)
         self.pub_arm_right = self.create_publisher(JointTrajectory, TOPIC_ARM_RIGHT, 10)
+        self.pub_torso = self.create_publisher(JointTrajectory, TOPIC_TORSO, 10)
 
         self.create_timer(0.1, self._tick)
         self.get_logger().info(
@@ -504,6 +512,15 @@ class ApproachNode(Node):
             point.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
             traj.points = [point]
             pub.publish(traj)
+
+        # And the torso with them, or the folded arm sits inside the base.
+        torso = JointTrajectory()
+        torso.joint_names = ["torso_lift_joint"]
+        lift = JointTrajectoryPoint()
+        lift.positions = [float(TUCK_TORSO)]
+        lift.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
+        torso.points = [lift]
+        self.pub_torso.publish(torso)
         self.get_logger().info("stowing arms for driving")
 
     def _do_tuck(self) -> None:

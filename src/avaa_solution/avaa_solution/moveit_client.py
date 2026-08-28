@@ -29,7 +29,7 @@ import threading
 from typing import List, Optional, Sequence
 
 import rclpy
-from geometry_msgs.msg import Pose, PoseStamped, Quaternion
+from geometry_msgs.msg import Pose, Quaternion
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     CollisionObject,
@@ -40,11 +40,15 @@ from moveit_msgs.msg import (
     PlanningScene,
     PositionConstraint,
 )
-from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath
+from moveit_msgs.msg import RobotState
+from moveit_msgs.msg import RobotTrajectory
+from moveit_msgs.srv import (ApplyPlanningScene, GetCartesianPath,
+                             GetStateValidity)
 from rclpy.action import ActionClient
 from rclpy.executors import SingleThreadedExecutor
-from rclpy.node import Node
+from builtin_interfaces.msg import Duration
 from shape_msgs.msg import SolidPrimitive
+from trajectory_msgs.msg import JointTrajectoryPoint
 
 ARM_GROUP = "arm_left_torso"
 GRIPPER_GROUP = "gripper_left"
@@ -93,6 +97,8 @@ class MoveItClient:
             GetCartesianPath, "compute_cartesian_path")
         self.apply_scene = self.node.create_client(
             ApplyPlanningScene, "apply_planning_scene")
+        self.validity = self.node.create_client(
+            GetStateValidity, "check_state_validity")
 
         self.last_failure = ""
         self._executor = SingleThreadedExecutor()
@@ -106,7 +112,8 @@ class MoveItClient:
         """Whether move_group is up. It takes a few seconds longer than the sim does."""
         return (self.move.wait_for_server(timeout_sec=timeout)
                 and self.cartesian.wait_for_service(timeout_sec=timeout)
-                and self.apply_scene.wait_for_service(timeout_sec=timeout))
+                and self.apply_scene.wait_for_service(timeout_sec=timeout)
+                and self.validity.wait_for_service(timeout_sec=timeout))
 
     def shutdown(self) -> None:
         self._executor.shutdown()
@@ -153,6 +160,30 @@ class MoveItClient:
         request.scene = scene
         result = self._wait(self.apply_scene.call_async(request), timeout=10.0)
         return bool(result and result.success)
+
+    def state_valid(self, joint_names: Sequence[str], values: Sequence[float],
+                    group: str = ARM_GROUP) -> Optional[bool]:
+        """Whether a joint configuration is collision free, according to the planner.
+
+        The analytic IK says where the arm reaches; it has no idea what the arm is
+        touching when it gets there. On a redundant eight-joint arm most targets have
+        many solutions and some of them put the elbow inside the shelf, so the solver
+        returns one of those about as often as not and the planner then refuses it as a
+        goal -- instantly, and with a generic failure that names nothing.
+
+        Checking here turns "sometimes the grasp will not plan" into "that posture is no
+        good, try another one".
+        """
+        state = RobotState()
+        state.joint_state.name = list(joint_names)
+        state.joint_state.position = [float(v) for v in values]
+        state.is_diff = True
+
+        request = GetStateValidity.Request()
+        request.robot_state = state
+        request.group_name = group
+        result = self._wait(self.validity.call_async(request), timeout=10.0)
+        return None if result is None else bool(result.valid)
 
     # ------------------------------------------------------------------ motion
 
@@ -207,6 +238,39 @@ class MoveItClient:
 
         return self._send_move(group, constraints, timeout)
 
+    def reach_fraction(self, waypoints: List[Pose], start_names: Sequence[str],
+                       start_values: Sequence[float], group: str = ARM_GROUP,
+                       link: str = TIP_LINK, step: float = 0.01) -> float:
+        """How much of a straight line would be achievable from a given posture.
+
+        Plans without executing and without the arm having to be there, which makes it a
+        test rather than an attempt. The pre-grasp posture is chosen with it: on a
+        redundant arm most postures reach the pre-grasp point, and only some of them can
+        then travel in a straight line into a 0.33 m shelf opening. Picking one that
+        cannot is how a grasp gets 31 per cent of the way in and stops.
+        """
+        request = GetCartesianPath.Request()
+        request.header.frame_id = PLANNING_FRAME
+        request.group_name = group
+        request.link_name = link
+        request.waypoints = waypoints
+        request.max_step = step
+        request.jump_threshold = 5.0
+        request.avoid_collisions = True
+        # The complete joint state, not a diff. A partial start_state with is_diff set
+        # is silently unusable here: every candidate posture came back 0.0 while the same
+        # request without a start_state planned 90 per cent of the way. Whatever the
+        # merge is meant to do, it does not do it, and a zero fraction is indistinguishable
+        # from a genuinely blocked reach.
+        request.start_state.joint_state.name = list(start_names)
+        request.start_state.joint_state.position = [float(v) for v in start_values]
+        request.start_state.is_diff = False
+
+        result = self._wait(self.cartesian.call_async(request), timeout=30.0)
+        if result is None or result.fraction < 0.0:
+            return 0.0
+        return float(result.fraction)
+
     def straight_line(self, waypoints: List[Pose], group: str = ARM_GROUP,
                       link: str = TIP_LINK, step: float = 0.01,
                       timeout: float = 120.0):
@@ -226,7 +290,16 @@ class MoveItClient:
         request.link_name = link
         request.waypoints = waypoints
         request.max_step = step
-        request.jump_threshold = 0.0
+        # NOT zero, which disables jump checking. On a redundant eight-joint arm the
+        # IK solutions along a path can flip the elbow between one waypoint and the
+        # next, and MoveIt will happily string those into a trajectory: the reported
+        # fraction stays high, the controller executes it, and the gripper arrives
+        # 116 mm sideways off a path that only asked to move in x.
+        #
+        # With a threshold, a discontinuity truncates the path instead. That shows up
+        # as a low fraction, which is a fact worth knowing rather than a silent
+        # sweep across the front of the shelf.
+        request.jump_threshold = 5.0
         request.avoid_collisions = True
 
         result = self._wait(self.cartesian.call_async(request), timeout=30.0)
@@ -241,6 +314,48 @@ class MoveItClient:
         goal.trajectory = result.solution
         code = self._send_action(self.execute, goal, timeout)
         return code, float(result.fraction)
+
+    def execute_path(self, joint_names: Sequence[str],
+                     waypoints: List[Sequence[float]],
+                     arm_speed: float = 0.30, torso_speed: float = 0.030,
+                     timeout: float = 240.0) -> int:
+        """Execute a joint-space path the caller has already worked out.
+
+        MoveIt still does the execution -- splitting the trajectory across the arm and
+        torso controllers, and monitoring it -- but not the kinematics. Its Cartesian
+        planner solves IK with KDL at every step, and on this redundant eight-joint chain
+        KDL fails: a reach whose every waypoint checks out as collision free, walked and
+        verified one by one against /check_state_validity, came back from
+        compute_cartesian_path as 2 per cent achievable.
+
+        Timed from what the joints can do rather than from what they are rated for. The
+        torso manages 0.035 m/s and the arm about 0.3 rad/s in practice against a rated
+        1.95 to 3.95, and a trajectory faster than that is aborted rather than lagged.
+        """
+        trajectory = RobotTrajectory()
+        trajectory.joint_trajectory.joint_names = list(joint_names)
+        moment = 0.0
+        previous = None
+        for values in waypoints:
+            if previous is not None:
+                arm_move = max(
+                    (abs(a - b) for name, a, b in zip(joint_names, values, previous)
+                     if name != "torso_lift_joint"), default=0.0)
+                torso_move = max(
+                    (abs(a - b) for name, a, b in zip(joint_names, values, previous)
+                     if name == "torso_lift_joint"), default=0.0)
+                moment += max(0.5, arm_move / arm_speed, torso_move / torso_speed)
+            point = JointTrajectoryPoint()
+            point.positions = [float(v) for v in values]
+            point.velocities = [0.0] * len(values)
+            point.time_from_start = Duration(
+                sec=int(moment), nanosec=int((moment % 1.0) * 1e9))
+            trajectory.joint_trajectory.points.append(point)
+            previous = values
+
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = trajectory
+        return self._send_action(self.execute, goal, timeout)
 
     # ------------------------------------------------------------------ plumbing
 
