@@ -285,7 +285,7 @@ class ArmChain:
            approach: Optional[Sequence[float]] = None,
            closing: Optional[Sequence[float]] = None,
            orientation_tolerance: float = 0.26,
-           prefer=None) -> Optional[List[float]]:
+           prefer=None, pin: Optional[dict] = None) -> Optional[List[float]]:
         """Joint values placing the gripper at target (x, y, z) in base_link.
 
         With approach and closing left out this solves position only, which is
@@ -336,6 +336,23 @@ class ArmChain:
         lower = [lo for lo, _ in self.limits]
         upper = [hi for _, hi in self.limits]
 
+        # Pinning narrows a joint's bounds instead of leaving the choice to the solver.
+        # Expressing a preference through ``prefer`` was not reliable: asked for a book at
+        # z=0.731 with the torso ideally at 0.054, the search returned 0.350 because no
+        # low-torso solution happened to turn up among its restarts. Some joints are not
+        # really free -- the torso is how this robot changes height, and the arm should
+        # not be spending its 26 Nm doing it -- and for those, narrowing is honest.
+        if pin:
+            for index, name in enumerate(self.joint_names):
+                if name in pin:
+                    wanted, slack = pin[name]
+                    lower[index] = max(lower[index], wanted - slack)
+                    upper[index] = min(upper[index], wanted + slack)
+                    if lower[index] > upper[index]:
+                        return None
+                    seed[index] = float(np.clip(seed[index],
+                                                lower[index], upper[index]))
+
         # Orientation error is dimensionless where position error is in metres. This
         # scale makes a 10-degree axis error weigh about as much as 9 mm of position
         # error, so the solver squares the wrist up before chasing the last millimetre.
@@ -373,7 +390,7 @@ class ArmChain:
         # than stopping at the first that reaches.
         for attempt in range(40 if prefer is not None else (20 if want_orientation else 6)):
             start = seed if attempt == 0 else [
-                np.random.uniform(lo, hi) for lo, hi in self.limits
+                np.random.uniform(lo, hi) for lo, hi in zip(lower, upper)
             ]
             try:
                 result = least_squares(

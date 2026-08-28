@@ -99,6 +99,10 @@ GRASP_CLOSING = [0.0, 1.0, 0.0]
 # A book is 0.25 m tall and stands on the board below it, so the board sits this far under
 # the row height. The 0.02 is half the board thickness.
 BOARD_DROP = 0.125 + 0.02
+
+# Height of the left shoulder above base_link when the torso is fully down, measured from
+# the chain: arm_left_1 sits at z = 0.677 + torso.
+SHOULDER_BASE_Z = 0.677
 SHELF_DEPTH = 0.30
 SHELF_WIDTH = 4.8
 
@@ -118,6 +122,7 @@ def facing_shelf() -> Quaternion:
 class State(Enum):
     IDLE = "idle"
     SCENE = "scene"
+    RAISE = "raising"
     PREGRASP = "pregrasp"
     OPEN = "opening"
     ADVANCE = "advancing"
@@ -413,6 +418,16 @@ class GraspNode(Node):
                 "trying the best of them anyway" % np.round(target, 3).tolist())
         return first
 
+    def _clear(self, solution) -> bool:
+        """Whether a posture is collision free, judged on the whole robot.
+
+        Everything that checks a posture goes through here, so none of them can quietly
+        ask about eight joints and get an answer about a robot with its other arm
+        somewhere else.
+        """
+        names, values = self._full_state(solution)
+        return self.moveit.state_valid(names, values) is not False
+
     def _full_state(self, solution):
         """Describe the whole robot as it is now, with the arm moved to ``solution``.
 
@@ -430,7 +445,7 @@ class GraspNode(Node):
                 values.append(float(value))
         return names, values
 
-    def _posture_that_can_reach_in(self, attempts: int = 20):
+    def _posture_that_can_reach_in(self, attempts: int = 12):
         """Choose a pre-grasp posture by whether the reach works FROM it.
 
         Two conditions, and the second is the one that was missing. A posture has to be
@@ -454,10 +469,12 @@ class GraspNode(Node):
         for attempt in range(attempts):
             solution = self.chain.ik(
                 self.pre_target, seed=seed if attempt == 0 else None,
-                approach=GRASP_APPROACH, closing=GRASP_CLOSING)
+                approach=GRASP_APPROACH, closing=GRASP_CLOSING,
+                prefer=self._posture_cost(float(self.pre_target[2])),
+                pin=self._torso_for(float(self.pre_target[2])))
             if solution is None:
                 continue
-            if self.moveit.state_valid(CHAIN_JOINTS, solution) is False:
+            if not self._clear(solution):
                 rejected += 1
                 continue
             fraction = self._reach_clearance(
@@ -478,6 +495,54 @@ class GraspNode(Node):
             "no posture gives a clear reach; the best of %d is %.0f%% and will be tried"
             % (attempts, best[0] * 100.0))
         return best[1]
+
+    def _torso_for(self, height: float) -> dict:
+        """Pin the torso so the shoulder sits level with the target.
+
+        The torso lift is rated 2000 N and the arm joints 26 Nm, so every centimetre of
+        height the arm provides instead of the torso is bought at the wrong end of the
+        robot. Reaching for a book at z=1.061 with the torso left free, the solver chose
+        0.10 and stretched the arm up nearly a metre; the arm then sagged half a metre
+        short with arm_left_3 over a radian out.
+
+        The shoulder is aimed ABOVE the target rather than level with it, so the arm
+        reaches down. Level was the first guess and it is wrong twice over: with the
+        wrist held to reach into a shelf there is often no level solution at all, and
+        where there is one the arm is holding its own weight out horizontally. Reaching
+        down puts gravity on the same side as the motion. Asked freely, the solver picks
+        exactly this: for a row at z=0.731 it settles on a torso of 0.304, a quarter of a
+        metre above the book.
+
+        The slack lets it trade a little height for reach, without handing the whole job
+        back to the arm.
+        """
+        ideal = float(np.clip(height - SHOULDER_BASE_Z + 0.25, 0.0, 0.35))
+        return {"torso_lift_joint": (ideal, 0.10)}
+
+    def _posture_cost(self, height: float):
+        """Prefer postures that get their height from the torso, not from the arm.
+
+        The torso lift is rated 2000 N and the arm joints 26 Nm, so every centimetre of
+        height the arm provides instead of the torso is bought at the wrong end of the
+        robot. Nothing was expressing that: solving for a book at z=1.061 the IK picked a
+        torso of 0.10 and stretched the arm up nearly a metre, and the arm then sagged
+        half a metre short of the target with arm_left_3 over a radian out.
+
+        The ideal torso puts the shoulder level with the target, so the arm reaches
+        horizontally and holds almost nothing. Where that is outside the torso range the
+        cost simply pulls as far that way as it goes.
+        """
+        ideal = float(np.clip(height - SHOULDER_BASE_Z, 0.0, 0.35))
+
+        def cost(values):
+            # Dominant: use the strong joint for height.
+            torso = abs(float(values[0]) - ideal)
+            # Mild: keep the elbow off its stops, which is where it sags onto.
+            crowding = sum(max(0.0, 0.20 - min(v - lo, hi - v))
+                           for v, (lo, hi) in zip(values, self.chain.limits))
+            return 10.0 * torso + crowding
+
+        return cost
 
     def _nudge(self, wanted, gain: float = 1.4, limit: float = 0.35) -> bool:
         """Re-command a posture with the standing error added, to beat the stiction.
@@ -515,7 +580,7 @@ class GraspNode(Node):
                          for w, e, (lo, hi) in zip(wanted, error, self.chain.limits)]
             candidate = [float(np.clip(c, w - limit, w + limit))
                          for c, w in zip(candidate, wanted)]
-            if self.moveit.state_valid(CHAIN_JOINTS, candidate) is not False:
+            if self._clear(candidate):
                 overshoot = candidate
                 break
         if overshoot is None:
@@ -531,7 +596,7 @@ class GraspNode(Node):
         return True
 
     def _reach_clearance(self, start_solution, start_point, end_point,
-                         steps: int = 7) -> float:
+                         steps: int = 4) -> float:
         """How far along a straight line this posture can get, as a fraction.
 
         The same walk as _straight_path, without building the trajectory, so a candidate
@@ -546,15 +611,20 @@ class GraspNode(Node):
         seed = list(start_solution)
         for step in range(1, steps + 1):
             point = start_point + (step / float(steps)) * (end_point - start_point)
+            # No posture cost here: the seed from the previous waypoint and the
+            # pinned torso already decide the shape, and asking for a cost makes the
+            # solver run forty restarts instead of stopping at the first success.
+            # Measured, that is 0.78 s per call against 0.02 s for a collision check,
+            # and it turned a posture search into a three-minute wait.
             solution = self.chain.ik(point, seed=seed, approach=GRASP_APPROACH,
-                                     closing=GRASP_CLOSING)
-            if solution is None or self.moveit.state_valid(
-                    CHAIN_JOINTS, solution) is False:
+                                     closing=GRASP_CLOSING,
+                                     pin=self._torso_for(float(point[2])))
+            if solution is None or not self._clear(solution):
                 return (step - 1) / float(steps)
             seed = solution
         return 1.0
 
-    def _straight_path(self, start_solution, start_point, end_point, steps: int = 14):
+    def _straight_path(self, start_solution, start_point, end_point, steps: int = 8):
         """Joint waypoints tracing a straight line in space, each one checked.
 
         The analytic solver is seeded from the previous waypoint so consecutive postures
@@ -569,13 +639,14 @@ class GraspNode(Node):
         for step in range(1, steps + 1):
             point = start_point + (step / float(steps)) * (end_point - start_point)
             solution = self.chain.ik(point, seed=seed, approach=GRASP_APPROACH,
-                                     closing=GRASP_CLOSING)
+                                     closing=GRASP_CLOSING,
+                                     pin=self._torso_for(float(point[2])))
             if solution is None:
                 self.get_logger().warn(
                     "no posture reaches %.0f%% of the way along the line"
                     % (100.0 * step / steps))
                 return None
-            if self.moveit.state_valid(CHAIN_JOINTS, solution) is False:
+            if not self._clear(solution):
                 self.get_logger().warn(
                     "the reach is obstructed %.0f%% of the way in"
                     % (100.0 * step / steps))
@@ -616,6 +687,7 @@ class GraspNode(Node):
         handler = {
             State.IDLE: self._do_idle,
             State.SCENE: self._do_scene,
+            State.RAISE: self._do_raise,
             State.PREGRASP: self._do_pregrasp,
             State.OPEN: self._do_open,
             State.ADVANCE: self._do_advance,
@@ -655,6 +727,31 @@ class GraspNode(Node):
             self._enter(State.FAILED)
             return
 
+        # Get the height first, with the arm still folded.
+        #
+        # Going straight from the tuck to the pre-grasp asks the planner to raise the
+        # torso most of its travel while unfolding the arm past a shelf, and for the
+        # middle rows it comes back "invalid motion plan". Raising first turns one hard
+        # problem into two easy ones: the torso moves with the arm out of the way, and
+        # the arm then unfolds at the height it will work at.
+        ideal = self._torso_for(float(self.pre_target[2]))["torso_lift_joint"][0]
+        self.raised = [ideal] + list(TUCK_POSE)
+        self._enter(State.RAISE)
+        self._start("raise", lambda: self.moveit.move_to_joints(
+            CHAIN_JOINTS, self.raised, timeout=180.0))
+
+    def _do_raise(self) -> None:
+        done = self._finished()
+        if done is None:
+            return
+        code, _ = done
+        if code != 1:
+            self.get_logger().warn(
+                "could not raise the torso first (%s); reaching from where we are"
+                % error_name(code))
+        else:
+            self.get_logger().info(
+                "torso at the row, arm still folded; reaching out")
         self._enter(State.PREGRASP)
         self._start("pre-grasp", lambda: self.moveit.move_to_joints(
             CHAIN_JOINTS, self.pre_solution, timeout=240.0))
@@ -701,10 +798,14 @@ class GraspNode(Node):
         waited = (self.get_clock().now() - self.open_at).nanoseconds / 1e9
         if waited < self.gripper_time + 0.5:
             return
-        where = self._gripper_now()
+        # Build the reach from the posture that was checked, not from where the arm
+        # happens to have stopped. They are a centimetre apart, but the analytic solver
+        # seeds from whatever it is given and a different seed lands on a different
+        # branch of a redundant arm: the same reach validated 100 per cent clear from the
+        # planned posture and 12 per cent from the arm one centimetre away from it.
+        # MoveIt tolerates a start that close, so the validated path is the one to run.
         path = self._straight_path(
-            self.pre_solution if where is None else self._current_joints(),
-            where if where is not None else self.pre_target, self.grasp_target)
+            self.pre_solution, self.pre_target, self.grasp_target)
         if path is None:
             self._enter(State.FAILED)
             return

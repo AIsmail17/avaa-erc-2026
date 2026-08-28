@@ -174,10 +174,16 @@ class MoveItClient:
         Checking here turns "sometimes the grasp will not plan" into "that posture is no
         good, try another one".
         """
+        # A complete state, not a diff. Sending only the eight arm joints and letting
+        # is_diff fill the rest evaluates the candidate against a robot whose other arm
+        # is wherever the default puts it -- straight out -- so every posture comes back
+        # in collision. The grasp reported "none of 12 postures is even collision free"
+        # for points that are clear, which is the same trap that made reach_fraction
+        # return zero for every candidate.
         state = RobotState()
         state.joint_state.name = list(joint_names)
         state.joint_state.position = [float(v) for v in values]
-        state.is_diff = True
+        state.is_diff = False
 
         request = GetStateValidity.Request()
         request.robot_state = state
@@ -364,7 +370,9 @@ class MoveItClient:
         goal.request.group_name = group
         goal.request.goal_constraints = [constraints]
         goal.request.num_planning_attempts = 10
-        goal.request.allowed_planning_time = 5.0
+        # Five seconds was not enough for the harder rows, where the torso has to
+        # travel most of its range while the arm unfolds past a shelf.
+        goal.request.allowed_planning_time = 15.0
         # Scaled down hard. This arm covers about 3 rad in 28 s and its controller aborts
         # trajectories it cannot keep up with, which presents as an arm that simply does
         # not move.

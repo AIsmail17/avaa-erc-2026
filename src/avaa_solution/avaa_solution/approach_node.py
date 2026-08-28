@@ -129,6 +129,23 @@ TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
 # start state, in 0.4 s, with no indication that the torso is the reason.
 TUCK_TORSO = 0.15
 
+# The right arm is never used, but it still has to be out of the way, and mirroring
+# the left tuck by flipping two joints does not do that: it leaves arm_right_4_link
+# at x=0.491, which is inside the shelf once the base is close enough to grasp from.
+# MoveIt then reports the robot in collision and refuses every left-arm goal, so the
+# grasp fails for a reason that has nothing to do with the arm doing the work.
+#
+# Found the same way as the left tuck, by sampling against /check_state_validity with
+# the shelf in the scene at grasping distance. See tools/find_right_tuck.py.
+#
+# Scored on where the links actually end up, not on how small the joint angles are.
+# Scoring on the angles picks postures close to all-zeros, and all-zeros is the arm
+# stretched straight out: the first answer put the right gripper 0.88 m forward,
+# inside the shelf, against shelf_back. This one reaches 0.204 m forward and is
+# checked at both torso heights, because raising the torso for the top rows takes
+# the whole upper body with it.
+RIGHT_TUCK = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
+
 
 class State(Enum):
     WAITING = "waiting"
@@ -503,11 +520,7 @@ class ApproachNode(Node):
             traj = JointTrajectory()
             traj.joint_names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
             point = JointTrajectoryPoint()
-            pose = list(TUCK_POSE)
-            if side == "right":
-                # Mirror the shoulder pan and upper-arm roll.
-                pose[0] = -pose[0]
-                pose[2] = -pose[2]
+            pose = list(RIGHT_TUCK) if side == "right" else list(TUCK_POSE)
             point.positions = [float(v) for v in pose]
             point.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
             traj.points = [point]

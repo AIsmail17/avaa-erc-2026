@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Find a folded posture for the right arm, which this solution never uses but must stow.
+"""Find a folded posture for the right arm, scored on where the arm IS.
 
-The right arm is tucked by mirroring the left one, flipping two joints. That is a guess,
-and it is wrong: arm_right_4_link ends up at x=0.491, y=-0.371, which is inside the shelf
-once the base is close enough to grasp from, and MoveIt then refuses to plan for the left
-arm because the robot as a whole is in collision.
+The first version of this scored candidates by the sum of their joint angles, which is a
+measure of how close a posture is to all-zeros -- and all-zeros is the arm stretched
+straight out. It duly returned a posture with the right gripper 0.88 m forward, inside the
+shelf, and MoveIt then refused every left-arm goal because the robot was in collision.
 
-Same method as the left arm: sample, ask /check_state_validity, keep the most compact
-posture with room at every stop.
+This scores on the forward and lateral reach of the actual links, and checks the posture
+with the torso RAISED, because that is when it matters: the torso goes to 0.35 for the top
+rows and takes the whole upper body with it.
 """
 import math
 import sys
@@ -20,8 +21,12 @@ from moveit_msgs.msg import RobotState
 from moveit_msgs.srv import GetStateValidity
 from sensor_msgs.msg import JointState
 
+sys.path.insert(0, "/opt/erc_ws/src/avaa_solution")
+from avaa_solution.kinematics.arm_chain import ArmChain  # noqa: E402
+
 URDF = "/opt/erc_ws/src/erc_description/urdf/tiago_pro.urdf"
 RIGHT = ["arm_right_%d_joint" % i for i in range(1, 8)]
+TORSO_HEIGHTS = [0.15, 0.35]
 
 
 def main():
@@ -51,16 +56,22 @@ def main():
     if not client.wait_for_service(timeout_sec=15.0):
         print("no /check_state_validity")
         return 1
-
     index = {n: i for i, n in enumerate(js.name)}
 
-    def valid(values):
+    # The right arm as a chain, so candidates can be scored on where the links end up
+    # rather than on how small their angles are.
+    chain = ArmChain.from_urdf(URDF, "base_link", "gripper_right_grasping_link")
+    names = chain.joint_names
+
+    def valid(values, torso):
         state = JointState()
         state.name = list(js.name)
         state.position = list(js.position)
         for name, value in zip(RIGHT, values):
             if name in index:
                 state.position[index[name]] = float(value)
+        if "torso_lift_joint" in index:
+            state.position[index["torso_lift_joint"]] = float(torso)
         request = GetStateValidity.Request()
         request.robot_state = RobotState()
         request.robot_state.joint_state = state
@@ -69,49 +80,52 @@ def main():
         future = client.call_async(request)
         rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
         result = future.result()
-        if result is None:
-            return None, []
-        contacts = {(c.contact_body_1, c.contact_body_2) for c in result.contacts}
-        return bool(result.valid), sorted(contacts)
+        return None if result is None else bool(result.valid)
 
-    ok, contacts = valid([js.position[index[n]] for n in RIGHT if n in index])
-    print("right arm as it stands: valid=%s" % ok)
-    for pair in contacts[:4]:
-        print("   %s <-> %s" % pair)
-    print()
-    print("searching...")
+    def reach(values, torso):
+        full = [torso] + list(values)
+        if len(full) != len(names):
+            full = list(values)
+        points = chain.joint_origins(full)
+        # Furthest forward any part of the arm gets, and how far out to the side.
+        return max(float(p[0]) for p in points), max(abs(float(p[1])) for p in points)
 
-    rng = np.random.default_rng(1)
+    print("right arm chain joints: %s" % names)
+    print("searching, checking each candidate at torso %s" % TORSO_HEIGHTS)
+    rng = np.random.default_rng(3)
     best = None
     checked = 0
     started = time.time()
-    while time.time() - started < 240 and checked < 300:
+    while time.time() - started < 260 and checked < 400:
         values = []
         for name in RIGHT:
             lo, hi = limits[name]
             centre = 0.5 * (lo + hi)
-            values.append(float(np.clip(rng.normal(centre, 0.35 * (hi - lo)), lo, hi)))
+            values.append(float(np.clip(rng.normal(centre, 0.4 * (hi - lo)), lo, hi)))
         margin = min(min(v - limits[n][0], limits[n][1] - v)
                      for n, v in zip(RIGHT, values))
         if margin < 0.15:
             continue
         checked += 1
-        state_ok, _ = valid(values)
-        if state_ok is not True:
+        forward, sideways = reach(values, 0.15)
+        # Cheap rejection before spending a service call: the shelf face is about 0.53 m
+        # ahead at grasping distance, so anything past 0.45 is not a stowed arm.
+        if forward > 0.45:
             continue
-        # Compact: judged on the joint angles rather than on a tip position, since the
-        # analytic chain in this package only models the left arm.
-        folded = sum(abs(v) for v in values)
-        if best is None or folded < best[0]:
-            best = (folded, list(values))
-            print("   candidate: sum |angle| %.2f, margin %.2f" % (folded, margin),
-                  flush=True)
+        if not all(valid(values, t) for t in TORSO_HEIGHTS):
+            continue
+        score = forward + 0.3 * sideways
+        if best is None or score < best[0]:
+            best = (score, list(values), forward, sideways)
+            print("   candidate: reaches %.3f m forward, %.3f sideways, margin %.2f"
+                  % (forward, sideways, margin), flush=True)
 
     print()
     if best is None:
-        print("nothing valid in %d samples" % checked)
+        print("nothing valid and folded in %d samples" % checked)
         return 1
-    print("best of %d samples:" % checked)
+    print("best of %d samples: %.3f m forward, %.3f sideways"
+          % (checked, best[2], best[3]))
     print("RIGHT_TUCK = [%s]" % ", ".join("%.4f" % v for v in best[1]))
 
     node.destroy_node()
