@@ -36,6 +36,7 @@ the summary is that an arm with four spare degrees of freedom will reach a corre
 by a path straight through the shelf unless something is actually checking.
 """
 
+import math
 import threading
 from collections import deque
 from enum import Enum
@@ -172,8 +173,25 @@ class GraspNode(Node):
         # and holding it to the same 12 mm as the grasp itself failed runs on a
         # millimetre while the arm sat 13 mm out and stable.
         self.declare_parameter("pregrasp_tol_m", 0.045)
+        # Reject postures the arm will not hold. Stalled 0.18 rad short of its last
+        # waypoint with no contact anywhere in Gazebo, the arm had arm_left_2 at
+        # 42 Nm of 43, arm_left_3 at 27 of 26 and arm_left_4 at 25 of 26 -- three
+        # joints saturated simply holding still.
+        #
+        # The estimate in arm_chain.gravity_torque reads about a quarter of the
+        # measured effort, because effort from a position controller includes
+        # whatever it is spending on friction and on correcting its own error, not
+        # just the load. So the threshold is set against the estimate rather than
+        # against the rating: on the posture that failed it reads 6.6 Nm on a 26 Nm
+        # joint, and anything at or above a quarter of rated is treated as too dear.
+        self.declare_parameter("max_torque_fraction", 0.24)
         # The nearest the pre-grasp may sit to the base.
-        self.declare_parameter("min_pregrasp_x_m", 0.42)
+        # The nearest the pre-grasp may sit to the base. It was 0.42 because the
+        # tucked arms reached 0.49 forward and the robot could not work any closer;
+        # that was the badly stowed right arm, and both now fold inside 0.31. Working
+        # closer is what actually lowers the torque the arm has to hold, which is the
+        # thing that has been stopping the reach.
+        self.declare_parameter("min_pregrasp_x_m", 0.34)
         # How long to let the arm settle after MoveIt says the trajectory is done.
         # It is not done: the controller reports success when the trajectory time
         # has elapsed, and this arm is still travelling. Judged immediately, a reach
@@ -195,6 +213,8 @@ class GraspNode(Node):
         self.tol_height = float(self.get_parameter("arrival_tol_height_m").value)
         self.reach_attempts = int(self.get_parameter("reach_attempts").value)
         self.pregrasp_tol = float(self.get_parameter("pregrasp_tol_m").value)
+        self.max_torque = float(
+            self.get_parameter("max_torque_fraction").value)
         self.min_pregrasp_x = float(
             self.get_parameter("min_pregrasp_x_m").value)
         self.reaches = 0
@@ -418,6 +438,46 @@ class GraspNode(Node):
                 "trying the best of them anyway" % np.round(target, 3).tolist())
         return first
 
+    def _extension(self, solution) -> float:
+        """How far the arm holds itself out, as a proxy for the load on it.
+
+        The mass-based estimate in arm_chain.gravity_torque is not trustworthy enough to
+        choose postures with -- against measured effort it reads a quarter of the load on
+        one joint and six times it on another -- but the geometry underneath is not in
+        doubt: a joint has to hold the weight of everything beyond it, times how far out
+        that weight sits. Summing the horizontal distance of each frame from the shoulder
+        needs no masses and gets the ordering right.
+
+        This matters because collision-free and reachable is not the same as holdable.
+        Planned 100 per cent clear and executed, a reach still stopped 0.18 rad short with
+        arm_left_2, 3 and 4 all at their effort limits and nothing touching anything.
+        """
+        origins = self.chain.joint_origins(solution)
+        shoulder = origins[1]
+        return float(sum(
+            math.hypot(float(p[0]) - float(shoulder[0]),
+                       float(p[1]) - float(shoulder[1]))
+            for p in origins[2:]))
+
+    def _affordable(self, solution) -> bool:
+        """Whether the arm could hold this posture, by the static torque estimate."""
+        torques = self.chain.gravity_torque(solution)
+        limits = self.chain.effort_limits()
+        for name, torque, limit in zip(CHAIN_JOINTS, torques, limits):
+            if name == "torso_lift_joint" or limit <= 0.0:
+                continue
+            if torque > self.max_torque * limit:
+                return False
+        return True
+
+    def _worst_torque(self, solution) -> str:
+        torques = self.chain.gravity_torque(solution)
+        limits = self.chain.effort_limits()
+        pairs = [(t / l if l else 0.0, n) for n, t, l in
+                 zip(CHAIN_JOINTS, torques, limits) if n != "torso_lift_joint"]
+        share, name = max(pairs)
+        return "%s at %.0f%% of rated" % (name, share * 100.0)
+
     def _clear(self, solution) -> bool:
         """Whether a posture is collision free, judged on the whole robot.
 
@@ -460,6 +520,7 @@ class GraspNode(Node):
         """
         best = None
         rejected = 0
+        expensive = 0
         # The first attempt is seeded from where the arm already is. Close to the shelf
         # most solutions for the pre-grasp fold the arm back towards the body and are in
         # collision, so an unbiased search spends its budget on postures that were never
@@ -477,19 +538,35 @@ class GraspNode(Node):
             if not self._clear(solution):
                 rejected += 1
                 continue
+            # The torque estimate is NOT used as a gate. Measured against the real
+            # thing it reads 6.6 Nm on a joint drawing 27, and 159 per cent of rated on a
+            # joint drawing 2.5 -- wrong in both directions, so a threshold on it rejects
+            # good postures and passes bad ones. Kept for reporting, where the ranking
+            # within one posture is still informative, and not for deciding.
+            _ = expensive
             fraction = self._reach_clearance(
                 solution, self.pre_target, self.grasp_target)
             if best is None or fraction > best[0]:
                 best = (fraction, solution)
             if fraction >= self.min_fraction:
+                # Take the first posture that reaches all the way, and stop.
+                #
+                # Collecting several and picking the least extended was tried and is
+                # worse: the extension measure sums distances over every frame, so it is
+                # driven by how many links are past the shoulder rather than by how far
+                # the arm actually holds itself out, and it chose the ninth candidate
+                # over the first. The pre-grasp went from arriving within 2 mm to
+                # arriving 238 mm off. The first fully-clear posture is the one seeded
+                # from where the arm already is, and that is why it is a good one.
                 self.get_logger().info(
-                    "pre-grasp posture found on try %d; the reach in is %.0f%% clear"
-                    % (attempt + 1, fraction * 100.0))
+                    "pre-grasp posture found on try %d; the reach in is %.0f%% clear, "
+                    "worst joint %s"
+                    % (attempt + 1, fraction * 100.0, self._worst_torque(solution)))
                 return solution
         if best is None:
             self.get_logger().error(
-                "none of %d postures for the pre-grasp is even collision free "
-                "(%d rejected outright)" % (attempts, rejected))
+                "no usable posture for the pre-grasp in %d tries: %d in collision, "
+                "%d beyond what the arm can hold" % (attempts, rejected, expensive))
             return None
         self.get_logger().warn(
             "no posture gives a clear reach; the best of %d is %.0f%% and will be tried"
@@ -841,10 +918,12 @@ class GraspNode(Node):
         if current is not None and getattr(self, "reach_path", None):
             gaps = [a - b for a, b in zip(current, self.reach_path[-1])]
             worst = max(range(len(gaps)), key=lambda i: abs(gaps[i]))
+            lo, hi = self.chain.limits[worst]
             self.get_logger().info(
-                "after the reach, worst joint %s is %+.3f from its last waypoint, "
-                "total %.3f" % (CHAIN_JOINTS[worst], gaps[worst],
-                                sum(abs(g) for g in gaps)))
+                "after the reach, %s wanted %+.3f got %+.3f (gap %+.3f, limits "
+                "%+.2f..%+.2f), total %.3f"
+                % (CHAIN_JOINTS[worst], self.reach_path[-1][worst], current[worst],
+                   gaps[worst], lo, hi, sum(abs(g) for g in gaps)))
 
         if self._arrived(self.grasp_target) is False:
             self.reaches += 1
