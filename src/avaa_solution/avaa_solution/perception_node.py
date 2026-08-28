@@ -94,6 +94,7 @@ class PerceptionNode(Node):
         self.reported_row: Optional[int] = None
         # Confident row readings, voted on before anything is latched. See _publish_row.
         self.row_votes = deque(maxlen=15)
+        self.started_at = None
         self.row_majority = 0.7
 
         if self.save_images:
@@ -208,12 +209,33 @@ class PerceptionNode(Node):
         The RGB and depth streams share intrinsics and dimensions exactly, so the box
         found in colour indexes the depth image directly.
         """
-        if self.depth_image is None or self.intrinsics is None or self.depth_frame is None:
-            return
-        if self.depth_frame is None:
-            self.get_logger().warn(
-                "no depth frame yet; cannot place the book in 3D",
-                throttle_duration_sec=5.0)
+        # Say which input is missing rather than returning without a word. The check
+        # below this used to be the one that logged, and it could never fire because the
+        # guard above already caught the same case. A run then spent its entire timeout
+        # printing "centred but the book is not located yet" from the approach while this
+        # returned silently on every frame, and nothing anywhere named the depth stream.
+        missing = [name for name, value in (
+            ("depth image", self.depth_image),
+            ("depth intrinsics", self.intrinsics),
+            ("depth frame id", self.depth_frame),
+        ) if value is None]
+        if missing:
+            if self.started_at is None:
+                self.started_at = self.get_clock().now()
+            waited = (self.get_clock().now() - self.started_at).nanoseconds / 1e9
+            # After this long it is not a slow start, it is a sensor that never came up.
+            # The Gazebo depth camera fails to start every so often and leaves its topic
+            # advertised with nothing on it, which otherwise surfaces minutes later as a
+            # timeout in the approach with no mention of a camera anywhere.
+            if waited > 15.0:
+                self.get_logger().error(
+                    "no %s after %.0f s. The simulator sometimes starts without its "
+                    "depth camera; restart it." % (", ".join(missing), waited),
+                    throttle_duration_sec=10.0)
+            else:
+                self.get_logger().warn(
+                    "cannot place the book in 3D, still waiting on: %s"
+                    % ", ".join(missing), throttle_duration_sec=5.0)
             return
         point_optical = dl.locate(target.bbox, self.depth_image, self.intrinsics)
         if point_optical is None:

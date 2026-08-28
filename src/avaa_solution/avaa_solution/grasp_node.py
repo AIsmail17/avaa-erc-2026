@@ -28,6 +28,8 @@ group to ask.
 from enum import Enum
 from typing import List, Optional
 
+from collections import deque
+
 import numpy as np
 import rclpy
 from builtin_interfaces.msg import Duration
@@ -160,6 +162,16 @@ class GraspNode(Node):
         self.state_since = self._now()
         self.row: Optional[int] = None
         self.book: Optional[np.ndarray] = None
+        self.grasp_target = None
+        self.pre_target = None
+        # How close the gripper must actually get before the fingers are allowed to
+        # close, and how long to keep trying before calling it a failure.
+        self.arrival_tol = 0.012
+        self.arrival_timeout = 12.0
+        # Roughly a second of frames at 15 Hz. Long enough to bury an outlier,
+        # short enough that the target is still current when the arm commits.
+        self.book_points = deque(maxlen=15)
+        self.book_points_min = 8
         self.joints = {}
         self.grasp_solution: Optional[List[float]] = None
         self.pre_solution: Optional[List[float]] = None
@@ -187,7 +199,24 @@ class GraspNode(Node):
         self.row = int(msg.data)
 
     def _on_book(self, msg: PointStamped) -> None:
-        self.book = np.array([msg.point.x, msg.point.y, msg.point.z])
+        """Hold the median of recent sightings, not the latest one.
+
+        Measured against Gazebo at grasping range, the published point is accurate
+        sideways -- 3 mm of bias, 7 mm of spread, worst case 14 mm, all inside the 15 mm
+        of clearance the jaws leave around a 30 mm book. In depth it is not: 76 mm of
+        bias with 149 mm of spread over the same samples.
+
+        Planning from whichever sample happened to arrive last therefore puts the hand
+        anywhere within a hand-width of the shelf. Too shallow and the fingers close in
+        front of the spine; too deep and they drive into it, which is what shoved a book
+        0.193 m along the shelf and left it flat while the controller reported success.
+
+        A median over a second of frames rejects the outliers that a mean would carry.
+        """
+        self.book_points.append([msg.point.x, msg.point.y, msg.point.z])
+        if len(self.book_points) < self.book_points_min:
+            return
+        self.book = np.median(np.array(self.book_points), axis=0)
 
     def _on_joints(self, msg: JointState) -> None:
         for name, position in zip(msg.name, msg.position):
@@ -227,6 +256,20 @@ class GraspNode(Node):
         return self.chain.ik(target, seed=seed,
                              approach=GRASP_APPROACH, closing=GRASP_CLOSING)
 
+    def _gripper_error(self) -> Optional[float]:
+        """How far the gripper actually is from where the plan asked it to be.
+
+        Reads the real joint positions rather than assuming the trajectory was followed.
+        """
+        if self.grasp_target is None:
+            return None
+        try:
+            values = [self.joints[name]
+                      for name in ["torso_lift_joint"] + ARM_JOINTS]
+        except KeyError:
+            return None      # not all joints reported yet
+        return float(np.linalg.norm(self.chain.position(values) - self.grasp_target))
+
     def _plan(self) -> bool:
         """Work out the pre-grasp and grasp joint targets. False if unreachable."""
         if self.row is None or self.book is None:
@@ -257,6 +300,8 @@ class GraspNode(Node):
 
         self.pre_solution = pre_solution
         self.grasp_solution = grasp_solution
+        self.grasp_target = grasp
+        self.pre_target = pre
         self.get_logger().info(
             f"row {self.row} at z={height:.3f}; book at "
             f"x={face_x:.3f} y={y:.3f}; torso {grasp_solution[0]:.3f}"
@@ -323,10 +368,47 @@ class GraspNode(Node):
             self._enter(State.ADVANCE)
 
     def _do_advance(self) -> None:
-        if self._elapsed() >= self.move_time + self.settle:
-            self._send(self.pub_gripper, ["gripper_left_finger_joint"],
-                       [GRIPPER_CLAMP], self.gripper_time)
-            self._enter(State.CLAMP)
+        """Close the fingers when the gripper has arrived, not when a timer says so.
+
+        This used to clamp after move_time + settle regardless of where the arm actually
+        was. Measured against the plan, it was still 60 mm short and still moving when
+        that timer expired: the grasping frame reached x=0.805 against a commanded 0.869,
+        with the fingertips a further 100 mm back, so the jaws closed in front of the
+        book every time. Which is why the failures looked like clean misses -- they were
+        clean misses, of a target the arm had not got to yet.
+
+        Waiting on the measured error also removes the guesswork from move_time. A move
+        that needs longer simply takes longer, and one that never arrives is reported
+        rather than clamped anyway.
+        """
+        error = self._gripper_error()
+        if error is None:
+            if self._elapsed() >= self.move_time + self.settle:
+                self.get_logger().warn(
+                    "cannot measure the gripper position; clamping on the timer")
+                self._clamp()
+            return
+
+        if error <= self.arrival_tol:
+            self.get_logger().info(
+                f"gripper arrived, {error * 1000:.0f} mm from the planned grasp point")
+            self._clamp()
+            return
+
+        if self._elapsed() >= self.arrival_timeout:
+            self.get_logger().error(
+                f"gripper stalled {error * 1000:.0f} mm from the grasp point after "
+                f"{self._elapsed():.1f}s; not closing on empty air")
+            self._enter(State.FAILED)
+            return
+
+        self.get_logger().info(
+            f"advancing: {error * 1000:.0f} mm to go", throttle_duration_sec=2.0)
+
+    def _clamp(self) -> None:
+        self._send(self.pub_gripper, ["gripper_left_finger_joint"],
+                   [GRIPPER_CLAMP], self.gripper_time)
+        self._enter(State.CLAMP)
 
     def _do_clamp(self) -> None:
         if self._elapsed() >= self.gripper_time + 0.5:

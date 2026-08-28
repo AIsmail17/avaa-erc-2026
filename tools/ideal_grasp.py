@@ -71,16 +71,26 @@ def nearest_book(colour):
     return best
 
 
-def run_grasp():
+def run_grasp(depth=None):
+    """Start the real grasp controller, optionally overriding how deep it reaches.
+
+    The jaw pads extend well forward of the fingertip link origins, so the depth that
+    puts them around a book rather than against its face is not something to derive from
+    mesh bounds. Sweeping it is quicker and the answer is measured rather than argued.
+    """
+    extra = "" if depth is None else " -p grasp_depth_m:=%f" % depth
     cmd = ("source /opt/erc_ws/install/setup.bash && "
            "exec python3 -u /opt/erc_ws/install/avaa_solution/lib/avaa_solution/"
-           "grasp --ros-args -p use_sim_time:=true > /tmp/ideal_grasp.log 2>&1")
+           "grasp --ros-args -p use_sim_time:=true" + extra +
+           " > /tmp/ideal_grasp.log 2>&1")
     return subprocess.Popen(["/entrypoint.sh", "bash", "-c", cmd])
 
 
 def main():
     colour = sys.argv[1] if len(sys.argv) > 1 else "red"
+    depth = float(sys.argv[2]) if len(sys.argv) > 2 else None
     chain = ArmChain.from_urdf()
+    print("grasp depth: %s" % ("default" if depth is None else "%.3f m" % depth))
 
     found = nearest_book(colour)
     if found is None:
@@ -119,7 +129,7 @@ def main():
     node.create_subscription(String, "/avaa/grasp/state",
                              lambda m: state.__setitem__("grasp", m.data), 10)
 
-    grasp = run_grasp()
+    grasp = run_grasp(depth)
     time.sleep(4)
 
     print("%-11s %6s  %-40s  %8s %8s %8s  %6s" %

@@ -30,6 +30,28 @@ def gz(*args, timeout=25):
                           timeout=timeout).stdout
 
 
+DEPTH_TOPIC = "/head_front_camera/head_front_camera/depth/image_rect_raw"
+
+
+def depth_is_live(timeout=12):
+    """Whether the depth camera is actually producing frames, not merely advertised.
+
+    The Gazebo depth sensor sometimes fails to start, leaving the topic advertised with a
+    publisher attached and no messages on it ever. A run costs five minutes before that
+    shows up as a timeout in a completely different node, so it is worth twelve seconds
+    here.
+    """
+    try:
+        result = subprocess.run(
+            ["ros2", "topic", "hz", "-w", "3", DEPTH_TOPIC],
+            capture_output=True, text=True, timeout=timeout)
+        return "average rate" in result.stdout
+    except subprocess.TimeoutExpired as expired:
+        return b"average rate" in (expired.stdout or b"")
+    except Exception:  # noqa: BLE001 - treat an unusable check as a failed one
+        return False
+
+
 def book_models():
     out = gz("model", "--list")
     return sorted(l.strip(" -") for l in out.splitlines() if "book_col" in l)
@@ -89,6 +111,40 @@ def _wrap(angle):
 
 
 
+def stop_the_base():
+    """Bring the base to a halt and wait until it has actually stopped.
+
+    The velocity controller holds the last command indefinitely. cmd_vel_timeout is set
+    to 0.25 s in mobile_base_controller.yaml but does not take effect in this build, so
+    killing the approach mid-strafe leaves the robot sliding sideways at about 0.09 m/s
+    with nothing publishing to it at all.
+
+    That is worth more than tidiness here. A run judged while the base is still moving
+    reports a final position it was only passing through, and a robot left drifting can
+    reach the shelf and sweep books over after the run has finished -- which the verdict
+    would then blame on the grasp.
+    """
+    try:
+        # -t bounds it: without a message count ros2 topic pub never returns.
+        subprocess.run(
+            ["ros2", "topic", "pub", "-t", "40", "-r", "20", "/cmd_vel",
+             "geometry_msgs/msg/Twist", "{}"],
+            capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        pass   # it published for ten seconds, which is plenty to stop the base
+    previous = None
+    for _ in range(10):
+        current = pose("tiago_pro")
+        if previous is not None and current is not None:
+            moved = sum((a - b) ** 2 for a, b in
+                        zip(previous[0][:2], current[0][:2])) ** 0.5
+            if moved < 0.002:
+                return
+        previous = current
+        time.sleep(0.5)
+    print("warning: the base is still moving; the verdict below may not be stable")
+
+
 def run_node(executable, extra=(), log="/tmp/trial_node.log"):
     cmd = (f"source /opt/erc_ws/install/setup.bash && "
            f"exec python3 -u /opt/erc_ws/install/avaa_solution/lib/avaa_solution/"
@@ -108,6 +164,14 @@ def main():
         print("no books found; is the simulation running?")
         sys.exit(1)
     print(f"tracking {len(models)} books")
+
+    if not depth_is_live():
+        print("the depth camera is not publishing. Nothing downstream can work without\n"
+              "it: perception cannot place a book in 3D, so the approach will centre on\n"
+              "the column and then sit there until it times out.\n"
+              "This happens intermittently when the simulator starts. Restart it:\n"
+              "    sim restart --fast --headless")
+        sys.exit(1)
 
     before = snapshot(models)
     robot_before = pose("tiago_pro")
@@ -148,6 +212,7 @@ def main():
         if proc is not None:
             proc.terminate()
     subprocess.run(["pkill", "-f", "avaa_solution/lib"], capture_output=True)
+    stop_the_base()
     time.sleep(3)
 
     after = snapshot(models)
@@ -162,6 +227,7 @@ def main():
 
     taken = [o for o in outcomes if o[1] == "taken"]
     spoiled = [o for o in outcomes if o[1] in ("knocked over", "nudged")]
+    unknown = [o for o in outcomes if o[1] == "unknown"]
 
     if taken:
         print("RESULT: PICKED UP")
@@ -173,10 +239,17 @@ def main():
 
     for model, verdict, d in sorted(outcomes, key=lambda t: -t[2]):
         print(f"  {model}: {verdict}, {d:.3f} m")
+        # A pose query can come back empty if gz is busy, and a missing reading is not
+        # evidence of anything -- say so rather than crashing the whole verdict.
+        if before.get(model) is None or after.get(model) is None:
+            print("    (pose unavailable; nothing can be concluded about this one)")
+            continue
         print(f"    before {before[model][0]} rpy {before[model][1]}")
         print(f"    after  {after[model][0]} rpy {after[model][1]}")
     if spoiled:
         print(f"  ({len(spoiled)} book(s) disturbed — each one is a penalty in the run)")
+    if unknown:
+        print(f"  ({len(unknown)} book(s) could not be read back from Gazebo)")
 
     if robot_before and robot_after:
         travelled = sum((a - b) ** 2 for a, b in
