@@ -71,6 +71,40 @@ def nearest_book(colour):
     return best
 
 
+TUCK_POSE = [-0.5, -2.4, 0.0, -2.4, 0.0, 0.0, 0.0]
+
+
+def tuck_the_arms(node):
+    """Fold the arm in before starting, the way the real approach does.
+
+    Without this the fixture starts from whatever pose the robot spawned in, which is not
+    the pose the grasp controller ever sees in a real run. Started from there, the arm
+    jammed against the shelf on its very first move and the fixture was measuring its own
+    setup rather than the grasp.
+    """
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from builtin_interfaces.msg import Duration
+
+    pub = node.create_publisher(
+        JointTrajectory, "/arm_left_controller/joint_trajectory", 10)
+    deadline = time.time() + 10
+    while pub.get_subscription_count() == 0 and time.time() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.1)
+
+    traj = JointTrajectory()
+    traj.joint_names = ARM_JOINTS
+    point = JointTrajectoryPoint()
+    point.positions = [float(v) for v in TUCK_POSE]
+    point.time_from_start = Duration(sec=20, nanosec=0)
+    traj.points = [point]
+    pub.publish(traj)
+    print("tucking the arm before the grasp...", flush=True)
+
+    end = time.time() + 28
+    while time.time() < end:
+        rclpy.spin_once(node, timeout_sec=0.1)
+
+
 def run_grasp(depth=None):
     """Start the real grasp controller, optionally overriding how deep it reaches.
 
@@ -129,6 +163,7 @@ def main():
     node.create_subscription(String, "/avaa/grasp/state",
                              lambda m: state.__setitem__("grasp", m.data), 10)
 
+    tuck_the_arms(node)
     grasp = run_grasp(depth)
     time.sleep(4)
 

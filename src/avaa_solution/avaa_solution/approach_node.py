@@ -52,6 +52,16 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 BASE_FRAME = "base_footprint"
 ODOM_FRAME = "odom"
+
+# Where the left shoulder sits, sideways, in base_link. The base is not the thing that
+# has to line up with the book: the arm is, and its first joint is 0.159 m to the left of
+# centre. Stopping with the book straight ahead of the base leaves it that far off the
+# arm centre line, so the forearm has to cross the shelf opening diagonally to reach in
+# and catches on it. Measured with the link contact sensors, four arm links ended up
+# against base_link_shelf_collision and the arm stopped 100 mm short.
+#
+# Aiming the same grasp at the shoulder line instead took the miss from 136 mm to 8 mm.
+SHOULDER_OFFSET_Y = 0.159
 CAMERA_FRAME = "head_front_camera_depth_optical_frame"
 
 # base_link sits this far above base_footprint. Row heights are quoted in base_link.
@@ -924,7 +934,8 @@ class ApproachNode(Node):
         # marker bearing only before there is one. The bearing is what jumped.
         target = self._target_in_base()
         if target is not None:
-            error_m = float(target[1])
+            # Line the book up with the shoulder, not with the middle of the robot.
+            error_m = float(target[1]) - SHOULDER_OFFSET_Y
             bearing = f"{error_m:+.3f}m"
             if abs(error_m) > self.centre_tol_m:
                 # +y is to the left of the base, and so is a positive error.

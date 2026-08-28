@@ -36,6 +36,11 @@ def pose(model):
 def main():
     colour = sys.argv[1] if len(sys.argv) > 1 else "red"
     standoff = float(sys.argv[2]) if len(sys.argv) > 2 else 0.90
+    # Line the book up with the arm, not with the middle of the robot. The left
+    # shoulder sits 0.159 m to the left of base_link, so a book centred on the base is
+    # that far off the arm centre line and the forearm has to cross the shelf opening
+    # diagonally to reach it.
+    shoulder = float(sys.argv[3]) if len(sys.argv) > 3 else 0.159
 
     names = [l.strip(" -") for l in gz("model", "--list").splitlines()
              if "book_col" in l and colour in l]
@@ -54,7 +59,7 @@ def main():
 
     # Square to the shelf, which faces -x, so the robot looks along +x at yaw 0.
     x = book[0] - standoff
-    y = book[1]
+    y = book[1] - shoulder
     request = ('name: "tiago_pro", position: {x: %f, y: %f, z: 0.0}, '
                'orientation: {x: 0, y: 0, z: 0, w: 1}' % (x, y))
     out = gz("service", "-s", "/world/erc_world/set_pose",

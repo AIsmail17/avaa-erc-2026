@@ -159,6 +159,29 @@ class ArmChain:
     def position(self, values: Sequence[float]) -> np.ndarray:
         return self.fk(values)[:3, 3]
 
+    def joint_origins(self, values: Sequence[float]) -> List[np.ndarray]:
+        """Where every moving joint sits, in base_link, ending with the tip.
+
+        Enough to tell whether a posture puts the elbow somewhere solid. The arm has four
+        spare degrees of freedom, so the solver is free to choose an elbow that reaches
+        the right point by going through the shelf, and it did: the same posture commanded
+        at the shelf and in open floor came out 5.733 and 0.998 rad from its target.
+        """
+        if len(values) != len(self.moving):
+            raise ValueError(f"expected {len(self.moving)} values, got {len(values)}")
+        result = np.eye(4)
+        points: List[np.ndarray] = []
+        index = 0
+        for joint in self.joints:
+            if joint.moving:
+                result = result @ joint.transform_at(float(values[index]))
+                index += 1
+                points.append(result[:3, 3].copy())
+            else:
+                result = result @ joint.origin
+        points.append(result[:3, 3].copy())
+        return points
+
     def clamp(self, values: Sequence[float]) -> List[float]:
         return [j.clamp(float(v)) for j, v in zip(self.moving, values)]
 
@@ -166,7 +189,8 @@ class ArmChain:
            tolerance: float = 0.005,
            approach: Optional[Sequence[float]] = None,
            closing: Optional[Sequence[float]] = None,
-           orientation_tolerance: float = 0.26) -> Optional[List[float]]:
+           orientation_tolerance: float = 0.26,
+           prefer=None) -> Optional[List[float]]:
         """Joint values placing the gripper at target (x, y, z) in base_link.
 
         With approach and closing left out this solves position only, which is
@@ -192,6 +216,12 @@ class ArmChain:
 
         The closing axis is sign-agnostic -- the jaws are symmetric, so a solution with
         the fingers swapped is the same grasp.
+
+        prefer picks between solutions that all satisfy the above. Reaching the
+        right point with the right wrist still leaves four degrees of freedom, and the
+        solver will spend them on an elbow inside the shelf as readily as beside it, so
+        the caller gets to say which posture it wants. It is given the joint values and
+        returns a cost to minimise.
 
         Returns None when nothing reaches within tolerance metres, or when an
         orientation was requested and no solution holds both axes within
@@ -240,10 +270,13 @@ class ArmChain:
             return position, angle
 
         best = None
+        acceptable: List[List[float]] = []
         # A few restarts: the arm is redundant and the solver can settle in a local
         # minimum that does not reach, particularly near the limits. Pinning the wrist
-        # narrows the basin, so allow more attempts when orientation matters.
-        for attempt in range(20 if want_orientation else 6):
+        # narrows the basin, so allow more attempts when orientation matters. When the
+        # caller wants to choose between postures, keep going to collect several rather
+        # than stopping at the first that reaches.
+        for attempt in range(40 if prefer is not None else (20 if want_orientation else 6)):
             start = seed if attempt == 0 else [
                 np.random.uniform(lo, hi) for lo, hi in self.limits
             ]
@@ -261,8 +294,12 @@ class ArmChain:
             if best is None or key < best[0]:
                 best = (key, list(result.x), position_error, angle_error)
             if position_error <= tolerance and angle_error <= orientation_tolerance:
-                break
+                acceptable.append(list(result.x))
+                if prefer is None:
+                    break
 
+        if prefer is not None and acceptable:
+            return min(acceptable, key=prefer)
         if best is None:
             return None
         _, values, position_error, angle_error = best

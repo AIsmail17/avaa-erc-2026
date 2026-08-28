@@ -54,7 +54,15 @@ ARM_JOINTS = [f"arm_left_{i}_joint" for i in range(1, 8)]
 # Gripper command values, from the measured span curve (span ~= 0.028 + 0.82 * joint):
 # a book is 0.03 m thick, and the fully closed span of 0.028 m closes past it.
 GRIPPER_OPEN = 0.040     # 60.5 mm, twice the book thickness
-GRIPPER_CLAMP = 0.000    # 28 mm, closes onto the spine
+# Measured from TF, not from the span model: at a commanded 0.000 the joint settles
+# at 0.0026 with the fingertips 30.4 mm apart, and the book is 30.0 mm thick. The
+# jaws were closing around the book with 0.2 mm to spare on each side and gripping
+# nothing, which is why a perfectly aimed grasp -- gripper arrived 8 mm from plan,
+# jaws centred on the spine and 20 mm inside the front face -- still lifted nothing.
+#
+# The joint goes to -0.001, its lower limit, which the span curve puts at about
+# 27.7 mm: 2.3 mm narrower than the book, so it actually squeezes.
+GRIPPER_CLAMP = -0.001
 
 # Row heights as gripper z in base_link, rows 1..4. base_link sits 0.186 m above the
 # floor, so these are the world shelf heights less that offset.
@@ -69,6 +77,17 @@ DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 # torso tracks exactly, and the compensation was placing the gripper 28 mm above the
 # book -- enough on its own to close the fingers over the top corner of a 30 mm book.
 TORSO_BIAS = 0.0
+
+# What the joints can actually manage, used to give each trajectory a duration it can be
+# followed within. A joint_trajectory_controller aborts a trajectory it cannot keep up
+# with, and an aborted trajectory looks exactly like a command that was never sent: the
+# arm does not move at all, and nothing says why. Measured runs sat still at 394 mm and
+# at 1066 mm from their targets until the state timed out.
+#
+# Deliberately conservative. Overestimating the speed asks for a trajectory that gets
+# rejected; underestimating only makes the move take longer than it needs to.
+ARM_SPEED = 0.25          # rad/s
+TORSO_SPEED = 0.035       # m/s, as documented for this lift
 
 # Which way the hand must be held to take a book off a shelf, in base_link, for an
 # arm whose seven joints leave four degrees of freedom spare. Without these the
@@ -103,6 +122,7 @@ def row_to_height(row: int, heights: List[float], top_down: bool = True) -> Opti
 
 class State(Enum):
     IDLE = "idle"
+    STAGE = "staging"
     PREPARE = "preparing"
     OPEN = "opening"
     ADVANCE = "advancing"
@@ -146,7 +166,9 @@ class GraspNode(Node):
         self.declare_parameter("move_time_sec", 6.0)
         self.declare_parameter("gripper_time_sec", 2.0)
         self.declare_parameter("settle_sec", 1.5)
-        self.declare_parameter("state_timeout_sec", 40.0)
+        # Long enough to outlast a full-reach move. A 40 s limit was aborting
+        # states while the arm was still travelling toward them.
+        self.declare_parameter("state_timeout_sec", 120.0)
         self.declare_parameter("auto_start", True)
 
         self.row_heights: List[float] = list(
@@ -167,6 +189,20 @@ class GraspNode(Node):
         self.book: Optional[np.ndarray] = None
         self.grasp_target = None
         self.pre_target = None
+        self.stage_solution = None
+        self.stage_target = None
+        # Held close to the body: far enough forward to be a real posture, nowhere near
+        # the shelf face.
+        self.stage_x = 0.45
+        # Outer-loop correction for a posture the arm cannot quite hold. Reaching into
+        # the shelf, arm_left_4 settles against its lower stop 0.203 rad short of the
+        # commanded value while every other joint sits exactly on target, which leaves
+        # the gripper a steady 95 mm from the plan. The offset is repeatable, so it can
+        # be aimed off: re-solve for a target displaced by the miss and command that.
+        self.corrections = 0
+        self.max_corrections = 3
+        self.settled_error = None
+        self.settled_since = 0.0
         # How close the gripper must actually get before the fingers are allowed to
         # close, and how long to keep trying before calling it a failure.
         #
@@ -175,7 +211,15 @@ class GraspNode(Node):
         # 12 and 16 s to get there. Every timing in this controller had been written as
         # though 4 s meant 4 s, so each state moved on while the arm was still in
         # transit, and the fingers closed somewhere along the way.
-        self.arrival_tol = 0.012
+        # Per axis, because the axes are not remotely equivalent. Sideways is the tight
+        # one: the jaws open to 60.5 mm around a 30 mm book, so more than about 15 mm off
+        # centre and a finger meets the front of the book instead of passing it. Depth
+        # and height are forgiving, the book being 160 mm deep and 250 mm tall. A single
+        # spherical tolerance has to be set to the tightest axis, and a grasp that was
+        # 17 mm out almost entirely in the forgiving directions never got to close.
+        self.arrival_tol_lateral = 0.012
+        self.arrival_tol_depth = 0.040
+        self.arrival_tol_height = 0.040
         # The pre-grasp point only has to be close enough to advance from in a straight
         # line, so it does not need the tolerance the grasp itself does.
         self.pre_tol = 0.03
@@ -277,20 +321,156 @@ class GraspNode(Node):
     def row_height(self, row: int) -> Optional[float]:
         return row_to_height(row, self.row_heights, self.rows_top_down)
 
-    def _solve(self, target: np.ndarray, seed: Optional[List[float]] = None):
-        """Every solve in this node holds the same wrist, not just the grasp itself.
+    def _solve(self, target: np.ndarray, seed: Optional[List[float]] = None,
+               face_x: Optional[float] = None):
+        """Every solve in this node holds the same wrist, and keeps the elbow outside.
 
         The lift and the withdraw run through here too, and they matter as much: a
         wrist left free to rotate while the fingers are clamped twists the book back
         out of the shelf instead of drawing it clear.
+
+        Reaching the right point with the right wrist still leaves four degrees of
+        freedom, and the solver spent them on postures that put the arm through the
+        shelf. Commanded at the shelf, one such solution ended 5.733 rad from its target
+        with arm_left_1 pushed backwards; the identical command in open floor settled
+        within 0.998 and still closing. Nothing in the logs said "blocked" -- the joints
+        simply never arrived.
         """
-        return self.chain.ik(target, seed=seed,
-                             approach=GRASP_APPROACH, closing=GRASP_CLOSING)
+        prefer = None if face_x is None else self._clearance_cost(face_x)
+        return self.chain.ik(target, seed=seed, approach=GRASP_APPROACH,
+                             closing=GRASP_CLOSING, prefer=prefer)
+
+    def _clearance_cost(self, face_x: float):
+        """Score postures: out of the shelf, near where the arm already is, off the stops.
+
+        Scoring on intrusion alone is not enough, and scoring on it alone was worse than
+        not scoring at all. Every candidate for a reachable book scores zero intrusion --
+        no joint origin goes past the shelf face, only the hand does -- so the minimum was
+        picked arbitrarily from among ties, and what came back was whichever random
+        restart happened to land first: shoulder wound round to 4.5 of a possible 4.7 rad
+        and the torso pinned at its 0.35 limit. The arm then drifted away from it for a
+        minute and a half.
+
+        So the cost orders the ties too. Travel keeps the posture near the one the arm is
+        already in, which also makes the move short; the limit term keeps it off the stops,
+        where a joint has no room to correct and the controller struggles to hold it.
+        """
+        try:
+            current = [self.joints[name]
+                       for name in ["torso_lift_joint"] + ARM_JOINTS]
+        except KeyError:
+            current = None
+        limits = self.chain.limits
+
+        def cost(values: List[float]) -> float:
+            origins = self.chain.joint_origins(values)
+            # The last two frames are the wrist and the gripper; they have to go in.
+            intrusion = sum(max(0.0, float(p[0]) - face_x) for p in origins[:-2])
+            travel = (0.0 if current is None
+                      else sum(abs(a - b) for a, b in zip(values, current)))
+            # Weighted heavily and measured generously, because a joint near its stop
+            # is the failure that has cost the most here. arm_left_4 was chosen 0.203 rad
+            # from its lower limit, sagged onto the stop under the weight of an extended
+            # arm, and held the gripper 95 mm from the book while every other joint sat
+            # exactly on target.
+            crowding = sum(max(0.0, 0.45 - min(v - lo, hi - v)) ** 2
+                           for v, (lo, hi) in zip(values, limits))
+            return 10.0 * intrusion + 0.10 * travel + 20.0 * crowding
+
+        return cost
+
+    def _travel_time(self, solution, torso: float) -> float:
+        """How long this move needs, from how far each joint has to travel.
+
+        Asking for less time than the joints can deliver does not make them faster; it
+        makes the controller give up on the trajectory.
+        """
+        try:
+            arm_now = [self.joints[name] for name in ARM_JOINTS]
+            torso_now = self.joints["torso_lift_joint"]
+        except KeyError:
+            return 0.0     # nothing known yet; leave the caller default alone
+        arm_time = max(abs(a - b) for a, b in zip(arm_now, solution[1:])) / ARM_SPEED
+        torso_time = abs(torso_now - torso) / TORSO_SPEED
+        return max(arm_time, torso_time)
+
+    def _tracking(self, solution) -> str:
+        """Per-joint gap between a commanded solution and where the joints actually are.
+
+        Distinguishes the two things a stalled position error can mean. If the joints are
+        at the commanded values then the arm did what it was told and the target is wrong;
+        if they are not, something is stopping it or the command never took.
+        """
+        if solution is None:
+            return ""
+        names = ["torso_lift_joint"] + ARM_JOINTS
+        try:
+            actual = [self.joints[name] for name in names]
+        except KeyError:
+            return " [joints unknown]"
+        gaps = [a - c for a, c in zip(actual, solution)]
+        worst = max(range(len(gaps)), key=lambda i: abs(gaps[i]))
+        return (" [sent=%s worst joint %s off %+.3f, sum |gap| %.3f]"
+                % (self.command_sent, names[worst], gaps[worst],
+                   sum(abs(g) for g in gaps)))
 
     def _ensure_commanded(self, solution) -> None:
         """Get the command out if the first attempt found nobody listening."""
         if not self.command_sent:
             self._command(solution, self.move_time)
+
+    def _reach_offset(self, target) -> Optional[np.ndarray]:
+        """Signed miss along each axis, in base_link, rather than one distance."""
+        achieved = self._achieved()
+        if achieved is None or target is None:
+            return None
+        return np.asarray(achieved) - np.asarray(target)
+
+    def _within_tolerance(self, offset) -> bool:
+        return (abs(float(offset[0])) <= self.arrival_tol_depth
+                and abs(float(offset[1])) <= self.arrival_tol_lateral
+                and abs(float(offset[2])) <= self.arrival_tol_height)
+
+    def _achieved(self) -> Optional[np.ndarray]:
+        """Where the gripper actually is, from the real joint positions."""
+        try:
+            values = [self.joints[name]
+                      for name in ["torso_lift_joint"] + ARM_JOINTS]
+        except KeyError:
+            return None
+        return self.chain.position(values)
+
+    def _unused_correct_for_sag(self) -> bool:
+        """Kept as a record of something that did not work.
+
+        The idea was to aim off by the measured shortfall: the gripper is short by some
+        vector, so ask for a target displaced by that vector. It is a reasonable move
+        against a fixed offset, and this is not one. Reaching further needs more
+        extension, extension is what the arm was failing to hold, and the miss went from
+        95 mm to 168 mm with the elbow gap growing from 0.20 to 0.59 rad. Left here so
+        the next person does not spend an afternoon rediscovering it.
+        """
+        achieved = self._achieved()
+        if achieved is None or self.grasp_target is None:
+            return False
+        miss = self.grasp_target - achieved
+        aim = self.grasp_target + miss
+        solution = self._solve(aim, seed=self.grasp_solution,
+                               face_x=float(self.book[0]) if self.book is not None
+                               else None)
+        if solution is None:
+            self.get_logger().warn(
+                "no IK for the corrected target %s" % np.round(aim, 3).tolist())
+            return False
+        self.corrections += 1
+        self.get_logger().info(
+            "arm is %.0f mm short and holding; aiming %.0f mm past the target "
+            "(correction %d of %d)"
+            % (np.linalg.norm(miss) * 1000, np.linalg.norm(miss) * 1000,
+               self.corrections, self.max_corrections))
+        self.grasp_solution = solution
+        self._command(solution, self.move_time)
+        return True
 
     def _reach_error(self, target) -> Optional[float]:
         """How far the gripper actually is from a planned point.
@@ -324,18 +504,38 @@ class GraspNode(Node):
         grasp = np.array([face_x + self.grasp_depth, y, height])
         pre = np.array([face_x - self.standoff, y, height])
 
-        pre_solution = self._solve(pre)
+        pre_solution = self._solve(pre, face_x=face_x)
         if pre_solution is None:
             self.get_logger().error(
                 f"no IK for pre-grasp {np.round(pre, 3).tolist()}")
             return False
         # Seed the grasp solve from the pre-grasp so the two are near neighbours and the
         # advance is a short, straight-ish motion rather than a re-orientation.
-        grasp_solution = self._solve(grasp, seed=pre_solution)
+        grasp_solution = self._solve(grasp, seed=pre_solution, face_x=face_x)
         if grasp_solution is None:
             self.get_logger().error(f"no IK for grasp {np.round(grasp, 3).tolist()}")
             return False
 
+        # Rise to the row before reaching for it.
+        #
+        # The controller interpolates in joint space, so a single command from the tucked
+        # pose to a point in the shelf sweeps the arm along whatever path the joints
+        # happen to take between them. Measured with the link contact sensors, that path
+        # put arm_left_6 inside the shelf at z=0.44, below the lowest shelf surface at
+        # 0.587, while the book it was reaching for was at z=1.247. Four links ended up
+        # against base_link_shelf_collision and the arm stopped moving.
+        #
+        # Staging near the body at the target height turns one long diagonal sweep into a
+        # lift and then a reach, neither of which crosses the shelf.
+        stage = np.array([self.stage_x, y, height])
+        stage_solution = self._solve(stage, face_x=face_x)
+        if stage_solution is None:
+            self.get_logger().warn(
+                f"no IK for the staging point {np.round(stage, 3).tolist()}; "
+                "reaching directly")
+
+        self.stage_solution = stage_solution
+        self.stage_target = stage
         self.pre_solution = pre_solution
         self.grasp_solution = grasp_solution
         self.grasp_target = grasp
@@ -349,6 +549,10 @@ class GraspNode(Node):
     def _command(self, solution: List[float], seconds: float) -> bool:
         """Send a full-chain solution, compensating the torso's known undershoot."""
         torso = min(0.35, max(0.0, solution[0] + TORSO_BIAS))
+        seconds = max(seconds, self._travel_time(solution, torso))
+        self.get_logger().info(
+            "commanding over %.1fs: torso %.3f, arm %s"
+            % (seconds, torso, [round(v, 2) for v in solution[1:]]))
         sent_torso = self._send(self.pub_torso, ["torso_lift_joint"], [torso], seconds)
         sent_arm = self._send(self.pub_arm, ARM_JOINTS, solution[1:], seconds)
         self.command_sent = sent_torso and sent_arm
@@ -373,6 +577,7 @@ class GraspNode(Node):
 
         handler = {
             State.IDLE: self._do_idle,
+            State.STAGE: self._do_stage,
             State.PREPARE: self._do_prepare,
             State.OPEN: self._do_open,
             State.ADVANCE: self._do_advance,
@@ -392,8 +597,38 @@ class GraspNode(Node):
         if not self._plan():
             self._enter(State.FAILED)
             return
-        self._command(self.pre_solution, self.move_time)
-        self._enter(State.PREPARE)
+        # _enter clears command_sent, so it has to come first or the command is wiped
+        # and sent a second time by the state that is waiting on it.
+        if self.stage_solution is not None:
+            self._enter(State.STAGE)
+            self._command(self.stage_solution, self.move_time)
+        else:
+            self._enter(State.PREPARE)
+            self._command(self.pre_solution, self.move_time)
+
+    def _do_stage(self) -> None:
+        """Get to the target height near the body before reaching into the shelf."""
+        if self.stage_solution is None:
+            self._enter(State.PREPARE)
+            self._command(self.pre_solution, self.move_time)
+            return
+        error = self._reach_error(self.stage_target)
+        if error is not None and error <= self.pre_tol:
+            self.get_logger().info(
+                f"staged at the row, {error * 1000:.0f} mm out; reaching in")
+            self._enter(State.PREPARE)
+            self._command(self.pre_solution, self.move_time)
+            return
+        if self._elapsed() >= self.arrival_timeout:
+            self.get_logger().error(
+                "arm stalled on the way to the staging point; it is probably against "
+                "the shelf")
+            self._enter(State.FAILED)
+            return
+        self._ensure_commanded(self.stage_solution)
+        if error is not None:
+            self.get_logger().info(
+                f"staging: {error * 1000:.0f} mm to go", throttle_duration_sec=3.0)
 
     def _do_prepare(self) -> None:
         """Reach the pre-grasp point, and wait until the arm is actually there.
@@ -423,7 +658,8 @@ class GraspNode(Node):
             return
         self._ensure_commanded(self.pre_solution)
         self.get_logger().info(
-            f"preparing: {error * 1000:.0f} mm to go", throttle_duration_sec=3.0)
+            f"preparing: {error * 1000:.0f} mm to go{self._tracking(self.pre_solution)}",
+            throttle_duration_sec=3.0)
 
     def _open_fingers(self) -> None:
         self._send(self.pub_gripper, ["gripper_left_finger_joint"],
@@ -453,6 +689,7 @@ class GraspNode(Node):
         rather than clamped anyway.
         """
         error = self._reach_error(self.grasp_target)
+        offset = self._reach_offset(self.grasp_target)
         if error is None:
             if self._elapsed() >= self.move_time + self.settle:
                 self.get_logger().warn(
@@ -460,9 +697,10 @@ class GraspNode(Node):
                 self._clamp()
             return
 
-        if error <= self.arrival_tol:
+        if offset is not None and self._within_tolerance(offset):
             self.get_logger().info(
-                f"gripper arrived, {error * 1000:.0f} mm from the planned grasp point")
+                "gripper arrived: %+.0f mm depth, %+.0f mm sideways, %+.0f mm height"
+                % (offset[0] * 1000, offset[1] * 1000, offset[2] * 1000))
             self._clamp()
             return
 
@@ -473,9 +711,17 @@ class GraspNode(Node):
             self._enter(State.FAILED)
             return
 
+        # Aiming off by the shortfall was tried here and made things worse: asking for a
+        # target 95 mm further in demands more extension, which is what the arm was
+        # already failing to hold, and the miss grew to 168 mm with the elbow gap
+        # tripling. The shortfall is not an offset to cancel, it is a posture that cannot
+        # be held, so it is dealt with when the posture is chosen rather than here.
+
         self._ensure_commanded(self.grasp_solution)
         self.get_logger().info(
-            f"advancing: {error * 1000:.0f} mm to go", throttle_duration_sec=2.0)
+            f"advancing: {error * 1000:.0f} mm to go"
+            f"{self._tracking(self.grasp_solution)}",
+            throttle_duration_sec=2.0)
 
     def _clamp(self) -> None:
         self._send(self.pub_gripper, ["gripper_left_finger_joint"],
