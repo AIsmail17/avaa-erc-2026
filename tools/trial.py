@@ -185,7 +185,10 @@ def main():
     approach = run_node("approach", log="/tmp/trial_approach.log")
 
     print(f"trial running: column {column}, {colour} book", flush=True)
-    deadline = time.time() + 260
+    # The grasp waits for the arm to actually arrive rather than for a stopwatch,
+    # and this arm takes about three times the trajectory duration it is given, so a
+    # full staging-preparing-advancing sequence runs well past four minutes.
+    deadline = time.time() + 480
     grasp = None
     while time.time() < deadline:
         time.sleep(10)

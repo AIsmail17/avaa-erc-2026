@@ -54,12 +54,24 @@ def gz_pose(model):
     return None, None
 
 
+def gz_pose_retry(model, attempts=4):
+    """gz declines a pose query often enough that one refusal must not end the run."""
+    for _ in range(attempts):
+        p, r = gz_pose(model)
+        if p is not None:
+            return p, r
+        time.sleep(1.0)
+    return None, None
+
+
 def nearest_book(colour):
     listing = subprocess.run(["gz", "model", "--list"], capture_output=True,
                              text=True, timeout=25).stdout
     names = [l.strip(" -") for l in listing.splitlines()
              if "book_col" in l and colour in l]
-    base, _ = gz_pose("tiago_pro")
+    base, _ = gz_pose_retry("tiago_pro")
+    if base is None:
+        return None
     best = None
     for name in names:
         p, r = gz_pose(name)
@@ -131,7 +143,7 @@ def main():
         print("no %s book found" % colour)
         return
     distance, name, truth, truth_rpy = found
-    robot, rpy = gz_pose("tiago_pro")
+    robot, rpy = gz_pose_retry("tiago_pro")
     yaw = rpy[2]
 
     # The book in base_link, from ground truth: rotate the world offset by -yaw.

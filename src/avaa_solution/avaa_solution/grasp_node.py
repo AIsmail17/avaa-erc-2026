@@ -144,7 +144,13 @@ class GraspNode(Node):
         # this is a parameter rather than an assumption baked into the table. If the
         # organisers clarify otherwise it is a launch argument, not a rewrite.
         self.declare_parameter("rows_top_down", True)
-        self.declare_parameter("standoff_m", 0.12)      # pre-grasp gap from the spine
+        # How far in front of the book face the pre-grasp sits. At 0.12 the hand is
+        # already in the shelf opening, and the arm was jamming there rather than at
+        # the grasp: stuck 86 mm out with arm_left_3 held against the shelf. Standing
+        # off further keeps the whole hand clear until the advance, which is a short
+        # straight push along the shelf normal and the one motion that should be
+        # inside the opening.
+        self.declare_parameter("standoff_m", 0.25)
         # How far past the measured face to close the gripper.
         #
         # The depth measurement is good. An earlier note here claimed a 0.114 m near bias
@@ -158,7 +164,15 @@ class GraspNode(Node):
         # grip the spine. 0.05 m is comfortably inside the book's 0.16 m depth and clear
         # of the shelf behind it. The 0.11 m that briefly stood here would have driven the
         # gripper 8 cm into the book.
-        self.declare_parameter("grasp_depth_m", 0.05)
+        # How far past the book face the GRASPING FRAME is driven, which is not where
+        # the jaws are: they sit 29.7 mm behind that frame, measured from TF. At 0.05
+        # a perfect arrival put the jaws 20 mm inside the face, and a run that arrived
+        # 29 mm short in depth -- comfortably inside tolerance, and dead on sideways
+        # and in height -- closed them 9 mm in FRONT of the book.
+        #
+        # 0.11 puts the jaws at the middle of a 160 mm deep book when the arm arrives,
+        # and still 51 mm inside the face when it is 29 mm short.
+        self.declare_parameter("grasp_depth_m", 0.11)
         self.declare_parameter("lift_m", 0.03)
         # Measured: this arm needs about three times the trajectory duration it is
         # given. States wait on arrival rather than on this, so it is a pace, not
@@ -218,7 +232,9 @@ class GraspNode(Node):
         # spherical tolerance has to be set to the tightest axis, and a grasp that was
         # 17 mm out almost entirely in the forgiving directions never got to close.
         self.arrival_tol_lateral = 0.012
-        self.arrival_tol_depth = 0.040
+        # Tightened from 0.040: the jaw offset means depth error eats into the margin
+        # twice over, once for the offset and once for the miss.
+        self.arrival_tol_depth = 0.030
         self.arrival_tol_height = 0.040
         # The pre-grasp point only has to be close enough to advance from in a straight
         # line, so it does not need the tolerance the grasp itself does.
@@ -297,6 +313,57 @@ class GraspNode(Node):
     def _elapsed(self) -> float:
         return self._now() - self.state_since
 
+    def _send_path(self, pub, names, waypoints, seconds) -> bool:
+        """Send a trajectory through several waypoints rather than one endpoint.
+
+        The controller interpolates in joint space. Between two postures that are 0.36 m
+        apart in a straight line, that interpolation bows the arm sideways, and at the
+        shelf the bow goes through it: the advance jammed with arm_left_3 held 0.159 rad
+        off and the gripper 133 mm short, having reached the pre-grasp point cleanly.
+
+        Handing the controller the intermediate postures keeps the gripper on the straight
+        line it is supposed to follow, which for a reach into a shelf is the only path
+        that fits.
+        """
+        if pub.get_subscription_count() == 0:
+            self.get_logger().warn(
+                f"nothing is listening on {pub.topic_name} yet; holding the path",
+                throttle_duration_sec=2.0)
+            return False
+        traj = JointTrajectory()
+        traj.joint_names = list(names)
+        traj.points = []
+        step = seconds / max(1, len(waypoints))
+        for index, values in enumerate(waypoints, start=1):
+            point = JointTrajectoryPoint()
+            point.positions = [float(v) for v in values]
+            moment = step * index
+            point.time_from_start = Duration(
+                sec=int(moment), nanosec=int((moment % 1.0) * 1e9))
+            traj.points.append(point)
+        pub.publish(traj)
+        return True
+
+    def _straight_line(self, start_solution, start_point, end_point, steps=6):
+        """Joint waypoints tracing a straight line in space between two points."""
+        face_x = float(self.book[0]) if self.book is not None else None
+        waypoints = []
+        seed = list(start_solution)
+        start_point = np.asarray(start_point, dtype=float)
+        end_point = np.asarray(end_point, dtype=float)
+        for index in range(1, steps + 1):
+            fraction = index / float(steps)
+            point = start_point + fraction * (end_point - start_point)
+            solution = self._solve(point, seed=seed, face_x=face_x, near=seed)
+            if solution is None:
+                self.get_logger().warn(
+                    "no IK %.0f%% of the way along the reach; pushing straight instead"
+                    % (100.0 * fraction))
+                return None
+            waypoints.append(solution)
+            seed = solution
+        return waypoints
+
     def _send(self, pub, names, values, seconds) -> bool:
         traj = JointTrajectory()
         traj.joint_names = list(names)
@@ -322,7 +389,7 @@ class GraspNode(Node):
         return row_to_height(row, self.row_heights, self.rows_top_down)
 
     def _solve(self, target: np.ndarray, seed: Optional[List[float]] = None,
-               face_x: Optional[float] = None):
+               face_x: Optional[float] = None, near=None):
         """Every solve in this node holds the same wrist, and keeps the elbow outside.
 
         The lift and the withdraw run through here too, and they matter as much: a
@@ -336,11 +403,11 @@ class GraspNode(Node):
         within 0.998 and still closing. Nothing in the logs said "blocked" -- the joints
         simply never arrived.
         """
-        prefer = None if face_x is None else self._clearance_cost(face_x)
+        prefer = None if face_x is None else self._clearance_cost(face_x, near=near)
         return self.chain.ik(target, seed=seed, approach=GRASP_APPROACH,
                              closing=GRASP_CLOSING, prefer=prefer)
 
-    def _clearance_cost(self, face_x: float):
+    def _clearance_cost(self, face_x: float, near=None):
         """Score postures: out of the shelf, near where the arm already is, off the stops.
 
         Scoring on intrusion alone is not enough, and scoring on it alone was worse than
@@ -355,11 +422,23 @@ class GraspNode(Node):
         already in, which also makes the move short; the limit term keeps it off the stops,
         where a joint has no room to correct and the controller struggles to hold it.
         """
-        try:
-            current = [self.joints[name]
-                       for name in ["torso_lift_joint"] + ARM_JOINTS]
-        except KeyError:
-            current = None
+        # Measure travel from a given posture when one is supplied, otherwise from where
+        # the arm is now. The grasp is solved against the pre-grasp posture: the two are
+        # 230 mm apart along one axis and ought to be neighbours in joint space, but the
+        # solver does not know that. Left to choose freely it returned a posture unrelated
+        # to the pre-grasp one, and the advance became a re-orientation instead of a push.
+        # The jaws straddled the book correctly at the pre-grasp -- tips at y 0.129 and
+        # 0.189 around a book spanning 0.144 to 0.174 -- and then closed on nothing.
+        if near is not None:
+            current = list(near)
+            weight = 2.0
+        else:
+            try:
+                current = [self.joints[name]
+                           for name in ["torso_lift_joint"] + ARM_JOINTS]
+            except KeyError:
+                current = None
+            weight = 0.10
         limits = self.chain.limits
 
         def cost(values: List[float]) -> float:
@@ -375,7 +454,7 @@ class GraspNode(Node):
             # exactly on target.
             crowding = sum(max(0.0, 0.45 - min(v - lo, hi - v)) ** 2
                            for v, (lo, hi) in zip(values, limits))
-            return 10.0 * intrusion + 0.10 * travel + 20.0 * crowding
+            return 10.0 * intrusion + weight * travel + 20.0 * crowding
 
         return cost
 
@@ -511,7 +590,10 @@ class GraspNode(Node):
             return False
         # Seed the grasp solve from the pre-grasp so the two are near neighbours and the
         # advance is a short, straight-ish motion rather than a re-orientation.
-        grasp_solution = self._solve(grasp, seed=pre_solution, face_x=face_x)
+        # Solved as a neighbour of the pre-grasp posture, so the advance is the short
+        # straight push it is meant to be rather than a fresh choice of arm shape.
+        grasp_solution = self._solve(grasp, seed=pre_solution, face_x=face_x,
+                                     near=pre_solution)
         if grasp_solution is None:
             self.get_logger().error(f"no IK for grasp {np.round(grasp, 3).tolist()}")
             return False
@@ -667,9 +749,26 @@ class GraspNode(Node):
         self._enter(State.OPEN)
 
     def _do_open(self) -> None:
-        if self._elapsed() >= self.gripper_time + 0.5:
+        if self._elapsed() < self.gripper_time + 0.5:
+            return
+        # The reach into the shelf is the one motion that has to stay on its line.
+        waypoints = self._straight_line(
+            self.pre_solution, self.pre_target, self.grasp_target)
+        self._enter(State.ADVANCE)
+        if waypoints is None:
             self._command(self.grasp_solution, self.move_time)
-            self._enter(State.ADVANCE)
+            return
+        self.grasp_solution = waypoints[-1]
+        seconds = max(self.move_time, self._travel_time(
+            waypoints[-1], min(0.35, max(0.0, waypoints[-1][0] + TORSO_BIAS))))
+        torso_path = [[min(0.35, max(0.0, w[0] + TORSO_BIAS))] for w in waypoints]
+        sent_torso = self._send_path(
+            self.pub_torso, ["torso_lift_joint"], torso_path, seconds)
+        sent_arm = self._send_path(
+            self.pub_arm, ARM_JOINTS, [w[1:] for w in waypoints], seconds)
+        self.command_sent = sent_torso and sent_arm
+        self.get_logger().info(
+            "advancing along %d waypoints over %.1fs" % (len(waypoints), seconds))
 
     def _do_advance(self) -> None:
         """Close the fingers when the gripper has arrived, not when a timer says so.

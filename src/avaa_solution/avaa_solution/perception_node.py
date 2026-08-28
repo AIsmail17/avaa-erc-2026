@@ -54,6 +54,19 @@ TOPIC_TARGET_BOOK_POINT = "/avaa/perception/target_book_point"
 # Where the grasp controller wants the book expressed.
 GRASP_FRAME = "base_link"
 
+# Shelf heights in base_link, top row first, and how far the deprojected height sits
+# above the truth. Measured against Gazebo over 100 published points: +152 mm at 0.7-0.9 m
+# with 41 mm of spread, +193 at 0.9-1.2, +146 at 1.2-1.6, +121 beyond. The bias is not
+# constant enough to name a row on its own -- 0.6 of a row spacing at worst -- but it is
+# nowhere near the 660 mm needed to confuse rows two apart, which is what makes it a
+# usable check on an answer arrived at a completely different way.
+#
+# ASSUMPTION: the bias comes from the bounding box sitting high on the visible face of a
+# book whose lower edge is occluded by the shelf lip. It is treated as a constant here
+# because it does not need to be better than half a row to do this job.
+ROW_HEIGHTS_BASE = [1.391, 1.061, 0.731, 0.401]
+DEPTH_HEIGHT_BIAS = 0.152
+
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -203,6 +216,43 @@ class PerceptionNode(Node):
             throttle_duration_sec=5.0,
         )
 
+    def _row_from_height(self, point) -> Optional[int]:
+        """Which row a measured height implies, correcting the known upward bias."""
+        corrected = float(point[2]) - DEPTH_HEIGHT_BIAS
+        best = min(range(len(ROW_HEIGHTS_BASE)),
+                   key=lambda i: abs(ROW_HEIGHTS_BASE[i] - corrected))
+        return best + 1
+
+    def _cross_check_row(self, point) -> None:
+        """Distrust the marker row when the measured height flatly contradicts it.
+
+        The row is counted from the books grouped under a column marker, which needs the
+        whole column in frame and gets it wrong when neighbouring books are swept in. One
+        run latched row 3 for a book that was on row 1, aimed the head two shelves too
+        low, and then reported no red book in view for the rest of the run while standing
+        squarely in front of it.
+
+        Being one row out is within what the height bias can explain, so that is left
+        alone and only logged. Two rows apart is 660 mm and the height cannot be that
+        wrong, so the height wins.
+        """
+        if self.reported_row is None:
+            return
+        implied = self._row_from_height(point)
+        if implied is None or implied == self.reported_row:
+            return
+        if abs(implied - self.reported_row) < 2:
+            self.get_logger().info(
+                f"row {self.reported_row} from the markers, {implied} from the measured "
+                f"height; keeping {self.reported_row}", throttle_duration_sec=10.0)
+            return
+        self.get_logger().warn(
+            f"row {self.reported_row} from the markers but the book measures at row "
+            f"{implied}, {abs(implied - self.reported_row)} rows away. The markers are "
+            f"wrong; switching to {implied}")
+        self.reported_row = implied
+        self.row_votes.clear()
+
     def _publish_book_point(self, target: bd.Book) -> None:
         """Publish the target book's 3D position in base_link, for the grasp controller.
 
@@ -262,6 +312,7 @@ class PerceptionNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.point.x, msg.point.y, msg.point.z = (float(v) for v in point)
         self.pub_book_point.publish(msg)
+        self._cross_check_row(point)
 
     def _process(self) -> None:
         if self.latest_frame is None:
