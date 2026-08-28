@@ -140,7 +140,10 @@ class GraspNode(Node):
         # gripper 8 cm into the book.
         self.declare_parameter("grasp_depth_m", 0.05)
         self.declare_parameter("lift_m", 0.03)
-        self.declare_parameter("move_time_sec", 4.0)
+        # Measured: this arm needs about three times the trajectory duration it is
+        # given. States wait on arrival rather than on this, so it is a pace, not
+        # a deadline.
+        self.declare_parameter("move_time_sec", 6.0)
         self.declare_parameter("gripper_time_sec", 2.0)
         self.declare_parameter("settle_sec", 1.5)
         self.declare_parameter("state_timeout_sec", 40.0)
@@ -166,8 +169,24 @@ class GraspNode(Node):
         self.pre_target = None
         # How close the gripper must actually get before the fingers are allowed to
         # close, and how long to keep trying before calling it a failure.
+        #
+        # The timeout is generous on purpose. tools/arm_probe.py commanded three poses
+        # with time_from_start of 4 s: each was reached exactly, and each took between
+        # 12 and 16 s to get there. Every timing in this controller had been written as
+        # though 4 s meant 4 s, so each state moved on while the arm was still in
+        # transit, and the fingers closed somewhere along the way.
         self.arrival_tol = 0.012
-        self.arrival_timeout = 12.0
+        # The pre-grasp point only has to be close enough to advance from in a straight
+        # line, so it does not need the tolerance the grasp itself does.
+        self.pre_tol = 0.03
+        # Whether the current state has managed to get its command out. Re-sending one
+        # that did arrive is actively harmful: each new trajectory restarts the motion
+        # from wherever the arm currently is, so repeating every 6 s left it creeping
+        # 5 mm in 55 s. Send once, when something is listening.
+        self.command_sent = False
+        # Measured end to end: the arm sat near 590 mm for 25 s and then converged
+        # to 37 mm by 38 s. A 30 s limit cut it off just before it arrived.
+        self.arrival_timeout = 75.0
         # Roughly a second of frames at 15 Hz. Long enough to bury an outlier,
         # short enough that the target is still current when the arm commits.
         self.book_points = deque(maxlen=15)
@@ -226,6 +245,7 @@ class GraspNode(Node):
 
     def _enter(self, state: State) -> None:
         if state is not self.state:
+            self.command_sent = False
             self.get_logger().info(f"{self.state.value} -> {state.value}")
             self.state = state
             self.state_since = self._now()
@@ -233,7 +253,7 @@ class GraspNode(Node):
     def _elapsed(self) -> float:
         return self._now() - self.state_since
 
-    def _send(self, pub, names, values, seconds) -> None:
+    def _send(self, pub, names, values, seconds) -> bool:
         traj = JointTrajectory()
         traj.joint_names = list(names)
         point = JointTrajectoryPoint()
@@ -241,7 +261,18 @@ class GraspNode(Node):
         point.time_from_start = Duration(
             sec=int(seconds), nanosec=int((seconds % 1.0) * 1e9))
         traj.points = [point]
+        if pub.get_subscription_count() == 0:
+            # Publishing now would go nowhere. A trajectory sent before the controller
+            # has matched the subscription is dropped in silence and the arm simply never
+            # moves: seen in tools/arm_probe.py, where the first of three commanded poses
+            # was ignored for 16 s while the other two were reached exactly, and in a
+            # grasp that sat 1066 mm from its pre-grasp point without twitching.
+            self.get_logger().warn(
+                f"nothing is listening on {pub.topic_name} yet; holding the command",
+                throttle_duration_sec=2.0)
+            return False
         pub.publish(traj)
+        return True
 
     def row_height(self, row: int) -> Optional[float]:
         return row_to_height(row, self.row_heights, self.rows_top_down)
@@ -256,19 +287,26 @@ class GraspNode(Node):
         return self.chain.ik(target, seed=seed,
                              approach=GRASP_APPROACH, closing=GRASP_CLOSING)
 
-    def _gripper_error(self) -> Optional[float]:
-        """How far the gripper actually is from where the plan asked it to be.
+    def _ensure_commanded(self, solution) -> None:
+        """Get the command out if the first attempt found nobody listening."""
+        if not self.command_sent:
+            self._command(solution, self.move_time)
+
+    def _reach_error(self, target) -> Optional[float]:
+        """How far the gripper actually is from a planned point.
 
         Reads the real joint positions rather than assuming the trajectory was followed.
+        Measured on this arm, a trajectory asking for 4 s takes 12 to 16 s to finish, so
+        assuming it was followed is assuming a great deal.
         """
-        if self.grasp_target is None:
+        if target is None:
             return None
         try:
             values = [self.joints[name]
                       for name in ["torso_lift_joint"] + ARM_JOINTS]
         except KeyError:
             return None      # not all joints reported yet
-        return float(np.linalg.norm(self.chain.position(values) - self.grasp_target))
+        return float(np.linalg.norm(self.chain.position(values) - target))
 
     def _plan(self) -> bool:
         """Work out the pre-grasp and grasp joint targets. False if unreachable."""
@@ -308,11 +346,13 @@ class GraspNode(Node):
         )
         return True
 
-    def _command(self, solution: List[float], seconds: float) -> None:
+    def _command(self, solution: List[float], seconds: float) -> bool:
         """Send a full-chain solution, compensating the torso's known undershoot."""
         torso = min(0.35, max(0.0, solution[0] + TORSO_BIAS))
-        self._send(self.pub_torso, ["torso_lift_joint"], [torso], seconds)
-        self._send(self.pub_arm, ARM_JOINTS, solution[1:], seconds)
+        sent_torso = self._send(self.pub_torso, ["torso_lift_joint"], [torso], seconds)
+        sent_arm = self._send(self.pub_arm, ARM_JOINTS, solution[1:], seconds)
+        self.command_sent = sent_torso and sent_arm
+        return self.command_sent
 
     def _offset_solution(self, solution: List[float], dz: float) -> Optional[List[float]]:
         target = self.chain.position(solution) + np.array([0.0, 0.0, dz])
@@ -356,11 +396,39 @@ class GraspNode(Node):
         self._enter(State.PREPARE)
 
     def _do_prepare(self) -> None:
-        # The torso is slow (0.035 m/s) and may have further to travel than the arm.
-        if self._elapsed() >= self.move_time + self.settle:
-            self._send(self.pub_gripper, ["gripper_left_finger_joint"],
-                       [GRIPPER_OPEN], self.gripper_time)
-            self._enter(State.OPEN)
+        """Reach the pre-grasp point, and wait until the arm is actually there.
+
+        The torso is slow (0.035 m/s) and may have further to travel than the arm, and
+        the arm itself takes about three times the trajectory duration it is given. Moving
+        on after move_time + settle meant the hand was still swinging out when the fingers
+        were told to open and again when the advance was commanded, so the advance started
+        from somewhere unplanned. In one run the distance to the grasp point was still
+        growing when the advance began: 389, 398, 408, 423, 441 mm.
+        """
+        error = self._reach_error(self.pre_target)
+        if error is None:
+            if self._elapsed() >= self.move_time + self.settle:
+                self._open_fingers()
+            return
+        if error <= self.pre_tol:
+            self.get_logger().info(
+                f"at the pre-grasp point, {error * 1000:.0f} mm out")
+            self._open_fingers()
+            return
+        if self._elapsed() >= self.arrival_timeout:
+            self.get_logger().error(
+                f"arm stalled {error * 1000:.0f} mm from the pre-grasp point after "
+                f"{self._elapsed():.1f}s")
+            self._enter(State.FAILED)
+            return
+        self._ensure_commanded(self.pre_solution)
+        self.get_logger().info(
+            f"preparing: {error * 1000:.0f} mm to go", throttle_duration_sec=3.0)
+
+    def _open_fingers(self) -> None:
+        self._send(self.pub_gripper, ["gripper_left_finger_joint"],
+                   [GRIPPER_OPEN], self.gripper_time)
+        self._enter(State.OPEN)
 
     def _do_open(self) -> None:
         if self._elapsed() >= self.gripper_time + 0.5:
@@ -372,16 +440,19 @@ class GraspNode(Node):
 
         This used to clamp after move_time + settle regardless of where the arm actually
         was. Measured against the plan, it was still 60 mm short and still moving when
-        that timer expired: the grasping frame reached x=0.805 against a commanded 0.869,
-        with the fingertips a further 100 mm back, so the jaws closed in front of the
-        book every time. Which is why the failures looked like clean misses -- they were
-        clean misses, of a target the arm had not got to yet.
+        that timer expired: the grasping frame reached x=0.805 against a commanded 0.869.
+        The failures looked like clean misses because they were clean misses, of a target
+        the arm had not reached yet.
+
+        The jaws sit 29.7 mm behind gripper_left_grasping_link when open, measured from
+        TF, so where they close is not the point the IK aims for. That offset is small
+        next to the errors above and is folded into grasp_depth_m rather than modelled.
 
         Waiting on the measured error also removes the guesswork from move_time. A move
         that needs longer simply takes longer, and one that never arrives is reported
         rather than clamped anyway.
         """
-        error = self._gripper_error()
+        error = self._reach_error(self.grasp_target)
         if error is None:
             if self._elapsed() >= self.move_time + self.settle:
                 self.get_logger().warn(
@@ -402,6 +473,7 @@ class GraspNode(Node):
             self._enter(State.FAILED)
             return
 
+        self._ensure_commanded(self.grasp_solution)
         self.get_logger().info(
             f"advancing: {error * 1000:.0f} mm to go", throttle_duration_sec=2.0)
 
