@@ -37,9 +37,12 @@ depth_live() {
 }
 
 planner_up() {
-    docker exec erc_sim bash -c \
-        "grep -c 'You can start planning' /tmp/movegroup.log 2>/dev/null" \
-        2>/dev/null | number
+    # Ask whether move_group is answering, not whether it once said it was ready. That
+    # log line outlives the process, so grepping for it reported a planner that had been
+    # dead for several restarts and let a grasp run start with nothing to plan against.
+    docker exec erc_sim /entrypoint.sh bash -c \
+        "source /opt/erc_ws/install/setup.bash && timeout 15 ros2 action list 2>/dev/null \
+         | grep -c move_action" 2>/dev/null | number
 }
 
 start_planner() {

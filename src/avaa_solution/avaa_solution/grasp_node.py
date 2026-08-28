@@ -71,17 +71,22 @@ GRIPPER_OPEN = 0.040     # 60.5 mm, twice the book thickness
 # is why a perfectly aimed grasp -- gripper 8 mm from plan, jaws centred on the spine and
 # 20 mm inside the front face -- still lifted nothing. -0.001 is the joint's lower limit,
 # about 27.7 mm, which actually squeezes.
-# A light interference, not a crush.
+# A light interference, and a narrow band to hit.
 #
-# Watched through TF, the jaws close 60.5 -> 36.0 -> 27.1 mm around a book 30.0 mm
-# thick: at -0.001 they end up 1.5 mm inside it on each side. The fingers are
-# position-driven and do not stop on contact, so instead of gripping they squeeze
-# the book out like a pip -- it left with 2.93 rad of tip while the gripper sat
-# exactly where it was asked to, within a millimetre on every axis.
+# The fingers are position-driven and do not stop on contact: watched through TF they
+# close 60.5 -> 37.6 -> 28.7 mm around a book 30.0 mm thick, straight past the point
+# where it should have stopped them. So the only grip available is whatever the
+# contact solver pushes back with, and how much interference to ask for is the whole
+# question.
 #
-# 0.0009 puts the span near 29 mm: half a millimetre of interference a side, enough
-# for the contact solver to hold a 0.3 kg book at mu 5 and not enough to eject it.
-GRIPPER_CLAMP = 0.0009
+# Measured span curve: 30.4 mm at joint 0.0026, about 0.8 mm of span per 0.001 of
+# joint. Both ends of the band fail, in opposite ways:
+#
+#   -0.0010   1.5 mm a side   ejects the book during the clamp, 2.9 rad of tip
+#    0.0009   0.65 mm a side  ejects the book during the clamp, 1.2 rad of tip
+#    0.0015   0.25 mm a side  survives the clamp, slips during the withdraw and
+#                             topples after 78 mm
+GRIPPER_CLAMP = 0.0012
 
 DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
@@ -169,7 +174,11 @@ class GraspNode(Node):
         # topples the book the moment it is asked to carry its weight, where sliding
         # it straight out leaves the shelf taking the weight the whole way.
         self.declare_parameter("lift_m", 0.0)
-        self.declare_parameter("gripper_time_sec", 2.0)
+        # Slowly. The fingers are position-driven and do not stop on contact, so a
+        # fast close arrives at the book with speed and flicks it out; the book has
+        # left with a radian of tip while the gripper sat exactly on target. Six
+        # seconds gives the contact solver time to push back instead.
+        self.declare_parameter("gripper_time_sec", 6.0)
         self.declare_parameter("auto_start", True)
         # A Cartesian path that only gets part way is a blocked reach, not a failure to
         # follow one. Below this, the grasp is abandoned rather than half-attempted.
