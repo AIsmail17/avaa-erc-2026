@@ -234,6 +234,23 @@ class GraspNode(Node):
         # sideways, and the jaws have about 13 mm of clearance either side of the book.
         # That buys roughly four seconds between the last look and the jaws closing.
         self.declare_parameter("final_approach_m", 0.035)
+        # How far below the middle of the book to grip it.
+        #
+        # The book is 250 mm tall and 30 mm thick, standing free on a shelf board it
+        # cannot slide on, so it is a lever with a very short base. Tipping it needs
+        # only F > m g t / 2h: with the pads at mid height that is 0.3 * 9.81 * 0.015
+        # / 0.125, about a third of a newton. A parallel gripper closes symmetrically
+        # about its own centre line, so any centring error means one pad touches first
+        # and pushes -- and a third of a newton is nothing, so the book goes over before
+        # the second pad arrives. Every failed run ended with it tipped, not slipped.
+        #
+        # 45 mm rather than the 80 that the arithmetic wants. At 80 the arm simply
+        # cannot get there: twelve pre-grasp postures in a row came back with no IK
+        # solution at all, none of them in collision and none over torque, so it is
+        # reach and not clutter that runs out. 45 mm still lifts the tipping threshold
+        # from 0.35 N to about 0.55 N, and the pads are 34 mm tall so it stays clear of
+        # the shelf board the book stands on.
+        self.declare_parameter("grasp_below_centre_m", 0.045)
         # How many postures that reach are compared before choosing one.
         self.declare_parameter("posture_choices", 4)
         # The pre-grasp is a staging point 0.15 m in front of the book, not the
@@ -290,6 +307,8 @@ class GraspNode(Node):
         self.tol_height = float(self.get_parameter("arrival_tol_height_m").value)
         self.reach_attempts = int(self.get_parameter("reach_attempts").value)
         self.final_approach = float(self.get_parameter("final_approach_m").value)
+        self.below_centre = float(
+            self.get_parameter("grasp_below_centre_m").value)
         self.posture_choices = int(
             self.get_parameter("posture_choices").value)
         self.pregrasp_tol = float(self.get_parameter("pregrasp_tol_m").value)
@@ -542,6 +561,7 @@ class GraspNode(Node):
         if fresh is not None and self.row is not None:
             height = row_to_height(self.row, self.row_heights, self.rows_top_down)
             if height is not None:
+                height -= self.below_centre
                 face_x = float(fresh[0])
                 y = float(fresh[1])
                 pre = np.array([max(face_x - self.standoff, self.min_pregrasp_x),
@@ -616,6 +636,7 @@ class GraspNode(Node):
             self.get_logger().error(
                 f"row {self.row} is outside 1..{len(self.row_heights)}")
             return False
+        height -= self.below_centre
 
         face_x = float(self.book[0])
         y = float(self.book[1])
