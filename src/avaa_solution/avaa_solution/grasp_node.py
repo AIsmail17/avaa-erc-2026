@@ -579,7 +579,18 @@ class GraspNode(Node):
         if self.book is not None and self.book_at is not None:
             age = (self.get_clock().now() - self.book_at).nanoseconds / 1e9
             if age <= self.book_fresh:
-                fresh = np.asarray(self.book, dtype=float)
+                # The median of the last six sightings, not of all fifteen.
+                #
+                # Fifteen sightings span several seconds, and several seconds ago the
+                # base was somewhere else: the median drags the target back towards
+                # wherever the book appeared to be while the arm was still swinging. It
+                # cost 20 mm sideways on a reach that had already waited for the base to
+                # go still, which was enough to fail the 12 mm arrival check and send
+                # the arm round again -- and going round again kicks the base, so the
+                # next look is worse than the last. Six samples is enough to reject a
+                # bad frame and recent enough to mean now.
+                recent = list(self.book_points)[-6:]
+                fresh = np.median(np.array(recent, dtype=float), axis=0)
 
         if fresh is not None and self.row is not None:
             height = row_to_height(self.row, self.row_heights, self.rows_top_down)

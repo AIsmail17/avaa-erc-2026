@@ -490,7 +490,7 @@
                 equivalent to inverse of viscous damping coefficient with units of m/s/N.
                 A slip value of 0 is infinitely viscous. -->
             <mu>0.80</mu>
-            <mu2>0.12</mu2>
+            <mu2>0.0</mu2>
             <fdir1 gz:expressed_in="base_footprint">1 1 0</fdir1>
           </ode>
         </friction>
@@ -593,7 +593,7 @@
                 equivalent to inverse of viscous damping coefficient with units of m/s/N.
                 A slip value of 0 is infinitely viscous. -->
             <mu>0.80</mu>
-            <mu2>0.12</mu2>
+            <mu2>0.0</mu2>
             <fdir1 gz:expressed_in="base_footprint">1 -1 0</fdir1>
           </ode>
         </friction>
@@ -696,7 +696,7 @@
                 equivalent to inverse of viscous damping coefficient with units of m/s/N.
                 A slip value of 0 is infinitely viscous. -->
             <mu>0.80</mu>
-            <mu2>0.12</mu2>
+            <mu2>0.0</mu2>
             <fdir1 gz:expressed_in="base_footprint">1 -1 0</fdir1>
           </ode>
         </friction>
@@ -799,7 +799,7 @@
                 equivalent to inverse of viscous damping coefficient with units of m/s/N.
                 A slip value of 0 is infinitely viscous. -->
             <mu>0.80</mu>
-            <mu2>0.12</mu2>
+            <mu2>0.0</mu2>
             <fdir1 gz:expressed_in="base_footprint">1 1 0</fdir1>
           </ode>
         </friction>

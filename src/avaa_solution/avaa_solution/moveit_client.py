@@ -343,7 +343,7 @@ class MoveItClient:
 
     def execute_path(self, joint_names: Sequence[str],
                      waypoints: List[Sequence[float]],
-                     arm_speed: float = 0.45, torso_speed: float = 0.045,
+                     arm_speed: float = 0.22, torso_speed: float = 0.030,
                      timeout: float = 240.0) -> int:
         """Execute a joint-space path the caller has already worked out.
 
@@ -361,9 +361,22 @@ class MoveItClient:
         it was told. Re-measured with the gain fixed, a 0.9 rad move asked for in one
         second settles in 1.6, which is 0.55 rad/s. Asking for more than that does not
         get more, it gets overshoot: at 0.70 rad/s with a 0.15 s floor between
-        waypoints, arm_left_1 was asked for 2.318 rad and went to 4.101, and the retry
-        loop then chased a target it kept flying past. 0.45 is comfortably inside what
-        the arm demonstrably follows and still half again as quick as before.
+        waypoints, arm_left_1 was asked for 2.318 rad and went to 4.101.
+
+        But speed was the wrong thing to optimise, and 0.45 was a mistake made for a
+        reason that turned out to be backwards. The reach was sped up to spend less time
+        exposed to base drift. The base drift is caused by the arm: tucked and idle the
+        base turns 0.05 deg/s, and after two swings of the arm it is turning 1.22 and
+        has moved 211 mm. The disturbance goes with how hard the arm accelerates, not
+        with how long it takes, so hurrying makes the very thing it was meant to escape.
+
+        It shows up as a loop that cannot converge. With the base measurably still --
+        the book holding to 1 mm through the camera -- a reach finished 112 mm from its
+        target, because the target had moved that far while the arm was travelling. The
+        correction for that is another arm motion, which moves the base again by about
+        as much as it corrects.
+
+        So: gently. 0.22 rad/s and a half second between waypoints.
 
         Speed matters here for a reason that has nothing to do with impatience. The base
         slides continuously -- the wheels have no friction across the roller axis -- at
@@ -383,12 +396,10 @@ class MoveItClient:
                 torso_move = max(
                     (abs(a - b) for name, a, b in zip(joint_names, values, previous)
                      if name == "torso_lift_joint"), default=0.0)
-                # The floor was a half second per segment, which on a nine waypoint
-                # reach is four and a half seconds of nothing but stopping. It cannot go
-                # much below this though: every waypoint asks for zero velocity, so very
-                # short segments demand accelerations the controller answers by
-                # overshooting.
-                moment += max(0.30, arm_move / arm_speed, torso_move / torso_speed)
+                # Every waypoint asks for zero velocity, so a short segment is a demand
+                # for hard acceleration, and hard acceleration is exactly what shoves the
+                # base. Half a second is deliberately unhurried.
+                moment += max(0.50, arm_move / arm_speed, torso_move / torso_speed)
             point = JointTrajectoryPoint()
             point.positions = [float(v) for v in values]
             point.velocities = [0.0] * len(values)
