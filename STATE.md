@@ -117,7 +117,20 @@ report.
 - **Recreating the container wipes `install/` and `build/`.** Expected; rebuild takes 15 s.
 - **Re-publishing a `JointTrajectory` restarts it**, resetting `time_from_start`. A
   trajectory re-sent on a timer never completes.
-- **The torso undershoots by 2.5–3 cm**, repeatably. `TORSO_BIAS` compensates.
+- **The base will not stay where it is put.** The wheels are mecanum, modelled with
+  `mu 0.8` along the roller axis and `mu2 0.0` across it, so nothing damps a sideways
+  drift. Untouched with the arm folded: 8 mm and 2° every 30 s. With the arm extended
+  into the shelf, far worse. Commanding zero `cmd_vel` does not help — that locks the
+  wheels and the base slides across them.
+- **`/odom` is wheel odometry and it lies.** A base sliding on locked wheels reports
+  nothing; a base held still by driving its wheels reports travel that never happened
+  (813 mm of it in one run held to 17 mm of true error). Never anchor a target in it.
+- **Run headless.** With the Gazebo GUI the real time factor collapsed to 0.034 and
+  nothing moved at all — trajectories "completed" while the arm was still folded. Check
+  it with `gz topic -e -t /stats` before believing any result.
+- **Polling Gazebo costs real time factor.** Each `gz model -p` spawns a process and hits
+  Gazebo's service thread. Three tools polling at once took the simulation from 0.65 to
+  0.008. Throttle every fixture.
 - **Don't read gripper state from `/joint_states`** — the linkage joints are not published
   there. Use TF.
 - **The stowed arm sits in the LiDAR plane.** Returns within 0.45 m of `base_footprint` are
@@ -137,8 +150,11 @@ report.
 
 ## Decisions taken, and why
 
-- **No MoveIt.** Installed but has no SRDF for this robot in the image, despite the Phase 1
-  document saying it is "configured". IK is solved directly from the URDF instead.
+- **MoveIt, with an SRDF written by hand.** The image ships no SRDF for this robot
+  despite the Phase 1 document saying MoveIt is "configured", so `src/avaa_solution/
+  moveit/` carries one, generated collision matrix and all. Analytic IK from the URDF
+  proposes postures; MoveIt validates and executes them. IK alone repeatedly reached
+  correct points by paths that went through the shelf.
 - **No lateral base motion.** Commanding pure `vy` yaws the base by roughly the magnitude
   it strafes. Rotate-then-drive avoids it.
 - **Map-less Nav2 in the `odom` frame.** No prior map, start pose not guaranteed, a trial
