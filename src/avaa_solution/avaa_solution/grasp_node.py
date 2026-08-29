@@ -84,9 +84,23 @@ CHAIN_JOINTS = ["torso_lift_joint"] + ARM_JOINTS
 # of it they met its front corners and shoved it 140 mm deeper into the shelf over
 # successive runs. Wide open the inner faces are about 60 mm apart, which tolerates a
 # 15 mm aiming error instead of none.
-GRIPPER_OPEN = 0.068
+# Open enough to clear the book, and no more.
+#
+# Measured with tools/fitcheck.py, the pad surfaces sit 11.3 mm from the grasp centre
+# line at finger 0.0297 and 29.9 mm at 0.0700, so about 461 mm of pad travel per unit of
+# finger. The book's own surface is 15 mm out. That fixes both numbers that matter:
+#
+#   0.068  pads 29 mm out, 14 mm clearance a side, 30 mm of finger to reach the book
+#   0.052  pads 21 mm out,  6 mm clearance a side, 14 mm of finger to reach the book
+#
+# and the gripper is force limited to about 4 mm/s, so those are 7.6 s and 3.5 s of
+# closing. Seven seconds is too long: the base turns a quarter degree a second, which
+# drags the pads 21 mm sideways at arm's length while they close, and the last run
+# closed on air beside an untouched book. Six millimetres of clearance is enough for a
+# reach that arrives within five, and halving the closing time halves the drag.
+GRIPPER_OPEN = 0.052
 # Below this the jaws are too narrow to take the book and clamping would close on air.
-GRIPPER_OPEN_MIN = 0.048
+GRIPPER_OPEN_MIN = 0.044
 # Measured from TF, not from the span model: at a commanded 0.000 the joint settles at
 # 0.0026 with the fingertips 30.4 mm apart, and the book is 30.0 mm thick. The jaws were
 # closing around the book with 0.2 mm to spare on each side and gripping nothing, which
@@ -251,6 +265,10 @@ class GraspNode(Node):
         # from 0.35 N to about 0.55 N, and the pads are 34 mm tall so it stays clear of
         # the shelf board the book stands on.
         self.declare_parameter("grasp_below_centre_m", 0.045)
+        # How still the book has to look, and for how long, before the jaws close.
+        self.declare_parameter("quiet_spread_m", 0.004)
+        self.declare_parameter("quiet_for_sec", 2.5)
+        self.declare_parameter("quiet_timeout_sec", 25.0)
         # How many postures that reach are compared before choosing one.
         self.declare_parameter("posture_choices", 4)
         # The pre-grasp is a staging point 0.15 m in front of the book, not the
@@ -309,6 +327,10 @@ class GraspNode(Node):
         self.final_approach = float(self.get_parameter("final_approach_m").value)
         self.below_centre = float(
             self.get_parameter("grasp_below_centre_m").value)
+        self.quiet_spread = float(self.get_parameter("quiet_spread_m").value)
+        self.quiet_for = float(self.get_parameter("quiet_for_sec").value)
+        self.quiet_timeout = float(self.get_parameter("quiet_timeout_sec").value)
+        self.quiet_waited = None
         self.posture_choices = int(
             self.get_parameter("posture_choices").value)
         self.pregrasp_tol = float(self.get_parameter("pregrasp_tol_m").value)
@@ -352,6 +374,7 @@ class GraspNode(Node):
         # stops being worth trusting. The arm occludes the book on the way in, so this
         # is expected to go stale during the reach itself.
         self.book_at = None
+        self.settled_since = None
         self.gripper_held_at = None
         self.reopens = 0
         self.reopen_at = None
@@ -1285,6 +1308,46 @@ class GraspNode(Node):
                 "closing the last %.0f mm" % (drifted * 1000, remaining * 1000))
             self._start("reach", lambda: self.moveit.execute_path(CHAIN_JOINTS, final))
             return
+
+        # Wait for the base to go quiet before closing.
+        #
+        # The base is not disturbed by the world, it is disturbed by this arm. Measured
+        # with nothing commanding the base: tucked and idle it drifts about 0.05 deg/s,
+        # and after two swings of the arm out to a reach posture and back it is turning
+        # at 1.22 deg/s and takes tens of seconds to calm down. The gripper is force
+        # limited and takes three to seven seconds to close, so closing while the base is
+        # still ringing sweeps the jaws tens of millimetres sideways -- 1.22 deg/s for
+        # 3.5 s is 51 mm at arm's length, past a book that is 30 mm thick.
+        #
+        # There is no need to measure the base to know this. Perception watches the book
+        # through a camera bolted to the base, so a base that is moving is a book that
+        # appears to move. When the sightings stop changing, the base has settled.
+        spread = None
+        if len(self.book_points) >= 6:
+            recent = np.array(list(self.book_points)[-6:], dtype=float)
+            spread = float(np.max(recent, axis=0)[1] - np.min(recent, axis=0)[1])
+        now = self._now()
+        if spread is not None and spread <= self.quiet_spread:
+            if self.settled_since is None:
+                self.settled_since = now
+        else:
+            self.settled_since = None
+        if self.settled_since is None or now - self.settled_since < self.quiet_for:
+            if self.quiet_waited is None:
+                self.quiet_waited = now
+            if now - self.quiet_waited < self.quiet_timeout:
+                self._hold_gripper(GRIPPER_OPEN)
+                return
+            self.get_logger().warn(
+                "the base has not gone quiet in %.0f s (book still wandering %s); "
+                "closing anyway"
+                % (self.quiet_timeout,
+                   "unknown" if spread is None else "%.0f mm" % (spread * 1000)))
+        else:
+            self.get_logger().info(
+                "the base is quiet -- the book has held to %.0f mm for %.0f s; closing"
+                % (spread * 1000, now - self.settled_since))
+        self.quiet_waited = None
 
         # Re-aim before judging arrival, not only before setting off.
         #

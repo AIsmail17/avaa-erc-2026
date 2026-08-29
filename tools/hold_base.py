@@ -72,8 +72,12 @@ DAMP_ANGULAR = 0.0
 # without removing any. A steady offset costs nothing anyway: perception measures the
 # book through a camera on the base, so a base parked 40 mm off still aims correctly.
 # What has to be small is the movement between re-aiming and closing.
-DEADBAND_LINEAR = 0.020
-DEADBAND_ANGULAR = 0.015
+# Only step in when the base has genuinely wandered. The grasp now waits for the book
+# to stop moving in the camera before it closes the jaws, and a holder that is forever
+# nudging is a base that is never quiet -- it would starve the grasp of the stillness it
+# is waiting for. A steady offset costs nothing, because perception re-aims through it.
+DEADBAND_LINEAR = 0.060
+DEADBAND_ANGULAR = 0.050
 # Slow enough that a correction never yanks a book out of the fingers.
 MAX_LINEAR = 0.15
 MAX_ANGULAR = 0.4
