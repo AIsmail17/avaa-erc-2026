@@ -343,7 +343,7 @@ class MoveItClient:
 
     def execute_path(self, joint_names: Sequence[str],
                      waypoints: List[Sequence[float]],
-                     arm_speed: float = 0.30, torso_speed: float = 0.030,
+                     arm_speed: float = 0.70, torso_speed: float = 0.055,
                      timeout: float = 240.0) -> int:
         """Execute a joint-space path the caller has already worked out.
 
@@ -354,9 +354,18 @@ class MoveItClient:
         verified one by one against /check_state_validity, came back from
         compute_cartesian_path as 2 per cent achievable.
 
-        Timed from what the joints can do rather than from what they are rated for. The
-        torso manages 0.035 m/s and the arm about 0.3 rad/s in practice against a rated
-        1.95 to 3.95, and a trajectory faster than that is aborted rather than lagged.
+        Timed from what the joints can do rather than from what they are rated for, and
+        that had to be measured again. The old figures -- 0.3 rad/s for the arm, 0.035
+        m/s for the torso, against a rated 1.95 to 3.95 -- were taken when
+        position_proportional_gain was still 0.1 and the arm could not follow anything
+        it was told. Re-measured with the gain fixed, a 0.9 rad move asked for in one
+        second settles in 1.6, which is 0.55 rad/s, and asking for more gets more.
+
+        Speed matters here for a reason that has nothing to do with impatience. The base
+        slides continuously -- the wheels have no friction across the roller axis -- at
+        around 3.4 mm/s, and it takes the target with it. A reach that takes 34 seconds
+        is a reach whose aim is 115 mm stale by the time it arrives. Halving the time
+        halves that error, and it is the cheapest halving available.
         """
         trajectory = RobotTrajectory()
         trajectory.joint_trajectory.joint_names = list(joint_names)
@@ -370,7 +379,9 @@ class MoveItClient:
                 torso_move = max(
                     (abs(a - b) for name, a, b in zip(joint_names, values, previous)
                      if name == "torso_lift_joint"), default=0.0)
-                moment += max(0.5, arm_move / arm_speed, torso_move / torso_speed)
+                # The floor was a half second per segment, which on a nine waypoint
+                # reach is four and a half seconds of nothing but stopping.
+                moment += max(0.15, arm_move / arm_speed, torso_move / torso_speed)
             point = JointTrajectoryPoint()
             point.positions = [float(v) for v in values]
             point.velocities = [0.0] * len(values)

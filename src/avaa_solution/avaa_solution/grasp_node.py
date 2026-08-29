@@ -77,9 +77,16 @@ CHAIN_JOINTS = ["torso_lift_joint"] + ARM_JOINTS
 #
 # The supplied clamp node limits the command to 0.069, so this is well inside what the
 # organisers allow.
-GRIPPER_OPEN = 0.055
+# All the way open. The supplied clamp node limits the command to 0.069, so this is the
+# widest the organisers allow, and the margin is the whole game: measured through a
+# reach the pads still closed from 0.060 to 0.042, which brings their inner faces to
+# about 30 mm -- exactly the thickness of the book -- so instead of passing either side
+# of it they met its front corners and shoved it 140 mm deeper into the shelf over
+# successive runs. Wide open the inner faces are about 60 mm apart, which tolerates a
+# 15 mm aiming error instead of none.
+GRIPPER_OPEN = 0.068
 # Below this the jaws are too narrow to take the book and clamping would close on air.
-GRIPPER_OPEN_MIN = 0.034
+GRIPPER_OPEN_MIN = 0.048
 # Measured from TF, not from the span model: at a commanded 0.000 the joint settles at
 # 0.0026 with the fingertips 30.4 mm apart, and the book is 30.0 mm thick. The jaws were
 # closing around the book with 0.2 mm to spare on each side and gripping nothing, which
@@ -215,6 +222,13 @@ class GraspNode(Node):
         self.declare_parameter("arrival_tol_depth_m", 0.030)
         self.declare_parameter("arrival_tol_height_m", 0.030)
         self.declare_parameter("reach_attempts", 6)
+        # How much of the reach is left for a second, separately aimed leg.
+        #
+        # The long leg takes about thirty seconds and the base slides for all of it, so
+        # a target aimed once at the start is stale by the time the jaws get there. This
+        # stops short, re-aims at the book as it is then, and covers the rest in a few
+        # seconds, which is short enough that the drift over it does not matter.
+        self.declare_parameter("final_approach_m", 0.06)
         # How many postures that reach are compared before choosing one.
         self.declare_parameter("posture_choices", 4)
         # The pre-grasp is a staging point 0.15 m in front of the book, not the
@@ -262,6 +276,7 @@ class GraspNode(Node):
         self.tol_depth = float(self.get_parameter("arrival_tol_depth_m").value)
         self.tol_height = float(self.get_parameter("arrival_tol_height_m").value)
         self.reach_attempts = int(self.get_parameter("reach_attempts").value)
+        self.final_approach = float(self.get_parameter("final_approach_m").value)
         self.posture_choices = int(
             self.get_parameter("posture_choices").value)
         self.pregrasp_tol = float(self.get_parameter("pregrasp_tol_m").value)
@@ -270,6 +285,8 @@ class GraspNode(Node):
         self.min_pregrasp_x = float(
             self.get_parameter("min_pregrasp_x_m").value)
         self.reaches = 0
+        self.leg = 0
+        self.leg_target = None
         self.settle = float(self.get_parameter("settle_sec").value)
         self.settled_at = None
 
@@ -377,7 +394,7 @@ class GraspNode(Node):
         traj.points = [point]
         self.pub_gripper.publish(traj)
 
-    def _hold_gripper(self, value: float, period: float = 1.0) -> None:
+    def _hold_gripper(self, value: float, period: float = 0.6) -> None:
         """Keep re-asserting a gripper position, briefly, so it is not back-driven.
 
         A single trajectory point is a promise the controller keeps only as well as the
@@ -782,8 +799,13 @@ class GraspNode(Node):
         if usable is not None:
             share, solution, tries = usable
             self.get_logger().info(
-                "pre-grasp posture from try %d of %d that reached: worst joint at "
-                "%.0f%% of rated" % (tries, len(candidates) + 1, share * 100.0))
+                # Just the attempt number. The count of candidates collected is not the
+                # count of attempts made -- the search stops collecting once it has
+                # enough, so the winning attempt can be numbered higher than the total
+                # and the line read "try 6 of 5".
+                "pre-grasp posture from try %d that reached, %d considered: worst "
+                "joint at %.0f%% of rated"
+                % (tries, len(candidates), share * 100.0))
             return solution
 
         if best is None:
@@ -1105,15 +1127,36 @@ class GraspNode(Node):
         # branch of a redundant arm: the same reach validated 100 per cent clear from the
         # planned posture and 12 per cent from the arm one centimetre away from it.
         # MoveIt tolerates a start that close, so the validated path is the one to run.
-        path = self._straight_path(
-            self.pre_solution, self.pre_target, self.grasp_target)
+        #
+        # Start it from the point that posture actually reaches, not from pre_target.
+        # Re-aiming moves pre_target -- 51 mm in one run -- and the line was then being
+        # drawn from a point the starting posture is not at, so its first step was a
+        # jump rather than a step and the whole reach came back obstructed 12 per cent
+        # in. The posture and the point it reaches have to be the same thing.
+        start_point = np.asarray(self.chain.fk(list(self.pre_solution))[:3, 3],
+                                 dtype=float)
+
+        # Stop short of the book, so the last stretch can be aimed separately.
+        leg_end = np.asarray(self.grasp_target, dtype=float)
+        span = leg_end - start_point
+        reach = float(np.linalg.norm(span))
+        if reach > self.final_approach + 0.02:
+            leg_end = leg_end - (self.final_approach / reach) * span
+            self.leg = 1
+        else:
+            self.leg = 2
+        self.leg_target = leg_end
+
+        path = self._straight_path(self.pre_solution, start_point, leg_end)
         if path is None:
             self._enter(State.FAILED)
             return
         self.reach_path = path
         self.get_logger().info(
-            "reaching along %d waypoints; the last one is %s"
-            % (len(path), [round(v, 2) for v in path[-1]]))
+            "reaching along %d waypoints to %s, stopping %.0f mm short so the last "
+            "stretch can be re-aimed"
+            % (len(path), np.round(leg_end, 3).tolist(),
+               float(np.linalg.norm(np.asarray(self.grasp_target) - leg_end)) * 1000))
         self._enter(State.ADVANCE)
         self._start("reach", lambda: self.moveit.execute_path(CHAIN_JOINTS, path))
 
@@ -1152,6 +1195,32 @@ class GraspNode(Node):
                 "%+.2f..%+.2f), total %.3f"
                 % (CHAIN_JOINTS[worst], self.reach_path[-1][worst], current[worst],
                    gaps[worst], lo, hi, sum(abs(g) for g in gaps)))
+
+        # First leg done: re-aim at the book as it is now, and cover the rest.
+        if self.leg == 1:
+            before = np.asarray(self.grasp_target, dtype=float)
+            self._refresh_targets()
+            drifted = float(np.linalg.norm(np.asarray(self.grasp_target) - before))
+            here = self._gripper_now()
+            start = self._current_joints()
+            if here is None or start is None:
+                self.get_logger().error("cannot see the arm to aim the last stretch")
+                self._enter(State.FAILED)
+                return
+            remaining = float(np.linalg.norm(np.asarray(self.grasp_target) - here))
+            final = self._straight_path(start, here, self.grasp_target, steps=4)
+            if final is None:
+                self.get_logger().error(
+                    "no clear line for the last %.0f mm" % (remaining * 1000))
+                self._enter(State.FAILED)
+                return
+            self.leg = 2
+            self.reach_path = final
+            self.get_logger().info(
+                "at the staging point; the book moved %.0f mm while I reached, "
+                "closing the last %.0f mm" % (drifted * 1000, remaining * 1000))
+            self._start("reach", lambda: self.moveit.execute_path(CHAIN_JOINTS, final))
+            return
 
         # Re-aim before judging arrival, not only before setting off.
         #
@@ -1262,8 +1331,39 @@ class GraspNode(Node):
             self.get_logger().warn(
                 "the lift did not complete (%s); withdrawing anyway" % error_name(code))
         self._enter(State.WITHDRAW)
-        out = self.pre_target + np.array([0.0, 0.0, self.lift])
-        path = self._straight_path(self._current_joints(), self._gripper_now(), out)
+
+        # Come out the way we went in, measured from where the arm actually is.
+        #
+        # Aiming at the stored pre-grasp point assumes the arm reached the grasp point
+        # exactly and that the base has not moved since, and neither is true: the reach
+        # routinely stops tens of millimetres short, and the base slides throughout. A
+        # run failed here with "no clear way back out" while the arm was sitting in an
+        # ordinary posture inside the shelf, because the line it was asked to check ran
+        # from where the arm was to a point that no longer meant anything.
+        #
+        # Reversing the advance displacement instead is the same motion the arm has
+        # already proved it can make, just backwards.
+        here = self._gripper_now()
+        if here is None:
+            self.get_logger().error("cannot see the gripper to withdraw")
+            self._enter(State.FAILED)
+            return
+        back = np.asarray(self.pre_target, dtype=float) - np.asarray(
+            self.grasp_target, dtype=float)
+        back = back + np.array([0.0, 0.0, self.lift])
+
+        # If the full retreat will not check out, take what is available. Half out of
+        # the shelf with the book is worth more than stopping inside it.
+        path = None
+        for share in (1.0, 0.7, 0.45):
+            out = here + share * back
+            path = self._straight_path(self._current_joints(), here, out)
+            if path is not None:
+                if share < 1.0:
+                    self.get_logger().warn(
+                        "only %.0f%% of the way out is clear; taking that"
+                        % (share * 100))
+                break
         if path is None:
             self.get_logger().error("no clear way back out with the book")
             self._enter(State.FAILED)

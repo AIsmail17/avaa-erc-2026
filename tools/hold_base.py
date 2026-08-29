@@ -42,8 +42,14 @@ from geometry_msgs.msg import Twist
 GAIN_LINEAR = 0.5
 GAIN_ANGULAR = 0.6
 # Below this the base is where it is wanted; chasing further only adds motion.
-DEADBAND_LINEAR = 0.003
-DEADBAND_ANGULAR = 0.005
+# Deliberately loose. A tight deadband makes this fight every millimetre, and with a
+# loop running near 0.7 Hz that fight is an oscillation: measured at the jaws during a
+# reach, the base was swinging the target through 13 to 52 mm sideways while the log
+# reported it "held" to 34 mm. The grasp re-aims from perception and can absorb a
+# steady offset; what it cannot absorb is the floor moving under it. So this now only
+# intervenes when the base is genuinely running away.
+DEADBAND_LINEAR = 0.030
+DEADBAND_ANGULAR = 0.020
 # Slow enough that a correction never yanks a book out of the fingers.
 MAX_LINEAR = 0.15
 MAX_ANGULAR = 0.4

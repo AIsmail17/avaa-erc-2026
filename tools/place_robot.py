@@ -14,6 +14,7 @@ of the base can be tested on its own. It is a fixture, not part of the solution.
 import math
 import subprocess
 import sys
+import time
 
 
 def gz(*args, timeout=25):
@@ -44,8 +45,16 @@ def main():
 
     # ``colour`` may instead be a full model name, so that a particular row can be
     # tested rather than whichever row the randomiser put that colour on.
-    names = [l.strip(" -") for l in gz("model", "--list").splitlines()
-             if "book_col" in l and (colour in l or colour == l.strip(" -"))]
+    # Ask more than once. Gazebo drops query requests when it is busy, and a dropped
+    # listing here does not fail politely -- the empty list falls straight through to an
+    # IndexError and the run is gone before it started.
+    names = []
+    for _ in range(8):
+        names = [l.strip(" -") for l in gz("model", "--list").splitlines()
+                 if "book_col" in l and (colour in l or colour == l.strip(" -"))]
+        if names:
+            break
+        time.sleep(0.5)
     if not names:
         print("no %s books" % colour)
         return
@@ -53,10 +62,16 @@ def main():
     # Pick the one nearest the middle of the shelf, so the base has room either side.
     books = []
     for name in names:
-        p, _ = pose(name)
-        if p:
-            books.append((abs(p[1]), name, p))
+        for _ in range(5):
+            p, _ = pose(name)
+            if p:
+                books.append((abs(p[1]), name, p))
+                break
+            time.sleep(0.4)
     books.sort()
+    if not books:
+        print("could not read any %s book back from Gazebo" % colour)
+        return
     _, name, book = books[0]
 
     # Square to the shelf, which faces -x, so the robot looks along +x at yaw 0.
