@@ -27,11 +27,22 @@ def main():
     rclpy.init(); n=rclpy.create_node("jaw_watch")
     n.set_parameters([rclpy.parameter.Parameter("use_sim_time",rclpy.Parameter.Type.BOOL,True)])
     buf=Buffer(); TransformListener(buf,n)
-    st={"s":"?","f":float("nan")}
+    st={"s":"?","f":float("nan"),"moving":0.0}
     n.create_subscription(String,"/avaa/grasp/state",lambda m: st.__setitem__("s",m.data),10)
     def js(m):
         if "gripper_left_finger_joint" in m.name:
             st["f"]=m.position[m.name.index("gripper_left_finger_joint")]
+        # Whether the arm is moving, so rows taken mid-motion can be marked.
+        #
+        # A row is assembled from a TF lookup and two Gazebo model queries, and the
+        # queries cost the better part of a second each. While the arm is swinging that
+        # makes the gripper reading up to two seconds older than the book reading, which
+        # is not a measurement of anything -- it showed the jaws 250 mm short of a book
+        # that was visibly being pushed. Standing still the three agree.
+        if m.velocity and len(m.velocity) == len(m.name):
+            st["moving"] = max(
+                (abs(v) for n, v in zip(m.name, m.velocity)
+                 if n.startswith("arm_left") or n == "torso_lift_joint"), default=0.0)
     n.create_subscription(JointState,"/joint_states",js,10)
     t=time.time()
     while time.time()-t<8: rclpy.spin_once(n,timeout_sec=0.1)
@@ -57,9 +68,10 @@ def main():
         row=(st["s"],round(wy,3))
         if row!=last:
             last=row
-            print("%-6.0f %-11s (%.3f,%+.3f,%.3f)   (%.3f,%+.3f,%.3f)   %+8.0f %+8.0f %+8.0f %8.4f"%(
+            mark = " ~moving" if st.get("moving", 0.0) > 0.02 else ""
+            print("%-6.0f %-11s (%.3f,%+.3f,%.3f)   (%.3f,%+.3f,%.3f)   %+8.0f %+8.0f %+8.0f %8.4f%s"%(
                 time.time()%10000,st["s"],wx,wy,wz,bk[0],bk[1],bk[2],
-                (wx-bk[0])*1000,(wy-bk[1])*1000,(wz-bk[2])*1000,st["f"]))
+                (wx-bk[0])*1000,(wy-bk[1])*1000,(wz-bk[2])*1000,st["f"],mark))
             sys.stdout.flush()
         if st["s"] in ("done","failed"): break
         time.sleep(4.0)

@@ -269,9 +269,12 @@ class GraspNode(Node):
         # Waiting for the arm to stop is not free. The base slides about 3.4 mm/s and
         # takes the book with it, and the jaws only have some 14 mm of clearance either
         # side of a 30 mm book, so five seconds of standing still is a third of the
-        # budget spent on nothing. Three is enough now the reach is timed to something
-        # the arm can actually follow.
-        self.declare_parameter("settle_sec", 3.0)
+        # budget spent on nothing. Down to 1.8: the base still turns about a quarter of
+        # a degree per second whatever the wheels are given, which is 3 mm/s sideways at
+        # arm's length, and the window that has to fit inside 13 mm is the last leg plus
+        # this settle plus the arrival check. Arriving early is cheap -- the check simply
+        # fails and the reach is retried -- while waiting is not.
+        self.declare_parameter("settle_sec", 1.8)
 
         self.row_heights = list(
             self.get_parameter("row_heights").get_parameter_value().double_array_value
