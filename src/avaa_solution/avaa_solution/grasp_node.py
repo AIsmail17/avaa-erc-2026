@@ -228,7 +228,12 @@ class GraspNode(Node):
         # a target aimed once at the start is stale by the time the jaws get there. This
         # stops short, re-aims at the book as it is then, and covers the rest in a few
         # seconds, which is short enough that the drift over it does not matter.
-        self.declare_parameter("final_approach_m", 0.06)
+        #
+        # 35 mm rather than 60. The base still turns about a quarter of a degree per
+        # second even with the wheels given friction, which at arm's length is 3 mm/s
+        # sideways, and the jaws have about 13 mm of clearance either side of the book.
+        # That buys roughly four seconds between the last look and the jaws closing.
+        self.declare_parameter("final_approach_m", 0.035)
         # How many postures that reach are compared before choosing one.
         self.declare_parameter("posture_choices", 4)
         # The pre-grasp is a staging point 0.15 m in front of the book, not the

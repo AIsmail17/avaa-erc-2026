@@ -216,6 +216,25 @@ def main():
                              lambda m: state.__setitem__("grasp", m.data), 10)
 
     tuck_the_arms(node)
+
+    # Take the "before" pose after the tuck, not before it.
+    #
+    # The tuck is the fixture's own arm motion, and it is not gentle: starting from a
+    # failed grasp it sweeps the arm out of the shelf, and on one run that knocked the
+    # target book onto the floor. The run then measured the book against a pose recorded
+    # before any of that happened, found it had not moved since, and reported NOT MOVED
+    # for a book that was never on the shelf to begin with.
+    settled, settled_rpy = gz_pose_retry(name)
+    if settled is not None and settled_rpy is not None:
+        shifted = math.dist(truth[:3], settled[:3])
+        if shifted > 0.02:
+            print("WARNING: %s moved %.3f m during the tuck, before the grasp started"
+                  % (name, shifted))
+        if abs(settled[2] - truth[2]) > 0.05:
+            print("WARNING: %s is not at shelf height any more (z=%.3f); "
+                  "this run cannot mean anything" % (name, settled[2]))
+        truth, truth_rpy = settled, settled_rpy
+
     grasp = run_grasp(depth)
     time.sleep(4)
 

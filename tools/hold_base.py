@@ -49,8 +49,13 @@ GAIN_ANGULAR = 0.6
 # 14 mm of clearance either side of the book, and it is the millimetres per second
 # between re-aiming and closing that spend it. Opposing the measured velocity attacks
 # that directly, and unlike the position term it does not need a setpoint to chase.
-DAMP_LINEAR = 1.6
-DAMP_ANGULAR = 1.6
+# Off. Differencing the pose over a 1.5 s loop and feeding that back as a velocity
+# command is derivative feedback through a long delay, and it did exactly what that
+# predicts: the base oscillated out to 503 mm and plus or minus 21 degrees, far worse
+# than the drift it was meant to remove. Kept at zero rather than deleted because the
+# gating below is the part worth keeping if it is ever tried again with a faster loop.
+DAMP_LINEAR = 0.0
+DAMP_ANGULAR = 0.0
 # Below this the base is where it is wanted; chasing further only adds motion.
 # Deliberately loose. A tight deadband makes this fight every millimetre, and with a
 # loop running near 0.7 Hz that fight is an oscillation: measured at the jaws during a
@@ -58,8 +63,17 @@ DAMP_ANGULAR = 1.6
 # reported it "held" to 34 mm. The grasp re-aims from perception and can absorb a
 # steady offset; what it cannot absorb is the floor moving under it. So this now only
 # intervenes when the base is genuinely running away.
-DEADBAND_LINEAR = 0.030
-DEADBAND_ANGULAR = 0.020
+# Tighter again now the wheels have friction across the roller axis. The loose
+# deadband existed to stop the holder fighting a base that slid out from under it
+# whatever it did; with the sliding gone it can afford to hold properly.
+# Wide enough that it is not constantly nudging. Below about 40 mm of error the
+# proportional output falls under what the drive will actually move for -- commanded
+# 0.02 m/s the base simply sits there -- so chasing smaller errors just adds motion
+# without removing any. A steady offset costs nothing anyway: perception measures the
+# book through a camera on the base, so a base parked 40 mm off still aims correctly.
+# What has to be small is the movement between re-aiming and closing.
+DEADBAND_LINEAR = 0.020
+DEADBAND_ANGULAR = 0.015
 # Slow enough that a correction never yanks a book out of the fingers.
 MAX_LINEAR = 0.15
 MAX_ANGULAR = 0.4
@@ -155,36 +169,18 @@ def main():
         if not rclpy.ok():
             break
 
-        # Velocity, differenced from the true pose. Coarse at this rate, but the drift
-        # is smooth and slow so it does not need to be sharp.
-        now = time.time()
-        vx = vy = vyaw = 0.0
-        if previous is not None:
-            span = max(now - previous[3], 1e-3)
-            vx = (here[0] - previous[0]) / span
-            vy = (here[1] - previous[1]) / span
-            vyaw = wrap(rpy[2] - previous[2]) / span
-        previous = (here[0], here[1], rpy[2], now)
-        damp_forward = vx * math.cos(-yaw) - vy * math.sin(-yaw)
-        damp_sideways = vx * math.sin(-yaw) + vy * math.cos(-yaw)
-
-        # Damp only once it is nearly there. Further out the damping simply cancels the
-        # correction -- at 150 mm off, a 0.5 gain asks for 0.075 m/s and a 1.6 damping
-        # term subtracts 0.12 as soon as the base starts moving, so it never arrives.
-        # Near the setpoint there is nothing to cancel and damping is the whole point.
-        near = math.hypot(error_x, error_y) < 4 * DEADBAND_LINEAR
-        near_yaw = abs(error_yaw) < 4 * DEADBAND_ANGULAR
-        drive_x = -DAMP_LINEAR * damp_forward if near else 0.0
-        drive_y = -DAMP_LINEAR * damp_sideways if near else 0.0
-        drive_yaw = -DAMP_ANGULAR * vyaw if near_yaw else 0.0
+        # Straight proportional control on all three, which works again now the wheels
+        # have a little friction across the roller axis. At mu2 exactly zero the base
+        # slid out from under any correction; at 0.80 it could drive forwards but could
+        # not turn at all -- commanded 0.20 rad/s it managed 1 degree in six seconds --
+        # and the holder walked away from its goal. At 0.12 all four motions work:
+        # forward, backward, strafe and rotate.
         if math.hypot(error_x, error_y) > DEADBAND_LINEAR:
-            drive_x += GAIN_LINEAR * forward
-            drive_y += GAIN_LINEAR * sideways
+            command.linear.x = clamp(GAIN_LINEAR * forward, MAX_LINEAR)
+            command.linear.y = clamp(GAIN_LINEAR * sideways, MAX_LINEAR)
         if abs(error_yaw) > DEADBAND_ANGULAR:
-            drive_yaw += GAIN_ANGULAR * error_yaw
-        command.linear.x = clamp(drive_x, MAX_LINEAR)
-        command.linear.y = clamp(drive_y, MAX_LINEAR)
-        command.angular.z = clamp(drive_yaw, MAX_ANGULAR)
+            command.angular.z = clamp(GAIN_ANGULAR * error_yaw, MAX_ANGULAR)
+
         pub.publish(command)
         rclpy.spin_once(node, timeout_sec=0.01)
         # Reading the true pose is a Gazebo service call, and calling it flat out keeps
