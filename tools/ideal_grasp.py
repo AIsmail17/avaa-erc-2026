@@ -221,6 +221,7 @@ def main():
 
     refreshed = [0.0]
     last_fk = [None]
+    last_finger = [None]
     print("%-11s %6s  %-40s  %8s %8s %8s  %6s" %
           ("state", "torso", "arm 1..7", "fk x", "fk y", "fk z", "finger"))
     seen = set()
@@ -269,6 +270,7 @@ def main():
                     finger = js.position[index[FINGER]] if FINGER in index else float("nan")
                     fk = chain.fk(actual)[:3, 3]
                     last_fk[0] = fk
+                    last_finger[0] = finger
                     now = state["grasp"]
                     stamp = "%.0f" % (time.time() - start)
                     key = (now, stamp)
@@ -325,8 +327,19 @@ def main():
         print("book finished %.3f m from the gripper, and %+.3f m in height"
               % (held, after[2] - truth[2]))
 
-    if held is not None and held < 0.12:
-        print("RESULT: PICKED UP — the book finished in the hand")
+    # Near the hand is not in the hand. A run finished with the book 56 mm from the
+    # gripper and was called a pick, while the finger sat at 0.067 -- wide open -- and
+    # the book had not risen a millimetre. It had simply been knocked over and landed
+    # next to an open gripper. So the jaws have to be closed on something of about the
+    # right thickness as well: fully shut is air, fully open is nothing held.
+    finger = last_finger[0]
+    closed_on_something = finger is not None and 0.004 < finger < 0.055
+    if held is not None and held < 0.12 and closed_on_something:
+        print("RESULT: PICKED UP — the book finished in the hand, jaws at %.4f"
+              % finger)
+    elif held is not None and held < 0.12:
+        print("RESULT: NOT HELD — the book ended up beside the gripper, jaws at %s"
+              % ("unknown" if finger is None else "%.4f" % finger))
     elif moved <= 0.02:
         print("RESULT: NOT MOVED")
     elif tipped > 0.35:

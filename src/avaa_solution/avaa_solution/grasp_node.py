@@ -261,7 +261,12 @@ class GraspNode(Node):
         # has elapsed, and this arm is still travelling. Judged immediately, a reach
         # measured 86 mm short and 120 mm off sideways, and three retries three
         # seconds apart changed it by 3 mm because nothing had time to move.
-        self.declare_parameter("settle_sec", 5.0)
+        # Waiting for the arm to stop is not free. The base slides about 3.4 mm/s and
+        # takes the book with it, and the jaws only have some 14 mm of clearance either
+        # side of a 30 mm book, so five seconds of standing still is a third of the
+        # budget spent on nothing. Three is enough now the reach is timed to something
+        # the arm can actually follow.
+        self.declare_parameter("settle_sec", 3.0)
 
         self.row_heights = list(
             self.get_parameter("row_heights").get_parameter_value().double_array_value
@@ -1074,6 +1079,36 @@ class GraspNode(Node):
         else:
             self.get_logger().info(
                 "torso at the row, arm still folded; reaching out")
+        # Re-aim the pre-grasp before going to it.
+        #
+        # pre_solution is a joint-space posture, worked out back in the SCENE state, and
+        # joint space is measured from the base. A base that has slid forwards in the
+        # thirty to sixty seconds since then carries the whole arm forwards with it, so
+        # the posture that was a safe 150 mm in front of the book arrives inside it.
+        # That is not a theory: watched against ground truth, the book was standing when
+        # this move began and lying down when it finished, knocked over by the arm on
+        # its way to a pre-grasp that had gone stale.
+        self._refresh_targets()
+        moved = self.chain.ik(
+            self.pre_target, seed=list(self.pre_solution),
+            approach=GRASP_APPROACH, closing=GRASP_CLOSING,
+            pin=self._torso_for(float(self.pre_target[2])))
+        if moved is not None and self._clear(moved):
+            shift = float(np.linalg.norm(
+                np.asarray(self.chain.fk(list(moved))[:3, 3])
+                - np.asarray(self.chain.fk(list(self.pre_solution))[:3, 3])))
+            if shift > 0.005:
+                self.get_logger().info(
+                    "pre-grasp re-aimed %.0f mm for the base having moved"
+                    % (shift * 1000))
+            self.pre_solution = moved
+        elif moved is None:
+            self.get_logger().warn(
+                "could not re-aim the pre-grasp; going to the one planned earlier")
+        else:
+            self.get_logger().warn(
+                "the re-aimed pre-grasp is not collision free; keeping the planned one")
+
         self._enter(State.PREGRASP)
         self._start("pre-grasp", lambda: self.moveit.move_to_joints(
             CHAIN_JOINTS, self.pre_solution, timeout=240.0))

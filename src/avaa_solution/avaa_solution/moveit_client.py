@@ -343,7 +343,7 @@ class MoveItClient:
 
     def execute_path(self, joint_names: Sequence[str],
                      waypoints: List[Sequence[float]],
-                     arm_speed: float = 0.70, torso_speed: float = 0.055,
+                     arm_speed: float = 0.45, torso_speed: float = 0.045,
                      timeout: float = 240.0) -> int:
         """Execute a joint-space path the caller has already worked out.
 
@@ -359,7 +359,11 @@ class MoveItClient:
         m/s for the torso, against a rated 1.95 to 3.95 -- were taken when
         position_proportional_gain was still 0.1 and the arm could not follow anything
         it was told. Re-measured with the gain fixed, a 0.9 rad move asked for in one
-        second settles in 1.6, which is 0.55 rad/s, and asking for more gets more.
+        second settles in 1.6, which is 0.55 rad/s. Asking for more than that does not
+        get more, it gets overshoot: at 0.70 rad/s with a 0.15 s floor between
+        waypoints, arm_left_1 was asked for 2.318 rad and went to 4.101, and the retry
+        loop then chased a target it kept flying past. 0.45 is comfortably inside what
+        the arm demonstrably follows and still half again as quick as before.
 
         Speed matters here for a reason that has nothing to do with impatience. The base
         slides continuously -- the wheels have no friction across the roller axis -- at
@@ -380,8 +384,11 @@ class MoveItClient:
                     (abs(a - b) for name, a, b in zip(joint_names, values, previous)
                      if name == "torso_lift_joint"), default=0.0)
                 # The floor was a half second per segment, which on a nine waypoint
-                # reach is four and a half seconds of nothing but stopping.
-                moment += max(0.15, arm_move / arm_speed, torso_move / torso_speed)
+                # reach is four and a half seconds of nothing but stopping. It cannot go
+                # much below this though: every waypoint asks for zero velocity, so very
+                # short segments demand accelerations the controller answers by
+                # overshooting.
+                moment += max(0.30, arm_move / arm_speed, torso_move / torso_speed)
             point = JointTrajectoryPoint()
             point.positions = [float(v) for v in values]
             point.velocities = [0.0] * len(values)

@@ -41,6 +41,16 @@ from geometry_msgs.msg import Twist
 # base sat there oscillating. Keep the product of gain and step below one.
 GAIN_LINEAR = 0.5
 GAIN_ANGULAR = 0.6
+# Damping on measured velocity, not just error on position.
+#
+# A position controller on a loop this slow can only choose which way to be wrong: a
+# tight deadband makes it oscillate, a loose one lets it drift, and both show up at the
+# gripper as the target moving. What actually matters is the rate -- the jaws have about
+# 14 mm of clearance either side of the book, and it is the millimetres per second
+# between re-aiming and closing that spend it. Opposing the measured velocity attacks
+# that directly, and unlike the position term it does not need a setpoint to chase.
+DAMP_LINEAR = 1.6
+DAMP_ANGULAR = 1.6
 # Below this the base is where it is wanted; chasing further only adds motion.
 # Deliberately loose. A tight deadband makes this fight every millimetre, and with a
 # loop running near 0.7 Hz that fight is an oscillation: measured at the jaws during a
@@ -124,6 +134,7 @@ def main():
     sys.stdout.flush()
 
     began = time.time()
+    previous = None
     reported = [time.time()]
     worst_linear = worst_angular = 0.0
     while time.time() - began < seconds:
@@ -143,11 +154,37 @@ def main():
         command = Twist()
         if not rclpy.ok():
             break
+
+        # Velocity, differenced from the true pose. Coarse at this rate, but the drift
+        # is smooth and slow so it does not need to be sharp.
+        now = time.time()
+        vx = vy = vyaw = 0.0
+        if previous is not None:
+            span = max(now - previous[3], 1e-3)
+            vx = (here[0] - previous[0]) / span
+            vy = (here[1] - previous[1]) / span
+            vyaw = wrap(rpy[2] - previous[2]) / span
+        previous = (here[0], here[1], rpy[2], now)
+        damp_forward = vx * math.cos(-yaw) - vy * math.sin(-yaw)
+        damp_sideways = vx * math.sin(-yaw) + vy * math.cos(-yaw)
+
+        # Damp only once it is nearly there. Further out the damping simply cancels the
+        # correction -- at 150 mm off, a 0.5 gain asks for 0.075 m/s and a 1.6 damping
+        # term subtracts 0.12 as soon as the base starts moving, so it never arrives.
+        # Near the setpoint there is nothing to cancel and damping is the whole point.
+        near = math.hypot(error_x, error_y) < 4 * DEADBAND_LINEAR
+        near_yaw = abs(error_yaw) < 4 * DEADBAND_ANGULAR
+        drive_x = -DAMP_LINEAR * damp_forward if near else 0.0
+        drive_y = -DAMP_LINEAR * damp_sideways if near else 0.0
+        drive_yaw = -DAMP_ANGULAR * vyaw if near_yaw else 0.0
         if math.hypot(error_x, error_y) > DEADBAND_LINEAR:
-            command.linear.x = clamp(GAIN_LINEAR * forward, MAX_LINEAR)
-            command.linear.y = clamp(GAIN_LINEAR * sideways, MAX_LINEAR)
+            drive_x += GAIN_LINEAR * forward
+            drive_y += GAIN_LINEAR * sideways
         if abs(error_yaw) > DEADBAND_ANGULAR:
-            command.angular.z = clamp(GAIN_ANGULAR * error_yaw, MAX_ANGULAR)
+            drive_yaw += GAIN_ANGULAR * error_yaw
+        command.linear.x = clamp(drive_x, MAX_LINEAR)
+        command.linear.y = clamp(drive_y, MAX_LINEAR)
+        command.angular.z = clamp(drive_yaw, MAX_ANGULAR)
         pub.publish(command)
         rclpy.spin_once(node, timeout_sec=0.01)
         # Reading the true pose is a Gazebo service call, and calling it flat out keeps
