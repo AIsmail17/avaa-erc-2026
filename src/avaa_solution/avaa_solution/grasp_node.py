@@ -65,7 +65,21 @@ ARM_JOINTS = [f"arm_left_{i}_joint" for i in range(1, 8)]
 CHAIN_JOINTS = ["torso_lift_joint"] + ARM_JOINTS
 
 # Gripper command values. The span curve is roughly span = 0.0285 + 0.80 * joint.
-GRIPPER_OPEN = 0.040     # 60.5 mm, twice the book thickness
+# 0.055 opens the jaws to about 72 mm, against a book 30 mm thick.
+#
+# 0.040 -- 60.5 mm -- looked like ample clearance and was not. The jaws do not stay
+# where they are put while the arm is moving: measured through a reach, the finger went
+# from 0.045 to 0.006 between leaving the pre-grasp and arriving at the book, which is a
+# span of 32 mm closing on a 30 mm book, and the book was never touched. Standing still
+# it holds the commanded position to within 8 mm, so this is the arm's motion
+# back-driving a joint held by a proportional velocity loop, not a slow leak. Starting
+# wider leaves margin for that, and _hold_gripper keeps re-asserting it.
+#
+# The supplied clamp node limits the command to 0.069, so this is well inside what the
+# organisers allow.
+GRIPPER_OPEN = 0.055
+# Below this the jaws are too narrow to take the book and clamping would close on air.
+GRIPPER_OPEN_MIN = 0.034
 # Measured from TF, not from the span model: at a commanded 0.000 the joint settles at
 # 0.0026 with the fingertips 30.4 mm apart, and the book is 30.0 mm thick. The jaws were
 # closing around the book with 0.2 mm to spare on each side and gripping nothing, which
@@ -285,6 +299,17 @@ class GraspNode(Node):
 
         self.pre_target = None
         self.grasp_target = None
+        # When perception last saw the book, and how old a sighting may be before it
+        # stops being worth trusting. The arm occludes the book on the way in, so this
+        # is expected to go stale during the reach itself.
+        self.book_at = None
+        self.gripper_held_at = None
+        self.reopens = 0
+        self.reopen_at = None
+        # Generous, because the sighting rate is not guaranteed: perception competes for
+        # the same CPU as the planner, and the harness that stands in for it competes
+        # with Gazebo's own query service.
+        self.book_fresh = 6.0
         self.pre_solution = None
 
         self.motion_thread: Optional[threading.Thread] = None
@@ -322,6 +347,7 @@ class GraspNode(Node):
         if len(self.book_points) < self.book_points_min:
             return
         self.book = np.median(np.array(self.book_points), axis=0)
+        self.book_at = self.get_clock().now()
 
     def _on_joints(self, msg: JointState) -> None:
         for name, position in zip(msg.name, msg.position):
@@ -348,6 +374,27 @@ class GraspNode(Node):
         point.time_from_start = Duration(
             sec=int(self.gripper_time),
             nanosec=int((self.gripper_time % 1.0) * 1e9))
+        traj.points = [point]
+        self.pub_gripper.publish(traj)
+
+    def _hold_gripper(self, value: float, period: float = 1.0) -> None:
+        """Keep re-asserting a gripper position, briefly, so it is not back-driven.
+
+        A single trajectory point is a promise the controller keeps only as well as the
+        joint lets it. Re-sending the same long trajectory every tick would be worse --
+        each publish restarts it, so it never completes -- so this sends a short one at
+        a low rate, which acts as a hold rather than a move.
+        """
+        now = self.get_clock().now()
+        if (self.gripper_held_at is not None
+                and (now - self.gripper_held_at).nanoseconds / 1e9 < period):
+            return
+        self.gripper_held_at = now
+        traj = JointTrajectory()
+        traj.joint_names = ["gripper_left_finger_joint"]
+        point = JointTrajectoryPoint()
+        point.positions = [float(value)]
+        point.time_from_start = Duration(sec=0, nanosec=int(0.4 * 1e9))
         traj.points = [point]
         self.pub_gripper.publish(traj)
 
@@ -428,17 +475,66 @@ class GraspNode(Node):
         return rotation @ np.asarray(point, dtype=float) + np.array([t.x, t.y, t.z])
 
     def _refresh_targets(self) -> None:
-        """Re-express the targets in base_link, for the base as it is now."""
-        pre = self._from_odom(self.pre_odom)
-        grasp = self._from_odom(self.grasp_odom)
-        if pre is None or grasp is None:
-            return
-        moved = float(np.linalg.norm(grasp - self.grasp_target))
-        if moved > 0.005:
-            self.get_logger().info(
-                "base has moved; target shifted %.0f mm in base_link" % (moved * 1000))
-        self.pre_target = pre
-        self.grasp_target = grasp
+        """Re-aim at the book, preferring what perception can see over what odom claims.
+
+        The base does not merely roll, it slides across its own wheels. They are mecanum
+        wheels, modelled the way mecanum wheels have to be -- mu 0.8 along the roller
+        axis and mu2 0.0 across it -- so there is no friction whatever in one direction
+        and nothing damps a sideways drift once it starts. Measured on a freshly spawned
+        robot standing untouched with the arm still: it travels 8 mm and turns 2 degrees
+        every 30 seconds, while wheel odometry reports 2 mm and 0.06 degrees.
+
+        That is the whole problem with anchoring the target in odom. Odom is computed
+        from wheel rotations, and a wheel that is not turning reports nothing, so odom
+        cannot see a slide at all: the frame the target was anchored in is itself
+        drifting, and re-deriving from it corrects almost none of the error. Two degrees
+        of unseen yaw moves a target at arm's length by about 25 mm, and the book is
+        30 mm wide.
+
+        Perception measures the book through a camera bolted to the base, so when the
+        base slides the reading changes with it and the correction comes out right.
+
+        There is no odom fallback, because odom is not merely blind here, it is wrong in
+        the worst possible way. Holding the base still means driving the wheels against
+        the slide, and wheel odometry faithfully integrates every one of those turns
+        while the robot does not move: measured during a run held to 17 mm of true
+        error, odom had accumulated 813 mm of motion that never happened, and applying
+        it moved a correct target most of a metre. So when the sighting is stale --
+        which it will be, since the arm occludes the book on the way in -- the right
+        thing is to keep aiming where the book last actually was.
+        """
+        fresh = None
+        if self.book is not None and self.book_at is not None:
+            age = (self.get_clock().now() - self.book_at).nanoseconds / 1e9
+            if age <= self.book_fresh:
+                fresh = np.asarray(self.book, dtype=float)
+
+        if fresh is not None and self.row is not None:
+            height = row_to_height(self.row, self.row_heights, self.rows_top_down)
+            if height is not None:
+                face_x = float(fresh[0])
+                y = float(fresh[1])
+                pre = np.array([max(face_x - self.standoff, self.min_pregrasp_x),
+                                y, height])
+                grasp = np.array([face_x + self.grasp_depth, y, height])
+                moved = float(np.linalg.norm(grasp - self.grasp_target))
+                if moved > 0.005:
+                    self.get_logger().info(
+                        "the base has slid; re-aimed from perception, target moved "
+                        "%.0f mm" % (moved * 1000))
+                self.face_x = face_x
+                self.pre_target = pre
+                self.grasp_target = grasp
+                self.pre_odom = self._to_odom(pre)
+                self.grasp_odom = self._to_odom(grasp)
+                return
+
+        age = ("never" if self.book_at is None else "%.1f s old"
+               % ((self.get_clock().now() - self.book_at).nanoseconds / 1e9))
+        self.get_logger().warn(
+            "no fresh sighting (%s); holding the last measured target rather than "
+            "correcting from odom, which counts wheel turns the base did not make"
+            % age)
 
     def _gripper_now(self) -> Optional[np.ndarray]:
         """Where the gripper actually is, from the joints rather than from a promise."""
@@ -1022,6 +1118,10 @@ class GraspNode(Node):
         self._start("reach", lambda: self.moveit.execute_path(CHAIN_JOINTS, path))
 
     def _do_advance(self) -> None:
+        # Keep the jaws open on the way in. They are back-driven by the arm's own
+        # motion, and arriving at the book with them already shut is how a reach that
+        # lands within 2 mm still closes on nothing.
+        self._hold_gripper(GRIPPER_OPEN)
         done = self._finished()
         if done is None:
             return
@@ -1053,6 +1153,26 @@ class GraspNode(Node):
                 % (CHAIN_JOINTS[worst], self.reach_path[-1][worst], current[worst],
                    gaps[worst], lo, hi, sum(abs(g) for g in gaps)))
 
+        # Re-aim before judging arrival, not only before setting off.
+        #
+        # The reach takes the better part of a minute and the base does not stay still
+        # for it. It cannot: the wheels have no friction across the roller axis, so the
+        # moment of the extending arm slides the whole robot. Measured against ground
+        # truth through one reach, the jaws finished 110 mm short of the book and 244 mm
+        # to the side of it, while this controller reported arriving 2 mm from its
+        # target -- and both were true, because the target is held in base_link and
+        # base_link had moved.
+        #
+        # Re-aiming here turns that into an ordinary miss, which the retry below already
+        # knows how to correct.
+        aimed_at = np.array(self.grasp_target, dtype=float)
+        self._refresh_targets()
+        shifted = float(np.linalg.norm(np.asarray(self.grasp_target) - aimed_at))
+        if shifted > 0.005:
+            self.get_logger().warn(
+                "the book has moved %.0f mm in base_link since the reach was planned; "
+                "judging arrival against where it is now" % (shifted * 1000))
+
         if self._arrived(self.grasp_target) is False:
             self.reaches += 1
             if self.reaches < self.reach_attempts:
@@ -1062,7 +1182,11 @@ class GraspNode(Node):
                        self.reach_attempts))
                 # Push into the standing error rather than replay the same path. The
                 # path was followed; the joints just stopped short of its last point.
-                if self.reach_path and self._nudge(self.reach_path[-1]):
+                # Only when the target has held still, though: if it has moved, that
+                # waypoint is aimed at where the book used to be and pushing harder
+                # towards it makes the miss worse rather than better.
+                if (shifted <= 0.005 and self.reach_path
+                        and self._nudge(self.reach_path[-1])):
                     return
                 again = self._straight_path(
                     self._current_joints(), self._gripper_now(), self.grasp_target)
@@ -1078,8 +1202,39 @@ class GraspNode(Node):
             self._enter(State.FAILED)
             return
 
+        # Arriving is not the same as arriving ready. Check the jaws are still open
+        # wide enough to take the book before closing them, because clamping a gripper
+        # that is already nearly shut cannot fail loudly -- it simply reports a
+        # successful grasp of nothing, which is exactly what happened.
+        finger = self.joints.get("gripper_left_finger_joint")
+        if finger is not None and finger < GRIPPER_OPEN_MIN:
+            # Wait here rather than going back to the OPEN state. OPEN rebuilds the
+            # reach from the pre-grasp posture, and the arm is now deep inside the
+            # shelf, so that plan would start from a state the arm is nowhere near.
+            if self.reopen_at is None:
+                self.reopen_at = self._now()
+                self.reopens += 1
+                self.get_logger().warn(
+                    "the jaws are only %.0f mm apart at the book; re-opening in place "
+                    "(attempt %d of 3)"
+                    % (27.1 + (finger + 0.001) * 814.6, self.reopens))
+                self.gripper_held_at = None
+                self._send_gripper(GRIPPER_OPEN)
+                return
+            if self._now() - self.reopen_at < self.gripper_time + 1.0:
+                return
+            self.reopen_at = None
+            if self.reopens >= 3:
+                self.get_logger().error(
+                    "the jaws will not stay open; refusing to clamp on air")
+                self._enter(State.FAILED)
+            return
+        self.reopen_at = None
+
         self.get_logger().info(
-            "gripper is at the book (%s); clamping" % self._miss(self.grasp_target))
+            "gripper is at the book (%s), jaws %.0f mm apart; clamping"
+            % (self._miss(self.grasp_target),
+               27.1 + ((finger if finger is not None else GRIPPER_OPEN) + 0.001) * 814.6))
         self._send_gripper(GRIPPER_CLAMP)
         self.clamp_at = self.get_clock().now()
         self._enter(State.CLAMP)

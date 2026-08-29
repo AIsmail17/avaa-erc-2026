@@ -45,7 +45,8 @@ from moveit_msgs.msg import RobotTrajectory
 from moveit_msgs.srv import (ApplyPlanningScene, GetCartesianPath,
                              GetStateValidity)
 from rclpy.action import ActionClient
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from builtin_interfaces.msg import Duration
 from shape_msgs.msg import SolidPrimitive
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -91,17 +92,36 @@ class MoveItClient:
             rclpy.parameter.Parameter(
                 "use_sim_time", rclpy.Parameter.Type.BOOL, use_sim_time)
         ])
-        self.move = ActionClient(self.node, MoveGroup, "move_action")
-        self.execute = ActionClient(self.node, ExecuteTrajectory, "execute_trajectory")
+        # Every client shares one reentrant group, spun by a multi-threaded executor.
+        #
+        # rclpy's action client is not thread safe, and this class is called from a
+        # thread other than the one spinning it -- that is the whole point of it, since
+        # the grasp controller is a timer-driven state machine and cannot block. With a
+        # single-threaded executor and the default callback group, sending a goal from
+        # the caller's thread while the executor thread is servicing the same client is
+        # a race, and it does not fail politely: the node died mid-reach with no Python
+        # traceback at all, twice, and once took a segfault while printing one.
+        #
+        # A reentrant group on a multi-threaded executor is the documented arrangement
+        # for exactly this: it lets the goal, the feedback and the result be serviced
+        # concurrently instead of contending for one callback slot.
+        group = ReentrantCallbackGroup()
+        self._group = group
+        self.move = ActionClient(self.node, MoveGroup, "move_action",
+                                 callback_group=group)
+        self.execute = ActionClient(self.node, ExecuteTrajectory,
+                                    "execute_trajectory", callback_group=group)
         self.cartesian = self.node.create_client(
-            GetCartesianPath, "compute_cartesian_path")
+            GetCartesianPath, "compute_cartesian_path", callback_group=group)
         self.apply_scene = self.node.create_client(
-            ApplyPlanningScene, "apply_planning_scene")
+            ApplyPlanningScene, "apply_planning_scene", callback_group=group)
         self.validity = self.node.create_client(
-            GetStateValidity, "check_state_validity")
+            GetStateValidity, "check_state_validity", callback_group=group)
 
+        # One caller at a time, so two states can never have goals in flight together.
+        self._lock = threading.Lock()
         self.last_failure = ""
-        self._executor = SingleThreadedExecutor()
+        self._executor = MultiThreadedExecutor(num_threads=4)
         self._executor.add_node(self.node)
         self._thread = threading.Thread(target=self._executor.spin, daemon=True)
         self._thread.start()
@@ -384,6 +404,10 @@ class MoveItClient:
         return self._send_action(self.move, goal, timeout)
 
     def _send_action(self, client: ActionClient, goal, timeout: float) -> int:
+        with self._lock:
+            return self._send_action_locked(client, goal, timeout)
+
+    def _send_action_locked(self, client: ActionClient, goal, timeout: float) -> int:
         """Send a goal and wait for its result, saying which step failed if one does.
 
         Returning a bare FAILURE for every problem here made three different faults look
@@ -391,10 +415,17 @@ class MoveItClient:
         kind of silence this project has lost the most time to.
         """
         self.last_failure = ""
-        if not client.wait_for_server(timeout_sec=10.0):
+        if not client.wait_for_server(timeout_sec=20.0):
             self.last_failure = "action server never appeared"
             return MoveItErrorCodes.FAILURE
-        handle = self._wait(client.send_goal_async(goal), timeout=15.0)
+        # Accepting a goal is cheap, but move_group only gets to it when it is next
+        # scheduled, and it is competing with Gazebo, the controllers and perception on
+        # a machine already running the simulation below real time. Fifteen seconds was
+        # enough until the base holder was added and then a run failed with "no reply to
+        # the goal request" while the arm was visibly sitting at the pre-grasp it had
+        # just been asked for. This is a queueing delay, not a planning failure, so it
+        # deserves a timeout that reflects the load rather than the work.
+        handle = self._wait(client.send_goal_async(goal), timeout=45.0)
         if handle is None:
             self.last_failure = "no reply to the goal request"
             return MoveItErrorCodes.FAILURE

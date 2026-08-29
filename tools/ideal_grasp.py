@@ -65,17 +65,28 @@ def gz_pose_retry(model, attempts=4):
 
 
 def nearest_book(colour):
-    listing = subprocess.run(["gz", "model", "--list"], capture_output=True,
-                             text=True, timeout=25).stdout
-    # ``colour`` may be a full model name instead, so a specific row can be targeted.
-    names = [l.strip(" -") for l in listing.splitlines()
-             if "book_col" in l and (colour in l or colour == l.strip(" -"))]
+    # Ask more than once. Gazebo drops query requests when it is busy, and a single
+    # dropped listing here reports "no red book found" and throws away a run that was
+    # otherwise ready to go -- twice in one session.
+    names = []
+    for _ in range(8):
+        try:
+            listing = subprocess.run(["gz", "model", "--list"], capture_output=True,
+                                     text=True, timeout=25).stdout
+        except Exception:  # noqa: BLE001
+            listing = ""
+        # ``colour`` may be a full model name instead, so a specific row can be targeted.
+        names = [l.strip(" -") for l in listing.splitlines()
+                 if "book_col" in l and (colour in l or colour == l.strip(" -"))]
+        if names:
+            break
+        time.sleep(0.5)
     base, _ = gz_pose_retry("tiago_pro")
     if base is None:
         return None
     best = None
     for name in names:
-        p, r = gz_pose(name)
+        p, r = gz_pose_retry(name, attempts=4)
         if p is None:
             continue
         d = math.hypot(p[0] - base[0], p[1] - base[1])
@@ -85,6 +96,13 @@ def nearest_book(colour):
 
 
 TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
+# The right arm is never used and it still has to be out of the shelf. Left at the pose
+# it spawns in, gripper_right_base_link sits at x=+0.86 in base_link, which at a 0.68 m
+# standoff is 0.18 m inside the shelf: every pre-grasp posture then comes back in
+# collision -- arm_right_4/5/6/7 against shelf_board_2 -- and the grasp fails before it
+# has moved. Tucked, the same link sits at x=-0.52, behind the robot.
+RIGHT_TUCK = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
+TUCK_TORSO = 0.15
 
 
 def tuck_the_arms(node):
@@ -98,22 +116,42 @@ def tuck_the_arms(node):
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     from builtin_interfaces.msg import Duration
 
-    pub = node.create_publisher(
-        JointTrajectory, "/arm_left_controller/joint_trajectory", 10)
+    pubs = {
+        side: node.create_publisher(
+            JointTrajectory, "/arm_%s_controller/joint_trajectory" % side, 10)
+        for side in ("left", "right")
+    }
+    torso_pub = node.create_publisher(
+        JointTrajectory, "/torso_controller/joint_trajectory", 10)
     deadline = time.time() + 10
-    while pub.get_subscription_count() == 0 and time.time() < deadline:
+    while time.time() < deadline:
         rclpy.spin_once(node, timeout_sec=0.1)
+        if all(p.get_subscription_count() > 0 for p in pubs.values()):
+            break
 
-    traj = JointTrajectory()
-    traj.joint_names = ARM_JOINTS
-    point = JointTrajectoryPoint()
-    point.positions = [float(v) for v in TUCK_POSE]
-    point.time_from_start = Duration(sec=20, nanosec=0)
-    traj.points = [point]
-    pub.publish(traj)
-    print("tucking the arm before the grasp...", flush=True)
+    torso = JointTrajectory()
+    torso.joint_names = ["torso_lift_joint"]
+    lift = JointTrajectoryPoint()
+    lift.positions = [float(TUCK_TORSO)]
+    lift.time_from_start = Duration(sec=20, nanosec=0)
+    torso.points = [lift]
+    torso_pub.publish(torso)
 
-    end = time.time() + 28
+    for side, pub in pubs.items():
+        traj = JointTrajectory()
+        traj.joint_names = ["arm_%s_%d_joint" % (side, i) for i in range(1, 8)]
+        point = JointTrajectoryPoint()
+        point.positions = [float(v) for v in
+                           (RIGHT_TUCK if side == "right" else TUCK_POSE)]
+        point.time_from_start = Duration(sec=20, nanosec=0)
+        traj.points = [point]
+        pub.publish(traj)
+    print("tucking both arms before the grasp...", flush=True)
+
+    # The simulation runs below real time, so a 20 s trajectory needs more than 20 s of
+    # wall clock to finish. At the measured 0.7 real time factor this is about 32 s of
+    # simulated time, which is enough with room to spare.
+    end = time.time() + 46
     while time.time() < end:
         rclpy.spin_once(node, timeout_sec=0.1)
 
@@ -136,6 +174,7 @@ def run_grasp(depth=None):
 def main():
     colour = sys.argv[1] if len(sys.argv) > 1 else "red"
     depth = float(sys.argv[2]) if len(sys.argv) > 2 else None
+    run_seconds = float(sys.argv[3]) if len(sys.argv) > 3 else 600.0
     chain = ArmChain.from_urdf()
     print("grasp depth: %s" % ("default" if depth is None else "%.3f m" % depth))
 
@@ -181,12 +220,19 @@ def main():
     time.sleep(4)
 
     refreshed = [0.0]
+    last_fk = [None]
     print("%-11s %6s  %-40s  %8s %8s %8s  %6s" %
           ("state", "torso", "arm 1..7", "fk x", "fk y", "fk z", "finger"))
     seen = set()
     start = time.time()
     try:
-        while time.time() - start < 170:
+        # A whole grasp is scene, posture search, raise, pre-grasp, open, advance,
+        # clamp, lift, withdraw and stow, each of them a planned and executed
+        # trajectory, on a simulation running below real time. Measured, it reaches
+        # "advancing" around 130 s in. At 170 s this fixture was killing the controller
+        # part way into the shelf and then reporting that the book had not moved, which
+        # is true and says nothing about the grasp.
+        while time.time() - start < run_seconds:
             # Recompute from live ground truth, the way perception would.
             #
             # Taking one snapshot at startup and publishing it forever is not what the
@@ -195,7 +241,7 @@ def main():
             # arm is out -- so a target fixed in base_link at startup is 85 mm from the
             # book by the time the gripper gets there. That is the fixture being wrong,
             # not the grasp, and it was being read as the grasp being wrong.
-            if time.time() - refreshed[0] > 2.0:
+            if time.time() - refreshed[0] > 4.0:
                 refreshed[0] = time.time()
                 live, live_rpy = gz_pose_retry(name, attempts=1)
                 base, base_rpy = gz_pose_retry("tiago_pro", attempts=1)
@@ -222,6 +268,7 @@ def main():
                     actual = [js.position[index[n]] for n in CHAIN_JOINTS]
                     finger = js.position[index[FINGER]] if FINGER in index else float("nan")
                     fk = chain.fk(actual)[:3, 3]
+                    last_fk[0] = fk
                     now = state["grasp"]
                     stamp = "%.0f" % (time.time() - start)
                     key = (now, stamp)
@@ -242,22 +289,50 @@ def main():
         rclpy.shutdown()
 
     time.sleep(2)
-    after, after_rpy = gz_pose(name)
-    moved = math.dist(truth[:3], after[:3]) if after else float("nan")
+    after, after_rpy = gz_pose_retry(name)
+    if after is None or after_rpy is None:
+        print()
+        print("=== judged against Gazebo ===")
+        print("could not read %s back; no verdict" % name)
+        return
+    moved = math.dist(truth[:3], after[:3])
     tipped = max(abs(a - b) for a, b in zip(truth_rpy[:2], after_rpy[:2]))
     print()
     print("=== judged against Gazebo ===")
     print("%s moved %.3f m, tipped %.2f rad" % (name, moved, tipped))
-    # Displacement is not a pick. A book swept onto its side travelled 0.14 m with
-    # the fingers fully closed on air, and in the competition that is a penalty.
-    if moved <= 0.02:
+    # Displacement is not a pick, and neither is displacement plus staying upright.
+    #
+    # This fixture has now called two different failures a success. A book swept onto
+    # its side travelled 0.14 m with the fingers closed on air. Then a book shoved
+    # 0.085 m deeper into the shelf, still sitting at shelf height with the gripper
+    # fully closed and empty, was reported as PICKED UP because it had moved far enough
+    # and had not tipped far enough. Both were penalties in the competition and both
+    # read as wins here.
+    #
+    # A pick means the robot ended up holding the book. The only honest test of that is
+    # where the book finished relative to the hand, so that is what decides it.
+    # Where the gripper finished, in the world. ROS is shut down by now, so this uses
+    # the last pose the monitor computed rather than asking TF again.
+    held = None
+    robot, robot_rpy = gz_pose_retry("tiago_pro")
+    if last_fk[0] is not None and robot is not None:
+        yaw = robot_rpy[2]
+        gx, gy, gz_ = last_fk[0]
+        hand = (robot[0] + gx * math.cos(yaw) - gy * math.sin(yaw),
+                robot[1] + gx * math.sin(yaw) + gy * math.cos(yaw),
+                gz_ + BASE_Z)
+        held = math.dist(hand, after[:3])
+        print("book finished %.3f m from the gripper, and %+.3f m in height"
+              % (held, after[2] - truth[2]))
+
+    if held is not None and held < 0.12:
+        print("RESULT: PICKED UP — the book finished in the hand")
+    elif moved <= 0.02:
         print("RESULT: NOT MOVED")
     elif tipped > 0.35:
         print("RESULT: KNOCKED OVER — swept, not grasped")
-    elif moved < 0.05:
-        print("RESULT: NUDGED — touched but not taken")
     else:
-        print("RESULT: PICKED UP")
+        print("RESULT: DISTURBED — moved %.3f m but left behind, not carried" % moved)
 
 
 if __name__ == "__main__":
