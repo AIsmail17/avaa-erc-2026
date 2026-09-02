@@ -47,7 +47,7 @@ from typing import List, Optional
 import numpy as np
 import rclpy
 from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import Pose, PointStamped, Quaternion
+from geometry_msgs.msg import Pose, PointStamped, Quaternion, Twist
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -65,6 +65,7 @@ GRIPPER_TOPIC = "/gripper_left_controller_raw/joint_trajectory"
 # The last few centimetres are servoed, not planned, so they are published straight
 # to the controller. See _do_servo for why planning cannot close this gap.
 ARM_TOPIC = "/arm_left_controller/joint_trajectory"
+TOPIC_CMD = "/cmd_vel"
 
 ARM_JOINTS = [f"arm_left_{i}_joint" for i in range(1, 8)]
 CHAIN_JOINTS = ["torso_lift_joint"] + ARM_JOINTS
@@ -329,6 +330,35 @@ class GraspNode(Node):
         # A servo tick costs one analytic IK solve and one publish, so it closes at
         # 5 Hz. At that rate the base moves 0.6 mm between corrections, which is well
         # inside the 14 mm of clearance either side of the book.
+        # Hold the base with a zero twist for as long as the grasp lasts.
+        #
+        # Nothing was commanding the base during a grasp at all. The approach controller
+        # stops publishing when it finishes, and from that moment until the book is out
+        # of the shelf there is no publisher on /cmd_vel whatsoever -- which is not the
+        # same as commanding the robot to stay put, and the difference is most of the
+        # error this controller has been fighting.
+        #
+        # Measured against Gazebo on a fresh simulation, per SIMULATED second, in four
+        # windows of thirty seconds:
+        #
+        #     arm still,    nothing commanded   6.8 mm/s   0.81 deg/s
+        #     arm still,    zero twist at 20 Hz 3.1 mm/s   0.42 deg/s
+        #     arm swinging, nothing commanded   9.8 mm/s   0.88 deg/s
+        #     arm swinging, zero twist at 20 Hz 2.1 mm/s   0.43 deg/s
+        #
+        # and on a base still carrying the momentum of a fresh spawn, 58 mm/s
+        # uncommanded against 1.8 mm/s held. It does not stop the drift -- the wheels
+        # have no friction across the roller axis and never will -- but a factor of
+        # three to thirty is the difference between a reach that lands on the book and
+        # one that lands beside it.
+        #
+        # An earlier version of this measurement said a zero twist changed nothing. It
+        # was taken per second of WALL clock on an instance whose real-time factor had
+        # collapsed to 0.013, where almost no simulated time passes in a window and
+        # every condition looks identical. Per simulated second, on a healthy instance,
+        # it is one of the largest effects in the project.
+        self.declare_parameter("hold_base", True)
+        self.declare_parameter("hold_base_hz", 20.0)
         self.declare_parameter("servo_step_m", 0.012)
         # Above one, for the same reason _nudge is above one: every arm joint carries
         # about 2 Nm of Coulomb friction, so a command equal to the standing error dies
@@ -384,6 +414,8 @@ class GraspNode(Node):
         self.settle = float(self.get_parameter("settle_sec").value)
         self.settled_at = None
 
+        self.hold_base = bool(self.get_parameter("hold_base").value)
+        self.hold_base_hz = float(self.get_parameter("hold_base_hz").value)
         self.servo_step = float(self.get_parameter("servo_step_m").value)
         self.servo_gain = float(self.get_parameter("servo_gain").value)
         self.servo_command = float(self.get_parameter("servo_command_sec").value)
@@ -446,6 +478,7 @@ class GraspNode(Node):
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
         self.pub_gripper = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
         self.pub_arm = self.create_publisher(JointTrajectory, ARM_TOPIC, 10)
+        self.pub_cmd = self.create_publisher(Twist, TOPIC_CMD, 10)
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
 
         self.moveit = MoveItClient("avaa_grasp_moveit")
@@ -459,6 +492,8 @@ class GraspNode(Node):
             self.get_logger().info("move_group connected")
 
         self.create_timer(0.2, self._tick)
+        if self.hold_base:
+            self.create_timer(1.0 / max(self.hold_base_hz, 1.0), self._hold_base)
         self.get_logger().info(
             "grasp ready — rows top-down, heights %s" % self.row_heights)
 
@@ -1133,6 +1168,17 @@ class GraspNode(Node):
         return placed == len(self.row_heights) + 1
 
     # ------------------------------------------------------------------ states
+
+    def _hold_base(self) -> None:
+        """Ask the wheels to stand still, which is not what silence asks them.
+
+        Only once the grasp is under way. While this node is IDLE the approach
+        controller still owns the base, and two publishers on /cmd_vel disagreeing at
+        20 Hz would be worse than either alone.
+        """
+        if self.state is State.IDLE:
+            return
+        self.pub_cmd.publish(Twist())
 
     def _tick(self) -> None:
         self.pub_state.publish(String(data=self.state.value))
