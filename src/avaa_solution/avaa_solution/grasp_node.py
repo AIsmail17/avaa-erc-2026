@@ -6,6 +6,7 @@ Runs once the approach controller has the base in front of the target column.
     PREGRASP  plan to a posture in front of the book, collision free
     OPEN      gripper wide
     ADVANCE   straight line in, along the shelf normal
+    SERVO     close the last centimetres in a 5 Hz loop, faster than the drift
     CLAMP     close on the spine
     LIFT      small rise to take the weight off the shelf
     WITHDRAW  straight back out, book held
@@ -60,6 +61,9 @@ TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
 TOPIC_STATE = "/avaa/grasp/state"
 GRIPPER_TOPIC = "/gripper_left_controller_raw/joint_trajectory"
+# The last few centimetres are servoed, not planned, so they are published straight
+# to the controller. See _do_servo for why planning cannot close this gap.
+ARM_TOPIC = "/arm_left_controller/joint_trajectory"
 
 ARM_JOINTS = [f"arm_left_{i}_joint" for i in range(1, 8)]
 CHAIN_JOINTS = ["torso_lift_joint"] + ARM_JOINTS
@@ -185,6 +189,7 @@ class State(Enum):
     PREGRASP = "pregrasp"
     OPEN = "opening"
     ADVANCE = "advancing"
+    SERVO = "servoing"
     CLAMP = "clamping"
     LIFT = "lifting"
     WITHDRAW = "withdrawing"
@@ -265,10 +270,6 @@ class GraspNode(Node):
         # from 0.35 N to about 0.55 N, and the pads are 34 mm tall so it stays clear of
         # the shelf board the book stands on.
         self.declare_parameter("grasp_below_centre_m", 0.045)
-        # How still the book has to look, and for how long, before the jaws close.
-        self.declare_parameter("quiet_spread_m", 0.004)
-        self.declare_parameter("quiet_for_sec", 2.5)
-        self.declare_parameter("quiet_timeout_sec", 25.0)
         # How many postures that reach are compared before choosing one.
         self.declare_parameter("posture_choices", 4)
         # The pre-grasp is a staging point 0.15 m in front of the book, not the
@@ -311,6 +312,48 @@ class GraspNode(Node):
         # fails and the reach is retried -- while waiting is not.
         self.declare_parameter("settle_sec", 1.8)
 
+        # ------------------------------------------------------------- servo
+        # The last few centimetres are closed by a servo loop rather than by a plan.
+        #
+        # Everything above this point corrects the aim by planning a fresh reach,
+        # executing it and checking where it landed. That cycle costs six to ten
+        # seconds -- planning, a trajectory run at a speed the controller can follow,
+        # and a settle for the arm to catch up -- and the base slides about 3 mm/s the
+        # whole time. So each correction is computed against a target that has moved
+        # twenty to thirty millimetres by the time the correction lands, which is the
+        # same order as the error being corrected. It is not a loop that converges
+        # slowly; it is a loop that cannot converge, and the measured 38 mm of standing
+        # lateral error is what that looks like.
+        #
+        # A servo tick costs one analytic IK solve and one publish, so it closes at
+        # 5 Hz. At that rate the base moves 0.6 mm between corrections, which is well
+        # inside the 14 mm of clearance either side of the book.
+        self.declare_parameter("servo_step_m", 0.012)
+        # Above one, for the same reason _nudge is above one: every arm joint carries
+        # about 2 Nm of Coulomb friction, so a command equal to the standing error dies
+        # before it arrives. Asking for the error twice over puts the stall point on
+        # the target instead of short of it.
+        self.declare_parameter("servo_gain", 1.6)
+        # Longer than the tick, so the controller is always interpolating towards a
+        # point rather than sitting at one it has reached. Each publish replaces the
+        # last, which for a servo is the behaviour wanted and for a plan is a bug.
+        self.declare_parameter("servo_command_sec", 0.35)
+        # A solve that jumps further than this in any joint is an elbow flip, not a
+        # correction. Rejected, and retried with a shorter Cartesian step.
+        self.declare_parameter("servo_max_joint_step", 0.25)
+        # Consecutive in-tolerance ticks before clamping. Three at 5 Hz is 0.6 s, long
+        # enough that a single good frame cannot trigger a grasp on its own.
+        self.declare_parameter("servo_hold_ticks", 3)
+        self.declare_parameter("servo_timeout_sec", 40.0)
+        # Keep tracking the book while the jaws close. The gripper is force limited and
+        # takes three to seven seconds to shut, and the base does not stop sliding for
+        # it -- this is what the old wait-for-quiet gate was trying to buy, except the
+        # drift never decays, so waiting only spent the clearance instead of using it.
+        # Tracking stops once the jaws are near the book, because after that moving the
+        # arm drags the book rather than centring on it.
+        self.declare_parameter("servo_track_while_closing", True)
+        self.declare_parameter("servo_release_span_m", 0.040)
+
         self.row_heights = list(
             self.get_parameter("row_heights").get_parameter_value().double_array_value
         ) or DEFAULT_ROW_HEIGHTS
@@ -327,10 +370,6 @@ class GraspNode(Node):
         self.final_approach = float(self.get_parameter("final_approach_m").value)
         self.below_centre = float(
             self.get_parameter("grasp_below_centre_m").value)
-        self.quiet_spread = float(self.get_parameter("quiet_spread_m").value)
-        self.quiet_for = float(self.get_parameter("quiet_for_sec").value)
-        self.quiet_timeout = float(self.get_parameter("quiet_timeout_sec").value)
-        self.quiet_waited = None
         self.posture_choices = int(
             self.get_parameter("posture_choices").value)
         self.pregrasp_tol = float(self.get_parameter("pregrasp_tol_m").value)
@@ -343,6 +382,20 @@ class GraspNode(Node):
         self.leg_target = None
         self.settle = float(self.get_parameter("settle_sec").value)
         self.settled_at = None
+
+        self.servo_step = float(self.get_parameter("servo_step_m").value)
+        self.servo_gain = float(self.get_parameter("servo_gain").value)
+        self.servo_command = float(self.get_parameter("servo_command_sec").value)
+        self.servo_max_joint = float(self.get_parameter("servo_max_joint_step").value)
+        self.servo_hold_ticks = int(self.get_parameter("servo_hold_ticks").value)
+        self.servo_timeout = float(self.get_parameter("servo_timeout_sec").value)
+        self.servo_track = bool(self.get_parameter("servo_track_while_closing").value)
+        self.servo_release_span = float(
+            self.get_parameter("servo_release_span_m").value)
+        self.servo_since = None
+        self.servo_good = 0
+        self.servo_best = None
+        self.servo_rejected = 0
 
         self.chain = ArmChain.from_urdf()
         self.state = State.IDLE
@@ -374,7 +427,6 @@ class GraspNode(Node):
         # stops being worth trusting. The arm occludes the book on the way in, so this
         # is expected to go stale during the reach itself.
         self.book_at = None
-        self.settled_since = None
         self.gripper_held_at = None
         self.reopens = 0
         self.reopen_at = None
@@ -392,6 +444,7 @@ class GraspNode(Node):
         self.create_subscription(PointStamped, TOPIC_BOOK_POINT, self._on_book, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
         self.pub_gripper = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
+        self.pub_arm = self.create_publisher(JointTrajectory, ARM_TOPIC, 10)
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
 
         self.moveit = MoveItClient("avaa_grasp_moveit")
@@ -1081,6 +1134,7 @@ class GraspNode(Node):
             State.PREGRASP: self._do_pregrasp,
             State.OPEN: self._do_open,
             State.ADVANCE: self._do_advance,
+            State.SERVO: self._do_servo,
             State.CLAMP: self._do_clamp,
             State.LIFT: self._do_lift,
             State.WITHDRAW: self._do_withdraw,
@@ -1320,134 +1374,189 @@ class GraspNode(Node):
             self._start("reach", lambda: self.moveit.execute_path(CHAIN_JOINTS, final))
             return
 
-        # Wait for the base to go quiet before closing.
+        # Hand the last few centimetres to the servo.
         #
-        # The base is not disturbed by the world, it is disturbed by this arm. Measured
-        # with nothing commanding the base: tucked and idle it drifts about 0.05 deg/s,
-        # and after two swings of the arm out to a reach posture and back it is turning
-        # at 1.22 deg/s and takes tens of seconds to calm down. The gripper is force
-        # limited and takes three to seven seconds to close, so closing while the base is
-        # still ringing sweeps the jaws tens of millimetres sideways -- 1.22 deg/s for
-        # 3.5 s is 51 mm at arm's length, past a book that is 30 mm thick.
+        # The planned reach has done what a plan can do: it has brought the jaws to
+        # within a few centimetres of the book along a line that was checked for
+        # collisions. What it cannot do is finish, because by the time a plan of that
+        # length has executed the base has carried the book somewhere else.
         #
-        # There is no need to measure the base to know this. Perception watches the book
-        # through a camera bolted to the base, so a base that is moving is a book that
-        # appears to move. When the sightings stop changing, the base has settled.
-        spread = None
-        if len(self.book_points) >= 6:
-            recent = np.array(list(self.book_points)[-6:], dtype=float)
-            spread = float(np.max(recent, axis=0)[1] - np.min(recent, axis=0)[1])
-        now = self._now()
-        if spread is not None and spread <= self.quiet_spread:
-            if self.settled_since is None:
-                self.settled_since = now
-        else:
-            self.settled_since = None
-        if self.settled_since is None or now - self.settled_since < self.quiet_for:
-            if self.quiet_waited is None:
-                self.quiet_waited = now
-            if now - self.quiet_waited < self.quiet_timeout:
-                self._hold_gripper(GRIPPER_OPEN)
-                return
-            self.get_logger().warn(
-                "the base has not gone quiet in %.0f s (book still wandering %s); "
-                "closing anyway"
-                % (self.quiet_timeout,
-                   "unknown" if spread is None else "%.0f mm" % (spread * 1000)))
-        else:
-            self.get_logger().info(
-                "the base is quiet -- the book has held to %.0f mm for %.0f s; closing"
-                % (spread * 1000, now - self.settled_since))
-        self.quiet_waited = None
+        # This is also where the old wait-for-the-base-to-go-quiet gate used to be. It
+        # was removed rather than tuned: it waited for a drift that was measured not to
+        # decay -- 0.35 to 0.68 deg/s in every window of a controlled A/B, arm idle or
+        # swinging, wheels slippery or not -- so it always ran to its timeout and spent
+        # twenty-five seconds of clearance buying nothing. Tracking the book beats
+        # waiting for it to stop.
+        self.servo_since = self._now()
+        self.servo_good = 0
+        self.servo_best = None
+        self.servo_rejected = 0
+        self._enter(State.SERVO)
 
-        # Re-aim before judging arrival, not only before setting off.
-        #
-        # The reach takes the better part of a minute and the base does not stay still
-        # for it. It cannot: the wheels have no friction across the roller axis, so the
-        # moment of the extending arm slides the whole robot. Measured against ground
-        # truth through one reach, the jaws finished 110 mm short of the book and 244 mm
-        # to the side of it, while this controller reported arriving 2 mm from its
-        # target -- and both were true, because the target is held in base_link and
-        # base_link had moved.
-        #
-        # Re-aiming here turns that into an ordinary miss, which the retry below already
-        # knows how to correct.
-        aimed_at = np.array(self.grasp_target, dtype=float)
+    # ------------------------------------------------------------------ servo
+
+    def _do_servo(self) -> None:
+        """Close on the book with a loop fast enough to outrun the base.
+
+        Runs on the ordinary 5 Hz tick. One analytic IK solve and one publish, no
+        planning, no action goal, no settle: the arm is given a fresh short trajectory
+        every 200 ms and never finishes any of them, which is exactly what a position
+        servo is. Collision checking is left out here deliberately -- the line into the
+        shelf was checked when it was planned, the corrections are at most 12 mm inside
+        the volume the gripper already occupies, and a service round trip per tick would
+        put the loop back at the speed that failed.
+        """
+        self._hold_gripper(GRIPPER_OPEN)
         self._refresh_targets()
-        shifted = float(np.linalg.norm(np.asarray(self.grasp_target) - aimed_at))
-        if shifted > 0.005:
-            self.get_logger().warn(
-                "the book has moved %.0f mm in base_link since the reach was planned; "
-                "judging arrival against where it is now" % (shifted * 1000))
+        target = np.asarray(self.grasp_target, dtype=float)
 
-        if self._arrived(self.grasp_target) is False:
-            self.reaches += 1
-            if self.reaches < self.reach_attempts:
-                self.get_logger().warn(
-                    "reach finished %s; going again (%d of %d)"
-                    % (self._miss(self.grasp_target), self.reaches,
-                       self.reach_attempts))
-                # Push into the standing error rather than replay the same path. The
-                # path was followed; the joints just stopped short of its last point.
-                # Only when the target has held still, though: if it has moved, that
-                # waypoint is aimed at where the book used to be and pushing harder
-                # towards it makes the miss worse rather than better.
-                if (shifted <= 0.005 and self.reach_path
-                        and self._nudge(self.reach_path[-1])):
-                    return
-                again = self._straight_path(
-                    self._current_joints(), self._gripper_now(), self.grasp_target)
-                if again is None:
-                    self._enter(State.FAILED)
-                    return
-                self._start("reach", lambda: self.moveit.execute_path(
-                    CHAIN_JOINTS, again))
+        here = self._gripper_now()
+        if here is None:
+            return
+        error = target - here
+        reach = float(np.linalg.norm(error))
+        if self.servo_best is None or reach < self.servo_best:
+            self.servo_best = reach
+
+        if self._arrived(target):
+            self.servo_good += 1
+        else:
+            self.servo_good = 0
+
+        if self.servo_good >= self.servo_hold_ticks:
+            if not self._jaws_ready():
                 return
+            self.get_logger().info(
+                "servo is on the book (%s) after %.1f s; clamping"
+                % (self._miss(target), self._now() - self.servo_since))
+            self._send_gripper(GRIPPER_CLAMP)
+            self.clamp_at = self.get_clock().now()
+            self._enter(State.CLAMP)
+            return
+
+        if self._now() - self.servo_since > self.servo_timeout:
             self.get_logger().error(
-                "still %s after %d reaches; not closing on empty air"
-                % (self._miss(self.grasp_target), self.reaches))
+                "the servo could not hold the book: %s after %.0f s, closest it came "
+                "was %.0f mm (%d solves rejected). Not clamping on air."
+                % (self._miss(target), self.servo_timeout,
+                   (self.servo_best or 0.0) * 1000, self.servo_rejected))
             self._enter(State.FAILED)
             return
 
-        # Arriving is not the same as arriving ready. Check the jaws are still open
-        # wide enough to take the book before closing them, because clamping a gripper
-        # that is already nearly shut cannot fail loudly -- it simply reports a
-        # successful grasp of nothing, which is exactly what happened.
-        finger = self.joints.get("gripper_left_finger_joint")
-        if finger is not None and finger < GRIPPER_OPEN_MIN:
-            # Wait here rather than going back to the OPEN state. OPEN rebuilds the
-            # reach from the pre-grasp posture, and the arm is now deep inside the
-            # shelf, so that plan would start from a state the arm is nowhere near.
-            if self.reopen_at is None:
-                self.reopen_at = self._now()
-                self.reopens += 1
-                self.get_logger().warn(
-                    "the jaws are only %.0f mm apart at the book; re-opening in place "
-                    "(attempt %d of 3)"
-                    % (27.1 + (finger + 0.001) * 814.6, self.reopens))
-                self.gripper_held_at = None
-                self._send_gripper(GRIPPER_OPEN)
-                return
-            if self._now() - self.reopen_at < self.gripper_time + 1.0:
-                return
-            self.reopen_at = None
-            if self.reopens >= 3:
-                self.get_logger().error(
-                    "the jaws will not stay open; refusing to clamp on air")
-                self._enter(State.FAILED)
-            return
-        self.reopen_at = None
+        self._servo_step(target, here, error)
 
-        self.get_logger().info(
-            "gripper is at the book (%s), jaws %.0f mm apart; clamping"
-            % (self._miss(self.grasp_target),
-               27.1 + ((finger if finger is not None else GRIPPER_OPEN) + 0.001) * 814.6))
-        self._send_gripper(GRIPPER_CLAMP)
-        self.clamp_at = self.get_clock().now()
-        self._enter(State.CLAMP)
+    def _servo_step(self, target, here, error) -> bool:
+        """Command one correction towards ``target``. True if something was sent."""
+        joints = self._current_joints()
+        if joints is None:
+            return False
+        distance = float(np.linalg.norm(error))
+        if distance < 1e-6:
+            return False
+
+        # Shorten the step until the solve is a neighbour of where the arm is. A long
+        # step can be satisfied by a completely different posture with the same
+        # fingertip position -- this arm has seven joints for three constraints -- and
+        # executing that as a 0.35 s trajectory would swing the elbow through the shelf.
+        solution = None
+        for scale in (1.0, 0.5, 0.25):
+            step = min(self.servo_step * scale, distance)
+            goal = here + error * (step / distance)
+            candidate = self.chain.ik(
+                goal, seed=joints, approach=GRASP_APPROACH, closing=GRASP_CLOSING,
+                pin={"torso_lift_joint": (joints[0], 0.004)})
+            if candidate is None:
+                continue
+            if max(abs(a - b) for a, b in zip(candidate, joints)) <= self.servo_max_joint:
+                solution = candidate
+                break
+
+        if solution is None:
+            self.servo_rejected += 1
+            if self.servo_rejected % 10 == 1:
+                self.get_logger().warn(
+                    "no neighbouring solve for a %.0f mm correction; holding"
+                    % (min(self.servo_step, distance) * 1000))
+            return False
+
+        # Ask for the standing error again on top of the solve, so the command outlives
+        # the joint friction that would otherwise stall it short.
+        command = []
+        for value, actual, (lo, hi) in zip(solution, joints, self.chain.limits):
+            pushed = value + self.servo_gain * (value - actual)
+            pushed = min(max(pushed, value - self.servo_max_joint),
+                         value + self.servo_max_joint)
+            command.append(float(np.clip(pushed, lo, hi)))
+
+        traj = JointTrajectory()
+        traj.joint_names = list(ARM_JOINTS)
+        point = JointTrajectoryPoint()
+        point.positions = [float(v) for v in command[1:]]
+        point.time_from_start = Duration(
+            sec=int(self.servo_command),
+            nanosec=int((self.servo_command % 1.0) * 1e9))
+        traj.points = [point]
+        self.pub_arm.publish(traj)
+        return True
+
+    def _jaws_ready(self) -> bool:
+        """Whether the jaws are open wide enough to take the book.
+
+        Clamping a gripper that is already nearly shut cannot fail loudly -- it reports
+        a successful grasp of nothing, which is exactly what happened. The jaws are
+        back-driven by the arm's own motion on the way in, so this is checked at the
+        book rather than assumed from the command sent at the pre-grasp.
+        """
+        finger = self.joints.get("gripper_left_finger_joint")
+        if finger is None or finger >= GRIPPER_OPEN_MIN:
+            self.reopen_at = None
+            return True
+        # Wait here rather than going back to the OPEN state. OPEN rebuilds the reach
+        # from the pre-grasp posture, and the arm is now deep inside the shelf, so that
+        # plan would start from a state the arm is nowhere near.
+        if self.reopen_at is None:
+            self.reopen_at = self._now()
+            self.reopens += 1
+            self.get_logger().warn(
+                "the jaws are only %.0f mm apart at the book; re-opening in place "
+                "(attempt %d of 3)" % (27.1 + (finger + 0.001) * 814.6, self.reopens))
+            self.gripper_held_at = None
+            self._send_gripper(GRIPPER_OPEN)
+            return False
+        if self._now() - self.reopen_at < self.gripper_time + 1.0:
+            return False
+        self.reopen_at = None
+        if self.reopens >= 3:
+            self.get_logger().error(
+                "the jaws will not stay open; refusing to clamp on air")
+            self._enter(State.FAILED)
+        return False
 
     def _do_clamp(self) -> None:
         waited = (self.get_clock().now() - self.clamp_at).nanoseconds / 1e9
+
+        # Keep servoing while the jaws travel.
+        #
+        # The gripper is force limited and takes three to seven seconds to close, and
+        # the base slides for every one of them -- 3 mm/s at the base is about 5 mm/s at
+        # the fingertips, so a slow close costs most of the 14 mm of clearance either
+        # side of the book. Holding the arm still through the close was what the old
+        # wait-for-quiet gate assumed was safe; it is not, because the drift does not
+        # stop. Tracking the book instead spends the close staying centred on it.
+        #
+        # This stops before contact. Once the pads are near the book, an arm still
+        # correcting sideways pushes the book over rather than centring on it, and a
+        # book on a shelf tips at about a third of a newton.
+        if self.servo_track:
+            finger = self.joints.get("gripper_left_finger_joint")
+            span = None if finger is None else 0.0271 + (finger + 0.001) * 0.8146
+            if span is not None and span > self.servo_release_span:
+                self._refresh_targets()
+                target = np.asarray(self.grasp_target, dtype=float)
+                here = self._gripper_now()
+                if here is not None:
+                    self._servo_step(target, here, target - here)
+
         if waited < self.gripper_time + 1.0:
             return
         lifted = self.grasp_target + np.array([0.0, 0.0, self.lift])
