@@ -44,6 +44,7 @@ from geometry_msgs.msg import PointStamped, Twist
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from builtin_interfaces.msg import Duration
 from std_msgs.msg import Float32, Int32, String
@@ -174,8 +175,17 @@ class ApproachNode(Node):
         self.declare_parameter("standoff_m", 0.75)
         self.declare_parameter("centre_tolerance_px", 12.0)
         self.declare_parameter("standoff_tolerance_m", 0.05)
-        self.declare_parameter("square_tolerance_rad", 0.05)
+        # 0.05 rad is 2.9 degrees, and the shelf angle reads to about that, so the
+        # squaring hunted along its own tolerance boundary and never declared itself
+        # done. Widened to 5 degrees: the reach is re-aimed from perception at the shelf
+        # anyway, and the grasp closes its last centimetres on a servo, so arriving two
+        # degrees less square costs less than not arriving.
+        self.declare_parameter("square_tolerance_rad", 0.09)
         self.declare_parameter("max_yaw_rate", 0.45)
+        # How hard to push back against the base's own rotation. At 0 the
+        # turn controllers are pure proportional and they ring; the base
+        # carries its rate because nothing damps it.
+        self.declare_parameter("turn_damping", 0.55)
         self.declare_parameter("max_forward", 0.22)
         self.declare_parameter("max_lateral", 0.10)
         # Refuse to drive closer than this whatever the standoff says, so a bad reading
@@ -184,6 +194,12 @@ class ApproachNode(Node):
         # roughly 0.19 m of margin.
         self.declare_parameter("min_safe_range_m", 0.55)
         self.declare_parameter("state_timeout_sec", 45.0)
+        # The acquire checkpoint gets its own, longer budget. It is the one
+        # state that deliberately holds still and waits -- for the row to be
+        # read, and for a metric fix on the book -- and it also drives an
+        # arc of up to half a metre at creep speed. 45 s cut it off with
+        # 190 mm to go on a run that was converging steadily.
+        self.declare_parameter("acquire_timeout_sec", 120.0)
         self.declare_parameter("search_rate", 0.35)
         self.declare_parameter("row_heights", DEFAULT_ROW_HEIGHTS)
         # Where to pause and confirm the book before committing to the final drive.
@@ -195,6 +211,12 @@ class ApproachNode(Node):
         # column with nothing recognisable in view.
         self.declare_parameter("acquire_range_m", 1.50)
         self.declare_parameter("acquire_tolerance_px", 25.0)
+        # How close to the standing pose counts as arrived, in metres.
+        self.declare_parameter("acquire_pose_tolerance_m", 0.06)
+        self.declare_parameter("acquire_pose_gain", 0.5)
+        # A floor under the speed, because a base with 2 Nm of stiction in
+        # its drive does not move at all for a few millimetres a second.
+        self.declare_parameter("acquire_creep_speed", 0.07)
         # Searching gets its own budget: a full turn at 0.35 rad/s is about 18 s of
         # simulation time, which at a real-time factor near 0.5 is well over half a minute
         # of wall clock. The ordinary state timeout would abort mid-sweep.
@@ -207,10 +229,13 @@ class ApproachNode(Node):
         self.standoff_tol = float(self.get_parameter("standoff_tolerance_m").value)
         self.square_tol = float(self.get_parameter("square_tolerance_rad").value)
         self.max_yaw = float(self.get_parameter("max_yaw_rate").value)
+        self.turn_damping = float(self.get_parameter("turn_damping").value)
         self.max_fwd = float(self.get_parameter("max_forward").value)
         self.max_lateral = float(self.get_parameter("max_lateral").value)
         self.min_safe = float(self.get_parameter("min_safe_range_m").value)
         self.timeout = float(self.get_parameter("state_timeout_sec").value)
+        self.acquire_timeout = float(
+            self.get_parameter("acquire_timeout_sec").value)
         self.search_rate = float(self.get_parameter("search_rate").value)
         self.search_timeout = float(self.get_parameter("search_timeout_sec").value)
         self.image_width = int(self.get_parameter("image_width_px").value)
@@ -219,6 +244,7 @@ class ApproachNode(Node):
         self.column_cx: Optional[float] = None
         self.column_cx_at: Optional[float] = None
         self.scan: Optional[LaserScan] = None
+        self.yaw_rate = 0.0
         self.state = State.WAITING
         self.state_since = self._now()
 
@@ -239,6 +265,11 @@ class ApproachNode(Node):
         self.head_tilt: Optional[float] = None
         self.acquire_range = float(self.get_parameter("acquire_range_m").value)
         self.acquire_tol = float(self.get_parameter("acquire_tolerance_px").value)
+        self.acquire_pose_tol = float(
+            self.get_parameter("acquire_pose_tolerance_m").value)
+        self.pose_gain = float(self.get_parameter("acquire_pose_gain").value)
+        self.creep_speed = float(
+            self.get_parameter("acquire_creep_speed").value)
         # Set once the book has actually been located in 3D, which is the signal that it
         # is genuinely visible rather than merely expected to be.
         self.book_point_at: Optional[float] = None
@@ -292,6 +323,12 @@ class ApproachNode(Node):
         self.create_subscription(Int32, TOPIC_TARGET_ROW, self._on_row, 10)
         self.create_subscription(Float32, TOPIC_TARGET_COLUMN_X, self._on_column_x, 10)
         self.create_subscription(LaserScan, TOPIC_SCAN, self._on_scan, SENSOR_QOS)
+        # Odometry is used for ONE thing: the yaw rate, to damp the turns.
+        # It is not trusted for position -- the base slides across its wheels
+        # without turning them, and during one run held to 17 mm of true error
+        # odom had accumulated 813 mm of travel that never happened. A turn is
+        # different: turning does rotate the wheels, so the rate is real.
+        self.create_subscription(Odometry, "/odom", self._on_odom, 10)
         self.pub_cmd = self.create_publisher(Twist, TOPIC_CMD, 10)
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
         self.pub_arm_left = self.create_publisher(JointTrajectory, TOPIC_ARM_LEFT, 10)
@@ -324,6 +361,29 @@ class ApproachNode(Node):
         if (self._now() - self.column_cx_at) > max_age:
             return None
         return self.column_cx
+
+    def _on_odom(self, msg: Odometry) -> None:
+        self.yaw_rate = float(msg.twist.twist.angular.z)
+
+    def _turn(self, error: float, gain: float, floor: float = 0.08) -> float:
+        """Command a damped turn: proportional to the error, against the measured rate.
+
+        Every turn controller here oscillated, and none of them was mistuned. This base
+        has no friction across the roller axis, so it does not stop when the command
+        stops -- it keeps whatever rate it was given. A pure proportional law on a plant
+        with no damping is an oscillator, and that is what the logs show: centring turned
+        for ninety seconds without ever landing inside a twelve pixel window, and the
+        acquire strafe walked the error from 132 px to 315 px in one direction.
+
+        Subtracting the measured rate supplies the damping the floor does not. The rate
+        comes from odometry, which is blind to sliding but not to turning: turning is the
+        one thing that actually rotates these wheels.
+        """
+        wanted = gain * error
+        if abs(wanted) > 1e-6:
+            wanted += math.copysign(floor, wanted)
+        command = wanted - self.turn_damping * self.yaw_rate
+        return float(max(-self.max_yaw, min(self.max_yaw, command)))
 
     def _on_scan(self, msg: LaserScan) -> None:
         self.scan = msg
@@ -480,7 +540,11 @@ class ApproachNode(Node):
             self._enter(State.TUCK)
             return
 
-        budget = self.search_timeout if self.state is State.SEARCH else self.timeout
+        budget = self.timeout
+        if self.state is State.SEARCH:
+            budget = self.search_timeout
+        elif self.state is State.ACQUIRE:
+            budget = self.acquire_timeout
         if self._elapsed() > budget:
             self.get_logger().error(f"timed out in {self.state.value}")
             self._stop()
@@ -858,8 +922,17 @@ class ApproachNode(Node):
 
         The head is aimed at the row first: the books are well below the markers, and
         without the tilt the target may not be in frame at all from here.
+
+        Nothing is stopped on the way in. This used to open with an unconditional
+        _stop(), which publishes a zero twist, and then fall through to publish a turn
+        -- so every tick sent stop, turn, stop, turn, and on the ticks that returned
+        early it sent only the stop. The base was being asked to hold still as often as
+        it was being asked to move. Measured over forty seconds of squaring, the shelf
+        angle read -2.9, -3.2, -3.1, -3.6, -2.9, -2.9, -3.1, -3.4 degrees: a controller
+        commanding a correction the whole time and a robot not turning at all. Each
+        branch below now sends exactly one command, and the branches that want the base
+        still say so themselves.
         """
-        self._stop()
         self._aim_head()
 
         # 1. Square to the shelf FIRST.
@@ -870,38 +943,105 @@ class ApproachNode(Node):
         # the target book leaves the frame entirely. Squaring here, at a range where the
         # shelf front still reads as a flat face, means the final drive runs along the
         # shelf normal.
+        goal = self._acquire_goal()
         angle = self._shelf_angle()
-        if angle is not None and abs(angle) > self.square_tol:
-            cmd = Twist()
-            cmd.angular.z = -math.copysign(
-                min(self.max_yaw, 0.8 * abs(angle) + 0.08), angle)
-            self.pub_cmd.publish(cmd)
-            self.get_logger().info(
-                f"acquiring: squaring, face {math.degrees(angle):+.1f} deg",
+
+        # Square first only while there is no pose to drive to. Once there is, the pose
+        # controller owns the heading: arriving square is what it is for, and it has to
+        # turn away from square on the way in order to arc across. Squaring on every tick
+        # fought it -- measured over one run the two alternated, the lateral offset came
+        # in at 20 mm per correction, and the state ran out of time with 190 mm still to
+        # go while the shelf angle wandered between -5 and -11 degrees.
+        if goal is None:
+            self._stop()
+            if angle is not None and abs(angle) > self.square_tol:
+                cmd = Twist()
+                cmd.angular.z = self._turn(-angle, 0.8)
+                self.pub_cmd.publish(cmd)
+                self.get_logger().info(
+                    "acquiring: squaring to look for the book, face %+.1f deg"
+                    % math.degrees(angle), throttle_duration_sec=3.0)
+                return
+            self.get_logger().warn(
+                "acquiring: no metric fix on the book to drive to",
                 throttle_duration_sec=3.0)
             return
 
-        bearing = self._column_cx_fresh()
         located = self._book_located()
 
-        if bearing is None:
-            self.get_logger().warn(
-                "acquiring: no bearing", throttle_duration_sec=3.0)
-            return
+        # No check on the image bearing here any more. It was required before this state
+        # steered by pixels, and it outlived the thing it was guarding: the pose
+        # controller below drives to a metric fix on the book and never reads a bearing,
+        # so a missing one is not a reason to refuse to move. Requiring it stalled the
+        # state for its whole timeout every time the head tilted far enough to push the
+        # marker out of frame -- which is exactly what the head is tilted down for.
 
-        # 2. Line up by STRAFING, not turning, so the heading stays square.
-        error_px = bearing - self.image_width / 2.0
-        if abs(error_px) > self.acquire_tol:
+        # 2. Line up by driving to a POSE, not by strafing.
+        #
+        # Strafing here diverged. Measured over one run, with the controller commanding
+        # lateral velocity the whole time, the pixel error went -132, -161, -182, -210,
+        # -242, -315 and the robot finished at the end of the shelf unit looking along
+        # it. That is not a gain that wants tuning. This base cannot strafe: commanding
+        # pure vy yaws it by roughly the magnitude it moves sideways, which is already
+        # written down as a design decision elsewhere in this project, and the yaw turns
+        # the camera away faster than the translation brings the target in.
+        #
+        # What replaces it is the textbook pose controller for a base that can only
+        # drive and turn. The goal is a pose, not a point: stand at the standoff in front
+        # of the book, facing the shelf. In base_footprint the shelf normal is +x once
+        # squared, so the goal is (book_x - standoff, book_y) with heading zero, and
+        #
+        #     rho   distance to it
+        #     alpha bearing to it
+        #     beta  the heading still owed on arrival, which is -alpha here
+        #     v     k_rho * rho
+        #     omega k_alpha * alpha + k_beta * beta
+        #
+        # is asymptotically stable for k_rho > 0, k_beta < 0, k_alpha > k_rho. It curves
+        # into the goal and arrives square, which is exactly the manoeuvre a strafe was
+        # standing in for.
+        gx, gy = goal
+        rho = math.hypot(gx, gy)
+        if rho > self.acquire_pose_tol:
+            ahead = self._min_range_ahead()
+            if gx > 0 and ahead is not None and ahead < self.min_safe:
+                self.get_logger().warn(
+                    f"acquiring: {ahead:.2f} m ahead is closer than the goal; holding",
+                    throttle_duration_sec=3.0)
+                self._stop()
+                return
+            alpha = math.atan2(gy, gx)
+            beta = -alpha
             cmd = Twist()
-            cmd.linear.y = -math.copysign(
-                min(self.max_lateral, 0.0015 * abs(error_px) + 0.02), error_px)
+            # Speed from the DISTANCE to the goal, not from how far ahead it is. Written
+            # the second way it stalls exactly when it is needed: a goal 20 mm ahead and
+            # 350 mm to the side asked for 9 mm/s, and a base that cannot strafe cannot
+            # close a lateral offset without driving. Measured, it crept in at 20 mm per
+            # correction and ran out of time with 190 mm still to go.
+            cmd.linear.x = float(min(self.max_fwd, max(self.creep_speed,
+                                                       self.pose_gain * rho)))
+            cmd.angular.z = self._turn(1.30 * alpha - 0.40 * beta, 1.0, floor=0.0)
             self.pub_cmd.publish(cmd)
             self.get_logger().info(
-                f"acquiring: strafing, error {error_px:+.0f}px",
+                f"acquiring: driving to the pose, {rho:.2f} m to go "
+                f"({gx:+.2f} ahead, {gy:+.2f} across, bearing "
+                f"{math.degrees(alpha):+.0f} deg)",
                 throttle_duration_sec=3.0)
             return
 
+        # Arrived. Square up now, with the driving finished.
+        if angle is not None and abs(angle) > self.square_tol:
+            cmd = Twist()
+            cmd.angular.z = self._turn(-angle, 0.8)
+            self.pub_cmd.publish(cmd)
+            self.get_logger().info(
+                "acquiring: at the pose, squaring, face %+.1f deg"
+                % math.degrees(angle), throttle_duration_sec=3.0)
+            return
+        self._stop()
+
         if not located:
+            self._stop()
             self.get_logger().warn(
                 "acquiring: centred but the book is not located yet",
                 throttle_duration_sec=3.0)
@@ -911,6 +1051,25 @@ class ApproachNode(Node):
             f"book acquired at {self._range_ahead() or float('nan'):.2f} m; closing in")
         self.approach_target = self.standoff
         self._enter(State.APPROACH)
+
+    def _acquire_goal(self):
+        """Where to stand, in base_footprint: the standoff in front of the book.
+
+        Metres from the book's own 3D fix rather than pixels from its bearing. The pixel
+        error says which way to move and nothing about how far, so a controller built on
+        it cannot know when to stop; the book point is measured to 15-35 mm in x against
+        ground truth and carries the lateral offset directly.
+        """
+        target = self._target_in_base()
+        if target is None or not self._book_located():
+            return None
+        # The ACQUIRE range, not the final standoff. This is the checkpoint where the
+        # whole column still fits in frame so the row can be read and the book found;
+        # driving to the grasping standoff from here closes the distance before the
+        # alignment is done, and at 0.65 m the column no longer fits. Measured on the run
+        # that found this: the robot arrived 0.65 m from the shelf and 1.67 m along it,
+        # with perception reporting no red book in view for the rest of the state.
+        return (float(target[0]) - self.acquire_range, float(target[1]))
 
     def _do_centre(self) -> None:
         column_cx = self._column_cx_fresh()
@@ -934,10 +1093,12 @@ class ApproachNode(Node):
             return
         # Positive error means the column is right of centre, so turn clockwise.
         cmd = Twist()
-        cmd.angular.z = -math.copysign(
-            min(self.max_yaw, 0.004 * abs(error_px) + 0.08), error_px
-        )
+        cmd.angular.z = self._turn(-error_px, 0.004)
         self.pub_cmd.publish(cmd)
+        self.get_logger().info(
+            "centring: %+.0f px off, turning at %+.2f rad/s (base already turning "
+            "%+.2f)" % (error_px, cmd.angular.z, self.yaw_rate),
+            throttle_duration_sec=3.0)
 
     def _do_approach(self) -> None:
         ahead = self._distance_to_face()
