@@ -119,8 +119,13 @@ class MissionNode(Node):
         self.bin_touched_at: Optional[float] = None
 
         self.phase = Phase.STARTING
-        self.started_at = self.get_clock().now()
-        self.phase_at = self.started_at
+        # Not set here. With use_sim_time the node's clock reads zero until the first
+        # /clock message arrives, and a baseline of zero makes the first elapsed time
+        # whatever the simulator's uptime happens to be -- this reported "the bin
+        # reports contact at 54.5 s" in its own constructor. Set on the first tick that
+        # sees a running clock instead.
+        self.started_at = None
+        self.phase_at = None
 
         if not self._parameters_valid():
             raise SystemExit(2)
@@ -189,18 +194,46 @@ class MissionNode(Node):
         self.deliver_state = msg.data
 
     def _on_bin_contact(self, msg) -> None:
-        if not msg.contacts:
+        """Stop the trial clock when a BOOK touches the bin, not when anything does.
+
+        The bin stands on a table and is therefore in contact with it permanently, so
+        the sensor reports contacts from the first simulated instant. Taken at face
+        value it stopped the trial clock inside this node's own constructor and
+        declared the book delivered before the robot had moved. Only a contact whose
+        other party is a book counts.
+        """
+        if self.bin_touched_at is not None:
             return
-        if self.bin_touched_at is None:
+        for contact in msg.contacts:
+            names = (getattr(contact.collision1, "name", ""),
+                     getattr(contact.collision2, "name", ""))
+            if not any("book" in name for name in names):
+                continue
             self.bin_touched_at = self._elapsed()
             self.get_logger().info(
-                "the bin reports contact at %.1f s — that is the trial clock stopped"
-                % self.bin_touched_at)
+                "a book is in contact with the bin at %.1f s — that is the trial "
+                "clock stopped (%s)"
+                % (self.bin_touched_at,
+                   " / ".join(n for n in names if n)))
+            return
 
     # ------------------------------------------------------------------ helpers
 
     def _elapsed(self) -> float:
+        if self.started_at is None:
+            return 0.0
         return (self.get_clock().now() - self.started_at).nanoseconds / 1e9
+
+    def _clock_started(self) -> bool:
+        """Latch the trial start on the first real clock reading."""
+        if self.started_at is not None:
+            return True
+        now = self.get_clock().now()
+        if now.nanoseconds == 0:
+            return False
+        self.started_at = now
+        self.phase_at = now
+        return True
 
     def _enter(self, phase: Phase) -> None:
         if phase is self.phase:
@@ -210,6 +243,7 @@ class MissionNode(Node):
                                           self._elapsed()))
         self.phase = phase
         self.phase_at = self.get_clock().now()
+        _ = self.phase_at
         self.pub_phase.publish(String(data=phase.value))
 
     def _report(self) -> None:
@@ -229,6 +263,8 @@ class MissionNode(Node):
     # ------------------------------------------------------------------ sequence
 
     def _tick(self) -> None:
+        if not self._clock_started():
+            return
         if self.phase is Phase.APPROACH:
             if self.approach_state == "done" or not self.grasp_needs_approach:
                 self._enter(Phase.GRASP)

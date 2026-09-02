@@ -18,6 +18,7 @@ Run it with the robot already standing in front of the shelf.
 """
 import math
 import subprocess
+import threading
 import sys
 import time
 
@@ -103,6 +104,34 @@ TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
 # has moved. Tucked, the same link sits at x=-0.52, behind the robot.
 RIGHT_TUCK = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
 TUCK_TORSO = 0.15
+
+
+def hold_the_base(node):
+    """Keep asking the wheels to stand still, for as long as this fixture runs.
+
+    In a scored run the approach controller owns /cmd_vel until the grasp takes over,
+    and both of them publish a zero twist when they are not driving. This fixture
+    replaces the approach, so without this there is no publisher on /cmd_vel at all
+    between the teleport and the first move of the grasp -- which is exactly the window
+    containing the teleport's own kick and a two-armed tuck.
+
+    Measured: the base yawed 169 degrees during the tuck alone, and the run that
+    followed was aimed at a book behind the robot. Measured against Gazebo per simulated
+    second, a zero twist at 20 Hz takes an arm-swinging base from 9.8 mm/s and 0.88
+    deg/s down to 2.1 mm/s and 0.43 deg/s.
+    """
+    from geometry_msgs.msg import Twist
+
+    publisher = node.create_publisher(Twist, "/cmd_vel", 10)
+
+    def loop():
+        while rclpy.ok():
+            publisher.publish(Twist())
+            time.sleep(0.05)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return thread
 
 
 def tuck_the_arms(node, state):
@@ -254,6 +283,7 @@ def main():
     node.create_subscription(String, "/avaa/grasp/state",
                              lambda m: state.__setitem__("grasp", m.data), 10)
 
+    hold_the_base(node)
     tuck_the_arms(node, state)
 
     # Take the "before" pose after the tuck, not before it.

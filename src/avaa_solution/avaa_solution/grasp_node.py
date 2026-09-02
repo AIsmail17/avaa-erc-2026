@@ -1191,9 +1191,19 @@ class GraspNode(Node):
         controller still owns the base, and two publishers on /cmd_vel disagreeing at
         20 Hz would be worse than either alone.
         """
-        if self.state is State.IDLE:
+        if self.state is State.IDLE and not self._my_turn():
             return
         self.pub_cmd.publish(Twist())
+
+    def _my_turn(self) -> bool:
+        """Whether the mission has handed this controller the base.
+
+        Holding from the moment the phase changes rather than from the first arm motion.
+        There is a gap between the approach reporting done -- at which point it stops
+        publishing -- and this controller having a target it is willing to move to, and
+        an unheld base spends that gap sliding.
+        """
+        return bool(self.start_phase) and self.phase == self.start_phase
 
     def _tick(self) -> None:
         self.pub_state.publish(String(data=self.state.value))

@@ -8,16 +8,46 @@ are intended, because several of them are properties of the supplied robot and
 world rather than of any team's code, and we would rather ask than quietly work
 around something that was meant to work.
 
+**Answered, 2026-09-02.** The committee's position is that teams solve these
+themselves. This document is kept as the record of what was measured and how,
+because the answers shaped the solution and belong in the report; item 1 in
+particular has since been partly solved in our own code, and is corrected below
+rather than deleted.
+
 ---
 
 ## 1. The base will not stay still, and no team code can make it
 
-**What happens.** With nothing commanding the base, it drifts continuously: about
-0.4 degrees per second of yaw and about 3 mm/s of translation, and it does not
-decay. At arm's length 0.4 deg/s is 5 mm/s sideways, so a thirty second reach
-finishes roughly 145 mm from where it was aimed. Measured at the pose one of our
-runs failed in, the gripper sat at the book's front face and 38 mm to one side of
-it.
+> **Correction, 2026-09-02.** The figures first written here, and the claim that
+> commanding zero velocity does not help, were both wrong. They were measured per
+> second of **wall clock**, and this simulator does not run at a fixed speed: a
+> freshly launched instance manages a real-time factor of 0.59 and the same
+> instance after twenty minutes of experiments manages 0.013. Per wall second at
+> RTF 0.013 almost no simulated time passes in a measurement window, so every
+> condition looks identical -- which is exactly what we saw, and exactly the wrong
+> conclusion. The numbers below are per **simulated** second, with the RTF recorded
+> beside each one (`tools/drift.py`, `tools/rtf.py`).
+
+**What happens.** With nothing commanding the base it drifts continuously and does
+not decay. Measured against Gazebo per simulated second, in thirty-second windows
+at RTF 0.41 to 0.57:
+
+| | translation | yaw |
+|---|---|---|
+| arm still, nothing commanded | 6.8 mm/s | 0.81 deg/s |
+| arm still, zero twist at 20 Hz | 3.1 mm/s | 0.42 deg/s |
+| arm swinging, nothing commanded | 9.8 mm/s | 0.88 deg/s |
+| arm swinging, zero twist at 20 Hz | 2.1 mm/s | 0.43 deg/s |
+
+and on a base still carrying the momentum of a fresh spawn, 58 mm/s uncommanded
+against 1.8 mm/s held.
+
+**So a zero twist does help, by a factor of three to thirty**, and our own code now
+publishes one at 20 Hz whenever it is not driving. That is the fix, it is ours, and
+it turned a reach that landed 38 mm to one side of the book into one that starts
+from the pose it was aimed from. What it does not do is abolish the drift: 2 mm/s
+and 0.4 deg/s still accumulate over a reach that takes tens of seconds, which is
+why the last centimetres are closed by a perception servo rather than by a plan.
 
 **What we checked.** The four mecanum wheels are modelled
 
@@ -40,17 +70,18 @@ either.
 
 **Questions.**
 - Is the world intended to run on ODE, so that `fdir1` is honoured?
-- If dartsim is intended, is the base expected to hold station under a moving
-  arm, and if so by what mechanism? There is no brake in the `MecanumDrive`
-  plugin, and commanding zero `cmd_vel` locks the wheels but the base slides
-  across them.
+- If dartsim is intended, is a residual drift of about 2 mm/s and 0.4 deg/s under
+  a held base the expected behaviour? There is no brake in the `MecanumDrive`
+  plugin; a zero twist holds the wheels at zero velocity and the base still slides
+  across them, just far more slowly than when nothing is published at all.
 
-**One observation we cannot fully explain.** A robot that has spawned and never
-been commanded drifts at 0.05 deg/s. One whose arm has been commanded even once
-drifts at 0.4 and stays there. The jump is eight-fold and does not decay, so it
-does not look like momentum from the motion. Our guess is that the arm
-controllers never stop making small corrections and each one puts momentum into a
-base that cannot absorb it, but that is a guess.
+**A second observation, about the simulator rather than the robot.** The real-time
+factor collapses when the robot gets into a jammed contact state and a teleport
+clears it: measured in one sitting, 0.033 with the robot at the shelf, 0.365 after
+teleporting it to open floor, and 0.433 after teleporting it straight back to the
+shelf. The position is not what matters; resetting the contact state is. We mention
+it because the trial is timed, and a run whose arm brushes the shelf early will be
+measured against a simulator running ten times slower for the rest of it.
 
 ---
 
