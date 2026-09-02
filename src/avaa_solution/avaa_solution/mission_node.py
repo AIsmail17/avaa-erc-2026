@@ -50,7 +50,12 @@ TOPIC_COLUMN_ID = "/erc/shelf_column_identification"
 TOPIC_ROW_ID = "/erc/shelf_row_identification"
 TOPIC_BIN_CONTACTS = "/bin_contacts"
 
-TOPIC_PERCEIVED_COLUMN = "/avaa/perception/target_column"
+# The column's position on the shelf, 1-5, and NOT /avaa/perception/target_column.
+# That one is an index among the columns currently in frame -- it is what the steering
+# needs and it is meaningless outside the frame it was measured in, reading 0 or 1 while
+# the robot drives along the shelf with two markers in view. Publishing it to the judges
+# would have forfeited the point while looking like it worked.
+TOPIC_PERCEIVED_COLUMN = "/avaa/perception/shelf_column"
 TOPIC_PERCEIVED_ROW = "/avaa/perception/target_row"
 TOPIC_APPROACH_STATE = "/avaa/approach/state"
 TOPIC_GRASP_STATE = "/avaa/grasp/state"
@@ -80,6 +85,12 @@ class MissionNode(Node):
         self.declare_parameter("shelf_column_number", 0)
         self.declare_parameter("book_colour", "")
         # How many times running perception has to agree before a digit is published.
+        #
+        # Perception only offers an answer at all when all five markers are in one frame
+        # and their digits are a permutation of 1-5, and it latches the first such
+        # reading, so this is a second line of defence rather than the only one. A
+        # consistently wrong reading agrees with itself, and counting agreements would
+        # not have caught the frame-relative index this topic used to carry.
         #
         # Perception is measured at 16 of 16 books and no false positives over nine
         # viewpoints, so this is not there to fix a reader that gets it wrong. It is

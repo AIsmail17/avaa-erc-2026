@@ -51,6 +51,9 @@ TOPIC_TARGET_COLUMN = "/avaa/perception/target_column"
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
 TOPIC_TARGET_BOOK_POINT = "/avaa/perception/target_book_point"
 TOPIC_BIN_POINT = "/avaa/perception/bin_point"
+# The column's position on the shelf, 1-5, as opposed to its index among
+# whichever columns happen to be in frame. This is the one the judges want.
+TOPIC_SHELF_COLUMN = "/avaa/perception/shelf_column"
 
 # Where the grasp controller wants the book expressed.
 GRASP_FRAME = "base_link"
@@ -65,6 +68,7 @@ GRASP_FRAME = "base_link"
 # ASSUMPTION: the bias comes from the bounding box sitting high on the visible face of a
 # book whose lower edge is occluded by the shelf lip. It is treated as a constant here
 # because it does not need to be better than half a row to do this job.
+COLUMNS_ON_SHELF = 5
 ROW_HEIGHTS_BASE = [1.391, 1.061, 0.731, 0.401]
 
 # The bin rim, in base_link, taken as known rather than measured.
@@ -100,6 +104,7 @@ class PerceptionNode(Node):
         # Manual override of the column index, for testing without markers in view.
         # -1 (the default) means work it out from the marker digits.
         self.declare_parameter("target_column_index", -1)
+        self.declare_parameter("columns_left_to_right", True)
         self.declare_parameter("save_images", True)
         # Only src/ is bind-mounted into the container, so this is the deepest path that
         # still lands inside the git repository on the host. See PERCEPTION.md.
@@ -109,6 +114,8 @@ class PerceptionNode(Node):
 
         self.book_colour = str(self.get_parameter("book_colour").value).lower()
         self.target_digit = int(self.get_parameter("shelf_column_number").value)
+        self.columns_left_to_right = bool(
+            self.get_parameter("columns_left_to_right").value)
         self.image_dir = str(self.get_parameter("image_dir").value)
         self.save_images = bool(self.get_parameter("save_images").value)
         self.min_save_interval = float(self.get_parameter("min_save_interval_sec").value)
@@ -119,6 +126,7 @@ class PerceptionNode(Node):
         self.last_column_save: Optional[float] = None
         self.last_book_save: Optional[float] = None
         self.reported_column: Optional[int] = None
+        self.shelf_column: Optional[int] = None
         self.reported_row: Optional[int] = None
         # Confident row readings, voted on before anything is latched. See _publish_row.
         self.row_votes = deque(maxlen=15)
@@ -150,6 +158,8 @@ class PerceptionNode(Node):
             PointStamped, TOPIC_TARGET_BOOK_POINT, 10)
         self.pub_bin_point = self.create_publisher(
             PointStamped, TOPIC_BIN_POINT, 10)
+        self.pub_shelf_column = self.create_publisher(
+            Int32, TOPIC_SHELF_COLUMN, 10)
         self.pub_detections = self.create_publisher(Detection2DArray, TOPIC_DETECTIONS, 10)
         self.pub_row = self.create_publisher(Int32, TOPIC_TARGET_ROW, 10)
         self.pub_column = self.create_publisher(Int32, TOPIC_TARGET_COLUMN, 10)
@@ -381,6 +391,7 @@ class PerceptionNode(Node):
         try:
             books = bd.detect_books(frame)
             markers = sorted(mr.read_markers(frame), key=lambda m: m.cx)
+            self._publish_shelf_column(markers)
             # The markers define the columns. Falling back to gap clustering only when
             # none are visible, since that cannot identify a target column anyway.
             if markers:
@@ -510,6 +521,53 @@ class PerceptionNode(Node):
             self._save_book_image(frame, books, target, row)
 
     # ------------------------------------------------------------------ helpers
+
+    def _publish_shelf_column(self, markers: List[mr.Marker]) -> None:
+        """Publish WHICH COLUMN of the shelf carries the target marker, 1 to 5.
+
+        This is not _target_column_index, and the difference is a scored point. That one
+        returns a position among the columns currently in frame, which is what the
+        steering needs and is meaningless to anybody else: driving along the shelf with
+        two markers in view it reads 0 or 1, whichever two those are. Published to the
+        judges it would be a number with no relation to the shelf.
+
+        The absolute answer needs the whole shelf in one frame: five markers, all
+        confident, their digits a permutation of 1 to 5. Anything less and some column is
+        off the edge of the image, so counting from the left counts from the wrong place.
+        From the start zone the whole unit is in view, which is where this fires.
+
+        Latched once found. The digits are fixed for the run, so a later view from close
+        up cannot improve on a reading taken with everything visible, and can easily make
+        it worse.
+
+        Which end is column 1 is a parameter, not an assumption. The rules do not say,
+        and the same ambiguity applies to the rows. Left to right in an image of the
+        robot facing the shelf is the simulator's own numbering -- book_col_1 stands at
+        y=+2.0 and book_col_5 at y=-1.9 -- which is the best evidence available.
+        """
+        if self.shelf_column is not None:
+            self.pub_shelf_column.publish(Int32(data=int(self.shelf_column)))
+            return
+        if not self.target_digit or len(markers) != COLUMNS_ON_SHELF:
+            return
+        if not all(m.confident for m in markers):
+            return
+        ordered = sorted(markers, key=lambda m: m.cx)
+        digits = [m.digit for m in ordered]
+        if sorted(digits) != list(range(1, COLUMNS_ON_SHELF + 1)):
+            self.get_logger().warn(
+                "five markers in view but their digits are %s, which is not a "
+                "permutation of 1-%d; not identifying the column from this frame"
+                % (digits, COLUMNS_ON_SHELF), throttle_duration_sec=10.0)
+            return
+        position = digits.index(self.target_digit) + 1
+        if not self.columns_left_to_right:
+            position = COLUMNS_ON_SHELF + 1 - position
+        self.shelf_column = position
+        self.get_logger().info(
+            "the whole shelf is in view, markers left to right are %s, so marker %d "
+            "is shelf column %d" % (digits, self.target_digit, position))
+        self.pub_shelf_column.publish(Int32(data=int(position)))
 
     def _target_column_index(self, markers: List[mr.Marker]) -> Optional[int]:
         """Index into ``columns`` of the column carrying the target marker digit.
