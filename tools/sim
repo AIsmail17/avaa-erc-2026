@@ -7,6 +7,7 @@
 #   sim shell     open a shell inside the container, ROS already sourced
 #   sim status    what is running right now
 #   sim log       follow the simulation log
+#   sim gui       attach a viewer to a running (headless) simulation
 #   sim build     rebuild the ROS workspace
 #   sim rebuild   recreate the container from scratch (destroys install/ and build/)
 #
@@ -193,6 +194,82 @@ stop_orphans() {
     done
 }
 
+cmd_gui() {
+    # Attach a viewer to a simulation that is already running headless.
+    #
+    # Why this exists rather than just launching Gazebo with its GUI: the GUI and the
+    # server are one process there, and the GUI is the fragile half. When WSL drops the
+    # virtual GPU, Mesa falls back to software rendering, the container's software
+    # driver does not work --
+    #
+    #     libGL error: glx: failed to create drisw screen
+    #     libGL error: failed to load driver: swrast
+    #     [GUI] [Err] Failed to create OpenGL context
+    #
+    # -- and Qt aborts. That abort takes the SERVER down with it: the controllers never
+    # spawn, every spawner dies with "Could not successfully call service
+    # /controller_manager/load_controller", and the whole simulation is gone. A crash in
+    # the window should not cost the run.
+    #
+    # Started separately, the viewer is disposable. If the GPU drops, the window dies and
+    # the simulation keeps going at full speed; run 'sim gui' again when it comes back.
+    container_running || { red "Container is not running. Run 'sim start' first."; return 1; }
+    if ! sim_running; then
+        red "Gazebo is not running. Start it headless first:  sim start --fast --headless"
+        return 1
+    fi
+    if docker exec "$CONTAINER" pgrep -f '[g]z sim -g' >/dev/null 2>&1; then
+        ylw "A viewer is already running."
+        unminimize_window
+        return 0
+    fi
+
+    grn "Attaching a viewer..."
+    # The environment is passed with -e rather than exported inside a login shell.
+    #
+    # 'bash -lc' sources the profile, and that loses LD_LIBRARY_PATH. Without
+    # /usr/lib/wsl/lib on it, Mesa cannot find libd3d12.so, silently falls back to the
+    # container's software driver -- which does not work -- and Qt aborts:
+    #
+    #     libGL error: glx: failed to create drisw screen
+    #     libGL error: failed to load driver: swrast
+    #     [GUI] [Err] Failed to create OpenGL context
+    #
+    # Passed explicitly, the same command runs clean. This looked exactly like the WSL
+    # virtual GPU dropping, which is a real failure that produces the identical message,
+    # and that is why it was worth chasing rather than retrying.
+    docker exec -d \
+        -e DISPLAY=:0 \
+        -e QT_X11_NO_MITSHM=1 \
+        -e XDG_RUNTIME_DIR=/tmp/runtime-root \
+        -e GALLIUM_DRIVER=d3d12 \
+        -e MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
+        -e LD_LIBRARY_PATH=/usr/lib/wsl/lib \
+        "$CONTAINER" bash -c \
+        'mkdir -p /tmp/runtime-root; exec gz sim -g > /tmp/gui.log 2>&1'
+
+    # Give it time to fail. A GUI that cannot make an OpenGL context dies within a few
+    # seconds, and saying so here is worth more than leaving the user watching an empty
+    # desktop wondering which of the two things went wrong.
+    local waited=0
+    while [ "$waited" -lt 25 ]; do
+        sleep 1
+        waited=$((waited + 1))
+        if ! docker exec "$CONTAINER" pgrep -f '[g]z sim -g' >/dev/null 2>&1; then
+            red "The viewer died after ${waited}s. The usual cause is WSL dropping the"
+            red "virtual GPU; check for 'failed to create drisw screen' in:"
+            echo "    docker exec $CONTAINER tail -30 /tmp/gui.log"
+            echo
+            echo "The simulation itself is unaffected and still running."
+            return 1
+        fi
+        if [ "$waited" -ge 12 ]; then break; fi
+    done
+
+    grn "Viewer running (the simulation is untouched if it crashes)."
+    unminimize_window
+}
+
 cmd_stop() {
     container_running || { ylw "Container is not running."; return 0; }
     if ! sim_running && ! sim_launching; then
@@ -288,6 +365,7 @@ case "${1:-}" in
     shell)   cmd_shell   ;;
     status)  cmd_status  ;;
     log)     cmd_log     ;;
+    gui)     cmd_gui     ;;
     build)   cmd_build   ;;
     rebuild) cmd_rebuild ;;
     *)
@@ -299,6 +377,7 @@ case "${1:-}" in
         echo "  sim shell     shell inside the container, ROS 2 sourced"
         echo "  sim status    show what is running"
         echo "  sim log       follow the simulation log"
+        echo "  sim gui       attach a viewer window to a running simulation"
         echo "  sim build     rebuild the ROS workspace"
         echo "  sim rebuild   recreate the container from scratch"
         ;;

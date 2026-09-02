@@ -12,44 +12,49 @@ level and unpenetrated afterwards, with no node running and nothing in contact o
 instrumented link. Killing every node does not bring it back. Teleporting the robot
 somewhere else does not bring it back. Only relaunching does.
 
-Driving costs nothing at all. Measured in the same way, in one session: 0.471 untouched,
+Driving costs nothing at all. Measured the same way, in one session: 0.471 untouched,
 0.550 after driving eight simulated seconds forward, 0.551 after turning, 0.561 after
 driving further.
 
-That matters more than it sounds. place_robot.py sets up every grasp experiment in this
-project, so every one of them has run on a simulator at a fifteenth of the speed of the
-one the scored run will use -- and a scored run never teleports, because the robot spawns
-once and drives. Much of what was measured about the arm under those conditions (that
-trajectories complete while the arm is still travelling, that the controller cannot
-follow, that the base slides several centimetres during a reach) deserves measuring again
-on a simulator that is running properly.
-
-This is still a fixture: it reads the true pose from Gazebo to decide when to stop, which
-the robot cannot do for itself. But it moves the robot with its own wheels, so the
+This is still a fixture: it reads the true pose from Gazebo to decide when to stop,
+which the robot cannot do for itself. But it moves the robot with its own wheels, so the
 simulation it hands to the experiment is the one the competition will use.
+
+How it is controlled, and why it is not a sequence of bursts
+------------------------------------------------------------
+The first version issued one open-loop burst per correction and stopped between them. It
+oscillated about the heading and never arrived: this base has no friction across the
+roller axis, so when a command stops the base keeps the rate it was given. Measured, it
+turned past the goal every time -- bearing +1.7 degrees, then -6.5, then -14.5, then
+-24.1 -- and after eighty corrections it had moved 90 mm.
+
+So the control is a cascade instead. Reading the true pose costs about a second of wall
+clock, so that is the outer loop and it runs in a background thread; the inner loop
+publishes at 20 Hz off the newest reading it has, and damps the turn against the yaw
+rate from odometry. Odom is blind to sliding, which is why nothing in the solution trusts
+it for position, but turning is the one thing that genuinely rotates these wheels.
 """
 import math
 import subprocess
 import sys
+import threading
 import time
 
 import rclpy
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from rosgraph_msgs.msg import Clock
 
 SHOULDER_OFFSET_Y = 0.159
 
-# Reading the true pose costs about a second of wall clock, so the loop runs near 1 Hz
-# and every correction is a short burst rather than a continuous command. Gains that
-# suit a 50 Hz loop would be wildly unstable here.
-TURN_SPEED = 0.35
+TURN_SPEED = 0.40
 DRIVE_SPEED = 0.30
-BURST_SIM_SEC = 0.8
+CREEP_SPEED = 0.06
+TURN_DAMPING = 0.55
 
-BEARING_TOL = 0.02      # rad, while there is still distance to cover
-YAW_TOL = 0.02          # rad, for the final squaring
-DISTANCE_TOL = 0.015    # m
+BEARING_TOL = 0.03      # rad, while there is still distance to cover
+YAW_TOL = 0.03          # rad, for the final squaring
+DISTANCE_TOL = 0.020    # m
 
 
 def gz(*args, timeout=25):
@@ -76,43 +81,53 @@ def wrap(angle):
 class Driver(Node):
     def __init__(self):
         super().__init__("drive_to")
-        self.now = None
-        self.create_subscription(Clock, "/clock", self._on_clock, 10)
+        self.yaw_rate = 0.0
+        self.create_subscription(Odometry, "/odom", self._odom, 10)
         self.cmd = self.create_publisher(Twist, "/cmd_vel", 10)
 
-    def _on_clock(self, msg):
-        self.now = msg.clock.sec + msg.clock.nanosec / 1e9
+    def _odom(self, msg):
+        self.yaw_rate = float(msg.twist.twist.angular.z)
 
-    def wait_for_clock(self):
-        while self.now is None:
-            rclpy.spin_once(self, timeout_sec=0.2)
+    def turn(self, error, gain, floor=0.06):
+        """A damped turn command, so the base does not carry its rate past the goal."""
+        wanted = gain * error
+        if abs(wanted) > 1e-6:
+            wanted += math.copysign(floor, wanted)
+        command = wanted - TURN_DAMPING * self.yaw_rate
+        return float(max(-TURN_SPEED, min(TURN_SPEED, command)))
 
-    def burst(self, vx, wz, sim_seconds=BURST_SIM_SEC):
-        """Command for a fixed span of SIMULATED time, then stop and hold."""
-        self.wait_for_clock()
-        until = self.now + sim_seconds
-        command = Twist()
-        command.linear.x = float(vx)
-        command.angular.z = float(wz)
-        guard = time.time() + 120
-        while self.now < until and time.time() < guard:
-            self.cmd.publish(command)
-            rclpy.spin_once(self, timeout_sec=0.02)
-        self.hold(0.4)
+    def send(self, vx, wz):
+        message = Twist()
+        message.linear.x = float(vx)
+        message.angular.z = float(wz)
+        self.cmd.publish(message)
 
-    def hold(self, sim_seconds):
-        """Publish a zero twist, which is not the same as publishing nothing.
-
-        Measured per simulated second: a base with nothing on /cmd_vel drifts 6.8 mm/s
-        and 0.81 deg/s with the arm still, and 2.1 mm/s and 0.43 deg/s with a zero twist
-        at 20 Hz while the arm swings.
-        """
-        self.wait_for_clock()
-        until = self.now + sim_seconds
-        guard = time.time() + 120
-        while self.now < until and time.time() < guard:
+    def hold(self, seconds):
+        """Publish a zero twist, which is not the same as publishing nothing."""
+        end = time.time() + seconds
+        while time.time() < end:
             self.cmd.publish(Twist())
             rclpy.spin_once(self, timeout_sec=0.02)
+
+
+class Truth:
+    """The true pose, refreshed in the background because reading it costs a second."""
+
+    def __init__(self):
+        self.value = None
+        self.stop = False
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while not self.stop:
+            try:
+                here, rpy = pose("tiago_pro")
+                if here is not None:
+                    self.value = (here[0], here[1], rpy[2])
+            except Exception:  # noqa: BLE001 - a dropped query is not a failure
+                pass
+            time.sleep(0.1)
 
 
 def find_book(colour):
@@ -153,57 +168,54 @@ def main():
     # on the left shoulder rather than on the middle of the robot.
     goal_x = book[0] - standoff
     goal_y = book[1] - shoulder
-    print("driving to [%.3f, %.3f] yaw 0, in front of %s" % (goal_x, goal_y, name))
+    print("driving to [%.3f, %.3f] yaw 0, in front of %s" % (goal_x, goal_y, name),
+          flush=True)
 
     rclpy.init()
     node = Driver()
-    node.wait_for_clock()
+    truth = Truth()
+    while truth.value is None:
+        rclpy.spin_once(node, timeout_sec=0.1)
 
-    for attempt in range(80):
-        here, rpy = pose("tiago_pro")
-        if here is None:
-            node.hold(0.5)
-            continue
-        yaw = rpy[2]
-        dx, dy = goal_x - here[0], goal_y - here[1]
+    deadline = time.time() + 240
+    arrived = False
+    reported = 0.0
+    while time.time() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.02)
+        x, y, yaw = truth.value
+        dx, dy = goal_x - x, goal_y - y
         distance = math.hypot(dx, dy)
 
         if distance <= DISTANCE_TOL:
             error = wrap(0.0 - yaw)
             if abs(error) <= YAW_TOL:
-                print("arrived: [%.3f, %.3f] yaw %+.2f deg, %.0f mm from the goal"
-                      % (here[0], here[1], math.degrees(yaw), distance * 1000))
+                arrived = True
                 break
-            node.burst(0.0, math.copysign(min(TURN_SPEED, 2.0 * abs(error)), error),
-                       min(BURST_SIM_SEC, abs(error) / TURN_SPEED + 0.1))
-            continue
+            node.send(0.0, node.turn(error, 1.2))
+        else:
+            bearing = wrap(math.atan2(dy, dx) - yaw)
+            # Rotate then drive, never both and never sideways: commanding pure vy yaws
+            # this base by roughly the magnitude it strafes.
+            if abs(bearing) > BEARING_TOL:
+                node.send(0.0, node.turn(bearing, 1.2))
+            else:
+                speed = min(DRIVE_SPEED, max(CREEP_SPEED, 0.8 * distance))
+                node.send(speed, node.turn(bearing, 0.8, floor=0.0))
 
-        bearing = wrap(math.atan2(dy, dx) - yaw)
-        if attempt < 6 or attempt % 20 == 0:
-            print("  [%d] at [%.3f, %.3f] yaw %+.1f, %.2f m to go, bearing %+.1f deg"
-                  % (attempt, here[0], here[1], math.degrees(yaw), distance,
-                     math.degrees(bearing)), flush=True)
-        # Rotate then drive, never both and never sideways: commanding pure vy yaws this
-        # base by roughly the magnitude it strafes.
-        if abs(bearing) > BEARING_TOL:
-            node.burst(0.0, math.copysign(min(TURN_SPEED, 2.0 * abs(bearing)), bearing),
-                       min(BURST_SIM_SEC, abs(bearing) / TURN_SPEED + 0.1))
-            continue
-        speed = min(DRIVE_SPEED, max(0.05, 0.8 * distance))
-        node.burst(speed, 0.0, min(BURST_SIM_SEC, distance / speed))
-    else:
-        here, rpy = pose("tiago_pro")
-        print("gave up after 80 corrections, at %s" % here)
+        if time.time() - reported > 3.0:
+            reported = time.time()
+            print("  at [%.2f, %.2f] yaw %+.0f deg, %.2f m to go"
+                  % (x, y, math.degrees(yaw), distance), flush=True)
 
-    here, rpy = pose("tiago_pro")
-    if here:
-        print("robot at [%.3f, %.3f] yaw %+.1f deg"
-              % (here[0], here[1], math.degrees(rpy[2])))
-        print("book %s at [%.3f, %.3f, %.3f]" % (name, book[0], book[1], book[2]))
-        print("so the book is %.3f m ahead and %+.3f m to the side"
-              % (book[0] - here[0], book[1] - here[1]))
+    node.hold(1.5)
+    x, y, yaw = truth.value
+    truth.stop = True
+    print("%s at [%.3f, %.3f] yaw %+.1f deg"
+          % ("arrived" if arrived else "GAVE UP", x, y, math.degrees(yaw)))
+    print("book %s at [%.3f, %.3f, %.3f]" % (name, book[0], book[1], book[2]))
+    print("so the book is %.3f m ahead and %+.3f m to the side"
+          % (book[0] - x, book[1] - y))
 
-    node.hold(1.0)
     node.destroy_node()
     rclpy.shutdown()
 
