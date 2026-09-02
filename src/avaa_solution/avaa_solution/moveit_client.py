@@ -87,7 +87,17 @@ class MoveItClient:
     """Synchronous access to move_group, on its own node and thread."""
 
     def __init__(self, name: str = "avaa_moveit_client", use_sim_time: bool = True):
-        self.node = rclpy.create_node(name)
+        # use_global_arguments=False, or this node is not called ``name`` at all.
+        #
+        # Every node in the launch file is started with --ros-args -r __node:=<name>,
+        # and a remap on the command line applies to EVERY node created in the process,
+        # not just the first. So this one was renamed to match the controller that owns
+        # it: two nodes called avaa_deliver in one process, both with rosout publishers,
+        # both being spun. ROS says so at startup and it is easy to read past --
+        # "Publisher already registered for provided node name" -- and then the delivery
+        # controller died with SIGSEGV in the executor thread the moment it finished
+        # connecting to move_group, taking the whole launch down with it.
+        self.node = rclpy.create_node(name, use_global_arguments=False)
         self.node.set_parameters([
             rclpy.parameter.Parameter(
                 "use_sim_time", rclpy.Parameter.Type.BOOL, use_sim_time)
