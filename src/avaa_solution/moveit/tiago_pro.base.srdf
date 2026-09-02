@@ -39,6 +39,19 @@
     <joint name="gripper_left_finger_joint"/>
   </group>
 
+  <!-- The right arm is never used to pick anything up: the rules allow one arm, and this
+       solution uses the left. It is here so that its DRIVING posture can be collision
+       checked like the left one.
+
+       That is not a formality. Measured from TF, the right hand in the posture this
+       solution drove with sat 246 mm BEHIND the base, where it catches the table on the
+       way past. Searching for something more compact without a group to check against
+       means searching with no notion of the torso, and the answer folds the arm through
+       it. -->
+  <group name="arm_right_torso">
+    <chain base_link="base_link" tip_link="gripper_right_grasping_link"/>
+  </group>
+
   <end_effector name="gripper_left_ee"
                 parent_link="gripper_left_grasping_link"
                 group="gripper_left"

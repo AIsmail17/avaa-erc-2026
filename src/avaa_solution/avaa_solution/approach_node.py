@@ -98,6 +98,21 @@ SENSOR_QOS = QoSProfile(
 )
 
 
+# The driving posture, chosen to keep the arm INSIDE the base.
+#
+# The previous one was collision free and that is all it was. Measured from TF with the
+# robot standing in it, arm_left_4_link sat at x=+0.449 -- 179 mm in front of a base that
+# is 0.54 m across -- and the right gripper at x=-0.516, 246 mm behind it. An elbow
+# leading the robot by 180 mm catches every shelf edge it drives past and a hand trailing
+# by 250 mm catches the table on the way out, and being collision free does not help with
+# either: that check is against the robot itself, and the shelf is not part of the robot.
+#
+# Both arms are now 0 mm outside the footprint, found by tools/tuck_search.py, which
+# hill-climbs from the old posture and accepts a step only if it is both more compact and
+# still collision free. Searching for compactness alone does not work: the torso stands in
+# the middle of the base, so "inside the footprint" and "inside the robot" are nearly the
+# same volume, and all 400 of the zero-overhang postures a free search produced were
+# rejected by MoveIt.
 # Arm posture for driving, measured rather than guessed (see try_tuck.py).
 #
 # The arms spawn with every joint at zero, which for this arm is fully extended: the
@@ -122,7 +137,7 @@ SENSOR_QOS = QoSProfile(
 # keeping the most compact one with at least 0.15 rad of room at every joint stop.
 # It is also tighter than the old one: the gripper sits 0.29 m from the base axis
 # rather than 0.49 m.
-TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
+TUCK_POSE = [2.3940, 1.1345, 1.3129, -2.0287, 1.0423, 1.5420, 1.1028]
 # The tuck is an eight-joint posture, torso included, and only the eight together
 # are collision free. Commanding the arm alone and leaving the torso down folds
 # arm_left_5, arm_left_6 and the gripper into base_link -- MoveIt reports exactly
@@ -145,7 +160,7 @@ TUCK_TORSO = 0.15
 # inside the shelf, against shelf_back. This one reaches 0.204 m forward and is
 # checked at both torso heights, because raising the torso for the top rows takes
 # the whole upper body with it.
-RIGHT_TUCK = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
+RIGHT_TUCK = [-0.2398, -1.5290, -0.1046, 1.1345, 2.4498, 3.0020, 1.5282]
 
 
 class State(Enum):

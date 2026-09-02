@@ -13,7 +13,8 @@ runtime through the create service, so no supplied file is touched and it vanish
 when the simulation restarts.
 
     python3 spectator.py            # default view of column 3
-    python3 spectator.py 1.6 -1.8 1.9 2.75 0.0 1.15
+    python3 spectator.py 1.6 -1.8 1.9 2.75 0.0 1.15        # eye, then target
+    python3 spectator.py 1.6 -1.8 1.9 2.75 0.0 1.15 0.9    # ...and a longer lens
 """
 import math
 import subprocess
@@ -31,7 +32,7 @@ def look_at(eye, target):
     return pitch, yaw
 
 
-def sdf(eye, pitch, yaw, width=960, height=540):
+def sdf(eye, pitch, yaw, width=1280, height=720, fov=1.25):
     return f"""<?xml version="1.0" ?>
 <sdf version="1.8">
   <model name="{NAME}">
@@ -43,7 +44,7 @@ def sdf(eye, pitch, yaw, width=960, height=540):
         <update_rate>15</update_rate>
         <always_on>1</always_on>
         <camera>
-          <horizontal_fov>1.05</horizontal_fov>
+          <horizontal_fov>{fov}</horizontal_fov>
           <image><width>{width}</width><height>{height}</height><format>R8G8B8</format></image>
           <clip><near>0.1</near><far>50</far></clip>
         </camera>
@@ -54,12 +55,24 @@ def sdf(eye, pitch, yaw, width=960, height=540):
 
 
 def main():
+    fov = 1.25
+    if len(sys.argv) >= 8:
+        fov = float(sys.argv[7])
     if len(sys.argv) >= 7:
         eye = tuple(float(v) for v in sys.argv[1:4])
         target = tuple(float(v) for v in sys.argv[4:7])
     else:
-        # Off the robot's right shoulder, high enough to see into the shelf.
-        eye, target = (1.55, -1.75, 1.95), (2.80, 0.0, 1.15)
+        # A stage view, not a close-up.
+        #
+        # The first framing looked from off the robot's shoulder straight at the shelf,
+        # which put the shelf behind the subject and filling most of the picture: good
+        # for watching fingers close on a book, useless for watching a robot drive,
+        # because it leaves frame within a couple of metres and the shelf hides it when
+        # it does not. This looks along the shelf's normal instead, from the open side,
+        # far enough back that the whole working area is in shot -- the start zone, the
+        # collection bin at x=-1, the robot, and the full width of the shelf at x=2.9 --
+        # with the robot between the camera and the shelf rather than against it.
+        eye, target = (1.05, -4.30, 2.85), (2.10, 0.00, 0.40)
 
     pitch, yaw = look_at(eye, target)
     print("camera at %s looking at %s (pitch %.3f, yaw %.3f)"
@@ -76,7 +89,7 @@ def main():
         ["gz", "service", "-s", "/world/erc_world/create",
          "--reqtype", "gz.msgs.EntityFactory", "--reptype", "gz.msgs.Boolean",
          "--timeout", "5000",
-         "--req", 'sdf: %r' % sdf(eye, pitch, yaw)],
+         "--req", 'sdf: %r' % sdf(eye, pitch, yaw, fov=fov)],
         capture_output=True, text=True, timeout=30)
     print("create said:", (out.stdout or out.stderr).strip()[:200])
 
