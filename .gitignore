@@ -24,3 +24,8 @@ Thumbs.db
 # erc_images/ is a Phase 1 deliverable: the solution node writes timestamped
 # annotated images there during a trial and judges use them to award the
 # identification points. Those must be committed, not ignored.
+
+# --- annotated frames from debug runs ---
+# A scored run's frames are a deliverable and get added deliberately; the hundreds
+# written by every debug launch are not.
+src/avaa_solution/erc_images/
