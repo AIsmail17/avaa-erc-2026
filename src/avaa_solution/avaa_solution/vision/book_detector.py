@@ -52,6 +52,18 @@ MIN_FILL = 0.55
 
 ROWS_PER_COLUMN = 4
 
+# Bin gates, the mirror image of the book gates above.
+#
+# The bin is the same red as a red book -- the module docstring says so, and it is the
+# reason the shape gates exist at all -- so the only thing separating them is size and
+# proportion. A book presents an upright face 6-8 px wide by 14-26 px tall; the bin
+# measured 136 x 66, which is wider than it is tall and two hundred times the area.
+# There is no overlap to argue about, so the gates sit an order of magnitude apart on
+# both counts rather than being tuned to a boundary.
+BIN_MIN_AREA = 1500
+BIN_MAX_ASPECT = 0.9
+BIN_MIN_FILL = 0.45
+
 
 @dataclass(frozen=True)
 class Book:
@@ -111,6 +123,38 @@ def detect_books(bgr: np.ndarray) -> List[Book]:
 
     found.sort(key=lambda b: b.cx)
     return found
+
+
+def detect_bin(bgr: np.ndarray) -> Optional[Book]:
+    """Return the collection bin, or None if it is not in view.
+
+    The bin is returned as a ``Book`` with colour "red" so that everything downstream --
+    the depth locator, the annotator, the tests -- takes it without a second code path.
+    It is not a book and nothing treats it as one: only ``detect_bin`` produces it, and
+    only the delivery controller asks.
+
+    The largest qualifying blob wins rather than the first. A red book on the shelf can
+    never pass the area gate, but the start zone and a red book seen close up are both
+    red things of some size, and picking the biggest is the difference between aiming at
+    the bin and aiming at whatever happened to be found first.
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    contours, _ = cv2.findContours(
+        _mask_for(hsv, "red"), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best: Optional[Book] = None
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w == 0 or h == 0:
+            continue
+        area = cv2.contourArea(contour)
+        aspect = h / float(w)
+        fill = area / float(w * h)
+        if area < BIN_MIN_AREA or aspect > BIN_MAX_ASPECT or fill < BIN_MIN_FILL:
+            continue
+        if best is None or area > best.area:
+            best = Book("red", x, y, w, h, area, aspect, fill)
+    return best
 
 
 def group_into_columns(books: Sequence[Book]) -> List[List[Book]]:

@@ -39,6 +39,7 @@ by a path straight through the shelf unless something is actually checking.
 
 import math
 import threading
+import traceback
 from collections import deque
 from enum import Enum
 from typing import List, Optional
@@ -532,8 +533,16 @@ class GraspNode(Node):
         def run():
             try:
                 self.motion_result = function()
-            except Exception as exc:  # noqa: BLE001 - a failed motion is not a crash
-                self.get_logger().error("%s raised %s" % (label, exc))
+            except BaseException as exc:  # noqa: BLE001 - a failed motion is not a crash
+                # repr and a traceback, not str(exc).
+                #
+                # Two motions failed with "error 99999" and nothing else in the log,
+                # because plenty of exceptions carry no message at all and "%s" % exc
+                # renders those as the empty string -- and an empty error line is
+                # indistinguishable from no error line when reading a log afterwards.
+                # An hour went into working out what 99999 meant. It means this.
+                self.get_logger().error(
+                    "%s raised %r\n%s" % (label, exc, traceback.format_exc()))
                 self.motion_result = (99999, 0.0)
 
         self.motion_thread = threading.Thread(target=run, daemon=True)

@@ -120,3 +120,47 @@ def test_annotate_does_not_modify_the_input():
     before = img.copy()
     bd.annotate(img, books, highlight=books[0], caption="test")
     assert np.array_equal(img, before)
+
+
+# ---------------------------------------------------------------- the bin
+
+def put_bin(img, x=200, y=120, w=136, h=66):
+    # The size the bin actually measured in a frame from the head camera.
+    cv2.rectangle(img, (x, y), (x + w, y + h), BGR["red"], -1)
+
+
+def test_bin_is_found_when_present():
+    img = blank()
+    put_bin(img)
+    found = bd.detect_bin(img)
+    assert found is not None
+    assert found.colour == "red"
+    assert found.aspect < 1.0
+
+
+def test_blank_frame_has_no_bin():
+    assert bd.detect_bin(blank()) is None
+
+
+def test_a_shelf_of_red_books_is_not_mistaken_for_the_bin():
+    """The gates have to separate the bin from the thing it shares a colour with."""
+    img = blank()
+    for row in range(4):
+        put_book(img, 300, 60 + row * 40, "red")
+    assert bd.detect_bin(img) is None
+
+
+def test_the_bin_wins_over_a_red_book_in_the_same_frame():
+    img = blank()
+    put_book(img, 500, 40, "red")
+    put_bin(img)
+    found = bd.detect_bin(img)
+    assert found is not None
+    assert found.w > 100
+
+
+def test_the_bin_is_not_returned_as_a_book():
+    """detect_books must still reject it, or a delivery target becomes a grasp target."""
+    img = blank()
+    put_bin(img)
+    assert [b for b in bd.detect_books(img) if b.colour == "red"] == []

@@ -36,6 +36,7 @@ setup(
             "approach = avaa_solution.approach_node:main",
             "grasp = avaa_solution.grasp_node:main",
             "perception = avaa_solution.perception_node:main",
+            "deliver = avaa_solution.deliver_node:main",
         ],
     },
 )

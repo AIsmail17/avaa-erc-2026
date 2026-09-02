@@ -50,6 +50,7 @@ TOPIC_DEPTH_INFO = "/head_front_camera/head_front_camera/depth/camera_info"
 TOPIC_TARGET_COLUMN = "/avaa/perception/target_column"
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
 TOPIC_TARGET_BOOK_POINT = "/avaa/perception/target_book_point"
+TOPIC_BIN_POINT = "/avaa/perception/bin_point"
 
 # Where the grasp controller wants the book expressed.
 GRASP_FRAME = "base_link"
@@ -65,6 +66,20 @@ GRASP_FRAME = "base_link"
 # book whose lower edge is occluded by the shelf lip. It is treated as a constant here
 # because it does not need to be better than half a row to do this job.
 ROW_HEIGHTS_BASE = [1.391, 1.061, 0.731, 0.401]
+
+# The bin rim, in base_link, taken as known rather than measured.
+#
+# The rules fix the bin on a table: table 140 x 80 x 73 cm, bin 50 x 31 x 21 cm, so the
+# rim stands 0.94 m above the floor and base_link sits 0.186 m up. Measured in the
+# simulator the rim is at 0.950, which is 10 mm from the arithmetic.
+#
+# Height is taken as known for the same reason it is taken as known for the shelf rows:
+# depth is trustworthy sideways and in range and is not trustworthy vertically. Measured
+# against ground truth, two settled readings of the bin came back +18 and +14 mm high,
+# and a third taken while the head was still tilting came back +176 mm. A number that
+# depends on whether the head has stopped moving is not a number to place a book with.
+BIN_RIM_BASE_Z = 0.950 - 0.186
+BIN_DEPTH_M = 0.50
 DEPTH_HEIGHT_BIAS = 0.152
 
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
@@ -133,6 +148,8 @@ class PerceptionNode(Node):
         self.create_subscription(CameraInfo, TOPIC_DEPTH_INFO, self._on_info, SENSOR_QOS)
         self.pub_book_point = self.create_publisher(
             PointStamped, TOPIC_TARGET_BOOK_POINT, 10)
+        self.pub_bin_point = self.create_publisher(
+            PointStamped, TOPIC_BIN_POINT, 10)
         self.pub_detections = self.create_publisher(Detection2DArray, TOPIC_DETECTIONS, 10)
         self.pub_row = self.create_publisher(Int32, TOPIC_TARGET_ROW, 10)
         self.pub_column = self.create_publisher(Int32, TOPIC_TARGET_COLUMN, 10)
@@ -314,10 +331,52 @@ class PerceptionNode(Node):
         self.pub_book_point.publish(msg)
         self._cross_check_row(point)
 
+    def _publish_bin_point(self, frame) -> None:
+        """Publish the collection bin's position in base_link, if it is in view.
+
+        Only x and y come from depth. The bin is the same red as a red book -- which is
+        why the shape gates in book_detector exist -- and it is large: 500 mm across the
+        opening against a book 30 mm wide. So the accuracy that matters here is not the
+        accuracy that matters for a grasp, and depth easily clears it: measured against
+        ground truth on a settled head, 7 mm and 5 mm in range, 20 mm and 16 mm
+        sideways, on a target with 250 mm of margin either side.
+
+        Publishing nothing when the bin is not in view is the point of the topic: the
+        delivery controller turns the robot until something arrives.
+        """
+        found = bd.detect_bin(frame)
+        if found is None:
+            return
+        if self.depth_image is None or self.intrinsics is None or not self.depth_frame:
+            return
+        point_optical = dl.locate(found.bbox, self.depth_image, self.intrinsics)
+        if point_optical is None:
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                GRASP_FRAME, self.depth_frame, rclpy.time.Time())
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                f"no transform {self.depth_frame} -> {GRASP_FRAME} for the bin: {exc}",
+                throttle_duration_sec=5.0)
+            return
+        point = dl.transform_point(
+            point_optical, tf.transform.rotation, tf.transform.translation)
+
+        msg = PointStamped()
+        msg.header.frame_id = GRASP_FRAME
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.point.x = float(point[0])
+        msg.point.y = float(point[1])
+        msg.point.z = float(BIN_RIM_BASE_Z)
+        self.pub_bin_point.publish(msg)
+
     def _process(self) -> None:
         if self.latest_frame is None:
             return
         frame = self.latest_frame
+
+        self._publish_bin_point(frame)
 
         try:
             books = bd.detect_books(frame)
