@@ -13,9 +13,16 @@ from rclpy.qos import (QoSProfile, QoSReliabilityPolicy,
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-TOPIC = '/head_front_camera/head_front_camera/color/image_raw'
-OUT = '/tmp/run.mp4'
+# Defaults to the spectator camera, because the head camera is a poor witness: it
+# stares at the shelf, so the arm enters from the side and barely appears, and it is
+# bolted to a base that wobbles, so the whole picture swings. A recording of it was
+# shown to someone who could only report a bookshelf, some books and camera shake --
+# a fair description, and no use at all.
+HEAD = '/head_front_camera/head_front_camera/color/image_raw'
+SPECTATOR = '/spectator/image'
 SECONDS = float(sys.argv[1]) if len(sys.argv) > 1 else 600.0
+TOPIC = sys.argv[2] if len(sys.argv) > 2 else SPECTATOR
+OUT = sys.argv[3] if len(sys.argv) > 3 else '/tmp/run.mp4'
 
 # Camera images are published best effort. A reliable subscription silently
 # receives nothing at all, which is exactly what it did: zero frames in 20 s.
