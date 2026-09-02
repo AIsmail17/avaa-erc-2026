@@ -142,6 +142,11 @@ class DeliverNode(Node):
         self.declare_parameter("drive_timeout_sec", 180.0)
         self.declare_parameter("obstacle_stop_m", 0.30)
         self.declare_parameter("auto_start", True)
+        # Empty means start as soon as the joints are known, which is how
+        # the delivery is exercised on its own. The mission sets it to
+        # "deliver" so that the drive cannot begin before there is a book
+        # in the gripper to drive anywhere with.
+        self.declare_parameter("start_phase", "")
         self.declare_parameter("hold_base_hz", 20.0)
         # The head angle while hunting for the bin, before there is a range to aim at.
         self.declare_parameter("search_tilt_rad", -0.30)
@@ -164,6 +169,8 @@ class DeliverNode(Node):
         self.obstacle_stop = float(self.get_parameter("obstacle_stop_m").value)
         self.search_tilt = float(self.get_parameter("search_tilt_rad").value)
         self.hold_base_hz = float(self.get_parameter("hold_base_hz").value)
+        self.start_phase = str(self.get_parameter("start_phase").value)
+        self.phase = ""
         self.carry_point = [float(v) for v in
                             self.get_parameter("carry_point").value]
 
@@ -190,6 +197,8 @@ class DeliverNode(Node):
         self.above_point = None
 
         self.create_subscription(PointStamped, TOPIC_BIN_POINT, self._on_bin, 10)
+        self.create_subscription(
+            String, "/avaa/mission/phase", self._on_phase, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
         self.create_subscription(LaserScan, TOPIC_SCAN, self._on_scan, SENSOR_QOS)
 
@@ -215,6 +224,9 @@ class DeliverNode(Node):
             "delivery ready — bin wanted dead ahead at %.2f m" % self.standoff)
 
     # ------------------------------------------------------------------ inputs
+
+    def _on_phase(self, msg: String) -> None:
+        self.phase = msg.data
 
     def _on_bin(self, msg: PointStamped) -> None:
         self.bin_points.append([msg.point.x, msg.point.y, msg.point.z])
@@ -412,6 +424,8 @@ class DeliverNode(Node):
 
     def _do_idle(self) -> None:
         if not bool(self.get_parameter("auto_start").value):
+            return
+        if self.start_phase and self.phase != self.start_phase:
             return
         if self._current_joints() is None:
             return

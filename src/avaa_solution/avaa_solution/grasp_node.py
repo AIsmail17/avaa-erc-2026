@@ -230,6 +230,14 @@ class GraspNode(Node):
         # seconds gives the contact solver time to push back instead.
         self.declare_parameter("gripper_time_sec", 6.0)
         self.declare_parameter("auto_start", True)
+        # Wait for the mission to say it is this controller's turn.
+        #
+        # Perception publishes a row and a book point as soon as the target book is in
+        # frame, which happens several metres out while the base is still driving. This
+        # controller starts on exactly those two facts, so left ungated it unfolds the
+        # arm into a shelf the robot has not reached. Empty means start as soon as the
+        # inputs are there, which is how every experiment runs it by hand.
+        self.declare_parameter("start_phase", "")
         # A Cartesian path that only gets part way is a blocked reach, not a failure to
         # follow one. Below this, the grasp is abandoned rather than half-attempted.
         self.declare_parameter("min_reach_fraction", 0.9)
@@ -412,6 +420,8 @@ class GraspNode(Node):
         self.leg = 0
         self.leg_target = None
         self.settle = float(self.get_parameter("settle_sec").value)
+        self.start_phase = str(self.get_parameter("start_phase").value)
+        self.phase = ""
         self.settled_at = None
 
         self.hold_base = bool(self.get_parameter("hold_base").value)
@@ -474,6 +484,8 @@ class GraspNode(Node):
         self.motion_label = ""
 
         self.create_subscription(Int32, TOPIC_TARGET_ROW, self._on_row, 10)
+        self.create_subscription(
+            String, "/avaa/mission/phase", self._on_phase, 10)
         self.create_subscription(PointStamped, TOPIC_BOOK_POINT, self._on_book, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
         self.pub_gripper = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
@@ -498,6 +510,9 @@ class GraspNode(Node):
             "grasp ready — rows top-down, heights %s" % self.row_heights)
 
     # ------------------------------------------------------------------ inputs
+
+    def _on_phase(self, msg: String) -> None:
+        self.phase = msg.data
 
     def _on_row(self, msg: Int32) -> None:
         self.row = int(msg.data)
@@ -1200,6 +1215,8 @@ class GraspNode(Node):
 
     def _do_idle(self) -> None:
         if not bool(self.get_parameter("auto_start").value):
+            return
+        if self.start_phase and self.phase != self.start_phase:
             return
         if self.row is None or self.book is None:
             return

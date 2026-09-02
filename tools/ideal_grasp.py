@@ -105,7 +105,7 @@ RIGHT_TUCK = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
 TUCK_TORSO = 0.15
 
 
-def tuck_the_arms(node):
+def tuck_the_arms(node, state):
     """Fold the arm in before starting, the way the real approach does.
 
     Without this the fixture starts from whatever pose the robot spawned in, which is not
@@ -148,12 +148,51 @@ def tuck_the_arms(node):
         pub.publish(traj)
     print("tucking both arms before the grasp...", flush=True)
 
-    # The simulation runs below real time, so a 20 s trajectory needs more than 20 s of
-    # wall clock to finish. At the measured 0.7 real time factor this is about 32 s of
-    # simulated time, which is enough with room to spare.
-    end = time.time() + 46
+    # Wait for the arm to ARRIVE, not for a stopwatch.
+    #
+    # This used to wait 46 seconds of wall clock for a 20 second trajectory, on the
+    # reasoning that the simulator runs at a real-time factor of about 0.7 so the
+    # trajectory needs about 30 seconds of wall clock. The factor is not 0.7. Measured
+    # with tools/rtf.py, a freshly launched instance manages 0.59 and the same instance
+    # after twenty minutes of experiments manages 0.013, and anywhere below about 0.45
+    # the wait expires with the arm still halfway. It then started the grasp with the
+    # arm stretched a metre out in front of the robot, every candidate pre-grasp posture
+    # came back in collision, and the run was recorded as a grasp failure. It was a
+    # fixture failure, and it would have been recorded as a grasp failure every time the
+    # simulator was tired.
+    #
+    # Waiting on the joints themselves needs no estimate of anything.
+    wanted = dict(zip(["arm_left_%d_joint" % i for i in range(1, 8)], TUCK_POSE))
+    wanted.update(zip(["arm_right_%d_joint" % i for i in range(1, 8)], RIGHT_TUCK))
+    wanted["torso_lift_joint"] = TUCK_TORSO
+
+    def worst():
+        message = state.get("joints")
+        if message is None:
+            return None
+        seen = dict(zip(message.name, message.position))
+        gaps = [abs(seen[name] - value)
+                for name, value in wanted.items() if name in seen]
+        return max(gaps) if len(gaps) == len(wanted) else None
+
+    end = time.time() + 300
+    settled = 0
     while time.time() < end:
         rclpy.spin_once(node, timeout_sec=0.1)
+        gap = worst()
+        if gap is None:
+            continue
+        if gap < 0.05:
+            settled += 1
+            if settled > 20:
+                print("tucked, worst joint %.3f rad out" % gap, flush=True)
+                return
+        else:
+            settled = 0
+    gap = worst()
+    print("WARNING: the tuck did not finish -- worst joint %s rad out. Anything the "
+          "grasp does from here is measuring the fixture."
+          % ("unknown" if gap is None else "%.3f" % gap), flush=True)
 
 
 def run_grasp(depth=None):
@@ -215,7 +254,7 @@ def main():
     node.create_subscription(String, "/avaa/grasp/state",
                              lambda m: state.__setitem__("grasp", m.data), 10)
 
-    tuck_the_arms(node)
+    tuck_the_arms(node, state)
 
     # Take the "before" pose after the tuck, not before it.
     #
