@@ -234,6 +234,11 @@ class ApproachNode(Node):
         # How long to stand squared with no acceptable fix before giving
         # up on the anchor and sweeping for the marker again.
         self.declare_parameter("nofix_grace_sec", 20.0)
+        # The closest the robot will drive without a 3D fix on the book.
+        # Far enough out that all four rows are still in the camera's
+        # reach, so a target it cannot see is a target it can back away
+        # from rather than one it is stuck in front of.
+        self.declare_parameter("blind_floor_m", 1.60)
         self.declare_parameter("row_heights", DEFAULT_ROW_HEIGHTS)
         # Where to pause and confirm the book before committing to the final drive.
         #
@@ -274,6 +279,7 @@ class ApproachNode(Node):
         self.lateral_tol = float(
             self.get_parameter("lateral_tolerance_m").value)
         self.nofix_grace = float(self.get_parameter("nofix_grace_sec").value)
+        self.blind_floor = float(self.get_parameter("blind_floor_m").value)
         self.nofix_since: Optional[float] = None
         self.lost_since: Optional[float] = None
         self.unsquared_since: Optional[float] = None
@@ -313,6 +319,8 @@ class ApproachNode(Node):
         # Set once the book has actually been located in 3D, which is the signal that it
         # is genuinely visible rather than merely expected to be.
         self.book_point_at: Optional[float] = None
+        self.book_seen_at: Optional[float] = None
+        self.book_live = None
         self.book_x: Optional[float] = None
         self.approach_target = self.acquire_range
         # Retry budget for losing the book on the final drive.
@@ -613,11 +621,25 @@ class ApproachNode(Node):
         # Safety floor applies in every moving state.
         nearest = self._min_range_ahead()
         if nearest is not None and nearest < self.min_safe and self.state is State.APPROACH:
+            # Back away, do not hand this to the squaring.
+            #
+            # It used to enter SQUARE, and SQUARE cannot work from here: fitting a line
+            # to the shelf face needs enough of the face in view, and half a metre from
+            # it the scan is dominated by whatever single board or upright triggered the
+            # stop. Measured on the run that found this, the safety floor tripped at
+            # 0.54 m with the book's own fix putting it 1.11 m away, SQUARE reported "no
+            # flat face to square against" four times, and the approach gave up --
+            # ending a run that was otherwise going well, half a metre from a shelf it
+            # had tracked correctly the whole way in.
+            #
+            # RETREAT already exists for exactly this and hands back to ACQUIRE, which
+            # can re-measure and come in again on a range it trusts.
             self.get_logger().warn(
-                f"safety stop: obstacle at {nearest:.2f} m < {self.min_safe:.2f} m"
-            )
+                "safety stop: something at %.2f m, closer than the %.2f m floor; "
+                "backing off rather than trying to square from here"
+                % (nearest, self.min_safe))
             self._stop()
-            self._enter(State.SQUARE)
+            self._enter(State.RETREAT)
             return
 
         if self.state is State.TUCK:
@@ -755,11 +777,29 @@ class ApproachNode(Node):
         )
 
     def _on_book_point(self, msg: PointStamped) -> None:
+        """Record a sighting, keeping "seen" and "believed" apart.
+
+        These were one thing and they are not the same thing, and merging them starved
+        every state that asks whether the book is visible. book_point_at was set only
+        when the anchor ACCEPTED a sighting, so _book_located -- which reads as "the
+        book is in view" and is used that way in four places -- actually meant "the
+        anchor agrees with this". Before the anchor has formed it needs eight agreeing
+        candidates, and while it is forming it accepts nothing, so perception could be
+        publishing the book on every frame while the approach reported no fix and
+        eventually gave up "rather than grasping blind". It was not blind.
+
+        So: seen on every sighting, believed only when the anchor accepts. The states
+        that need a trusted target position still ask for one through _target_in_base;
+        the states that only need to know whether perception can see the book now get an
+        honest answer.
+        """
         point = np.array([msg.point.x, msg.point.y, msg.point.z])
+        self.book_seen_at = self._now()
+        self.book_x = float(point[0])
+        self.book_live = point
         if not self._accept_sighting(point, msg.header.frame_id):
             return
         self.book_point_at = self._now()
-        self.book_x = float(point[0])
 
     def _lookup(self, target_frame: str, source_frame: str):
         try:
@@ -884,10 +924,32 @@ class ApproachNode(Node):
         """
         if self._book_located() and self.book_x is not None:
             return self.book_x
-        return self._range_ahead()
+        # The NEAREST return in a wide cone, not the median of a narrow one.
+        #
+        # _range_ahead takes the median over 0.12 rad, and a narrow cone aimed at a
+        # shelf OPENING reads straight through to the back panel: it overstates the
+        # distance to the face by about the shelf's depth, which the mesh puts at 0.35 m.
+        # The drive to the acquire checkpoint then overshoots by that much, and on the
+        # top row that is the difference between seeing the book and not -- at 0.51 m the
+        # camera cannot tilt far enough up to find it, and with no sighting there is no
+        # fix, and with no fix nothing can drive the robot back out.
+        #
+        # The minimum over a wider cone measures the shelf's uprights and edges, which
+        # are at the face. A spurious short return now stops the approach early rather
+        # than late, and early is recoverable.
+        return self._min_range_ahead()
 
     def _book_located(self, max_age: float = 1.5) -> bool:
-        """Whether the book is currently being located in 3D, not merely expected."""
+        """Whether perception can currently see the book in 3D.
+
+        Deliberately the SEEN timestamp, not the accepted one. See _on_book_point.
+        """
+        if self.book_seen_at is None:
+            return False
+        return (self._now() - self.book_seen_at) <= max_age
+
+    def _book_trusted(self, max_age: float = 1.5) -> bool:
+        """Whether there is an anchored fix on the book, not merely a sighting."""
         if self.book_point_at is None:
             return False
         return (self._now() - self.book_point_at) <= max_age
@@ -994,6 +1056,15 @@ class ApproachNode(Node):
             return
         cmd = Twist()
         cmd.linear.x = -0.12
+        # Hold the heading while reversing. Commanding linear velocity alone on this
+        # base is how the acquire back-off arrived side-on to the shelf at -95 degrees:
+        # there is no friction across the roller axis, so whatever rotation the robot
+        # has it keeps, and reversing blind for twenty seconds is long enough to lose
+        # the shelf entirely. Square against it if it can be seen; otherwise damp the
+        # rate, which needs nothing but odometry.
+        angle = self._shelf_angle()
+        cmd.angular.z = (self._turn(-angle, 0.8) if angle is not None
+                         else self._turn(0.0, 0.0, floor=0.0))
         self.pub_cmd.publish(cmd)
 
     def _do_acquire(self) -> None:
@@ -1243,9 +1314,26 @@ class ApproachNode(Node):
         it cannot know when to stop; the book point is measured to 15-35 mm in x against
         ground truth and carries the lateral offset directly.
         """
-        target = self._target_in_base()
-        if target is None or not self._book_located():
+        # The anchored fix if there is one, the live sighting if there is not.
+        #
+        # Requiring the anchor made this return None for the whole state whenever the
+        # anchor had not yet formed -- it needs eight agreeing candidates and accepts
+        # nothing while it is collecting them -- so the pose controller had nowhere to
+        # drive at exactly the moment it was needed, and the approach stood squared and
+        # reporting no fix while perception published the book on every frame.
+        #
+        # The live sighting is a measurement of the thing itself, good to 15-35 mm in x
+        # against ground truth, and perception now follows the same book from frame to
+        # frame rather than whichever is nearest the middle of the picture. The anchor is
+        # still preferred where it exists, because it averages several sightings; it is
+        # no longer a precondition for moving at all.
+        if not self._book_located():
             return None
+        target = self._target_in_base()
+        if target is None:
+            if self.book_live is None:
+                return None
+            target = self.book_live
         # The ACQUIRE range, not the final standoff. This is the checkpoint where the
         # whole column still fits in frame so the row can be read and the book found;
         # driving to the grasping standoff from here closes the distance before the
@@ -1320,8 +1408,43 @@ class ApproachNode(Node):
         # Keep the target row in frame as the gap closes.
         self._aim_head()
 
+        # Do not close past this without having actually seen the book.
+        #
+        # Driving in on the LiDAR alone is how the robot cornered itself: it arrived
+        # where the target row was out of the camera's reach, and every state after that
+        # needed a sighting it could no longer get. Holding here instead costs time and
+        # nothing else -- the head is still aimed at the row, perception is still
+        # looking, and the moment a fix arrives the drive resumes with a range it can
+        # trust.
+        if not self._book_located() and ahead < self.blind_floor:
+            self._stop()
+            self.get_logger().warn(
+                "holding at %.2f m: the book has not been seen and driving closer on "
+                "the LiDAR alone is how the view gets lost" % ahead,
+                throttle_duration_sec=5.0)
+            return
+
         cmd = Twist()
         cmd.linear.x = min(self.max_fwd, max(0.05, 0.5 * remaining))
+
+        # Hold square to the shelf all the way in.
+        #
+        # This state drove forward and strafed sideways and never once commanded a yaw,
+        # on the reasoning that strafing keeps the heading square by itself. It does not
+        # on this base: there is no friction across the roller axis, so any rotation the
+        # robot picks up it keeps, and a metre of driving is long enough to accumulate a
+        # lot of it. Measured on the run that found this, the approach reached the
+        # standoff 38.9 degrees off square, and at that angle the head camera is looking
+        # along the shelf rather than at it -- so the book left the frame, the squaring
+        # could not fit a face either, and the run ended with the target in plain view
+        # of nothing.
+        #
+        # This is the third state in this file to need the same thing. Any state that
+        # commands motion on this base has to hold the heading too; the base will not
+        # do it for us.
+        face = self._shelf_angle()
+        cmd.angular.z = (self._turn(-face, 0.8, floor=0.0) if face is not None
+                         else self._turn(0.0, 0.0, floor=0.0))
 
         # Correct sideways, not by turning.
         #
@@ -1385,9 +1508,41 @@ class ApproachNode(Node):
                     throttle_duration_sec=2.0)
                 return
             if self.retreats >= self.max_retreats:
+                # Out of retreats. Whether that ends the run depends on whether there
+                # is anything better to go on than this line fit.
+                #
+                # The refusal above is right when the base's heading is unknown: the
+                # grasp reaches along base x, so an unsquared base aims the hand across
+                # the book faces. But the heading is no longer unknown. The acquire
+                # state drives to a POSE with a pose controller, and arriving square is
+                # what that controller is for; the grasp then re-aims from perception
+                # and closes the last centimetres on a servo. So a noisy line fit is no
+                # longer the only thing standing between the arm and the book.
+                #
+                # And this was ending runs that were going well. Measured: the approach
+                # tracked the book correctly the whole way in, reached the standoff,
+                # read the face at -20.7 degrees, lost the fit, and failed at 94.7 s
+                # with a good fix on the book in hand. The scan at the standoff is
+                # dominated by the shelf's own openings -- the beam reads through the
+                # unstocked bottom shelf to the back panel, so the returns are a mix of
+                # front edges and back panel and no line fits them.
+                #
+                # So: proceed if the book is located, which means perception can see
+                # the target and the grasp will re-aim at it anyway. Refuse only when
+                # blind, which is the case the original reasoning was about.
+                if self._book_located():
+                    self.get_logger().warn(
+                        "no flat face after %d retreat(s), but the book is in view; "
+                        "going on to verify and letting the grasp re-aim, rather than "
+                        "ending a run over a line fit"
+                        % self.retreats)
+                    self.square_lost_since = None
+                    self._enter(State.VERIFY)
+                    return
                 self.get_logger().error(
-                    "still no flat face after %d retreat(s); giving up rather "
-                    "than grasping unsquared" % self.retreats)
+                    "still no flat face after %d retreat(s) and no fix on the book; "
+                    "giving up rather than grasping blind and unsquared"
+                    % self.retreats)
                 self._enter(State.FAILED)
                 return
             self.retreats += 1
