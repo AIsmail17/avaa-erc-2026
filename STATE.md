@@ -153,16 +153,29 @@ not the state the grasp inherits — the approach hands over having just been dr
 Over a 100 s grasp this is 700 mm of travel and 55 degrees of turn, which is enough on
 its own to explain every grasp failure recorded here.
 
+**The base does strafe.** Worth stating because the lateral command saturating for a
+whole approach looks exactly like a strafe that does nothing, and `mu2 = 0` across the
+roller axis makes that plausible. `tools/strafecheck.py`, per simulated second against
+Gazebo: commanded ±0.100 m/s sideways it went 0.080 and −0.081, against forward and
+backward trials at 0.077 and −0.084. Between 78 and 85 per cent in all four directions,
+no meaningful cross-coupling.
+
 **What can and cannot see it:**
 
 | sensor | verdict |
 |---|---|
 | odom, translation | blind — a wheel that is not turning reports nothing |
-| odom, rotation | **also blind.** `tools/spinhold.py`: driving against odom's yaw rate gives 0.524, 0.481, 0.436 deg/s at gains 0.5, 1.0, 2.0 against 0.551 for a zero twist. 23% at a gain of 2, where a sensor that could see it would have over-corrected |
-| the book alone | **not enough.** `tools/bookcoast.py` fitted 61.9 and −76.9 mm/s against a true 6.0 and −6.0, and driving on it made the drift worse, 8.5 → 22.3 mm/s. `dp/dt = −v − w × p`, so at 0.8 m the rotation swamps the translation |
+| odom, rotation | **accurate for commanded turns**, and an earlier claim here that it was blind was wrong. `tools/turncheck.py`: commanded 0.15, 0.30, 0.45 rad/s → odom 0.142, 0.270, 0.407 against a true 0.142, 0.235, 0.356. The claim came from `tools/spinhold.py` subscribed to `/mobile_base_controller/odom`, **which does not exist on this robot** — the only odometry topic is `/odom` — so it drove against a variable still holding its initial zero. Feeding the rate back still does not cancel the residual rotation (0.657–0.814 deg/s at gains 0.5–2.0 against 0.646 for a zero twist), but that is a different statement |
+| the book alone | **not enough.** `tools/bookcoast.py` fitted 61.9 and −76.9 mm/s against a true 6.0 and −6.0, and driving on it made the drift worse, 8.5 → 22.3 mm/s. `dp/dt = −v − w × p`, so at 0.8 m the rotation swamps the translation. The rotation-corrected version of that tool was never actually tested — it read the non-existent odom topic above |
 | the depth camera | the only instrument left, and the one the shelf-plane fit already uses |
 
-**Cancelling it works, once it is measured.** `tools/stopcoast.py`, taking the slide
+**Uncommanded ROTATION is not reliably measured yet.** `tools/spinhold.py` cannot
+measure it: each of its windows inherits the velocity the previous one left, and a base
+that coasts has no way to settle in between, so it reports anything from 0.06 to
+0.81 deg/s across conditions that ought to be comparable. The translational figures
+above do not have this problem — they used one condition throughout and agree to 0.98.
+
+**Cancelling the translation works, once it is measured.** `tools/stopcoast.py`, taking the slide
 from Gazebo: 7.07 mm/s coasting, 3.39 at a gain of 1, 2.02 at a gain of 2, overshooting
 back to 4.82 at 4. The wheels can do it. The problem is entirely one of measurement.
 

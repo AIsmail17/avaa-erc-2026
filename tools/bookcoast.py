@@ -16,9 +16,17 @@ driving on that took the drift from 8.5 mm/s to 22.3. The base ROTATES as well a
 slides, and a rotation moves a point at 0.8 m far more than a slide does -- the terms are
 w*py and w*px, so at the ranges here the turning swamps the sliding.
 
-Odom can supply the missing half. It is blind to a slide, which is the whole problem with
-it and why nothing else here trusts it, but turning is the one thing that genuinely
-rotates these wheels, so its yaw rate is good. For a point fixed in the world, seen from
+Odom can supply the missing half. It is blind to a slide, which is the whole problem
+with it and why nothing else here trusts it, but its yaw rate is good -- commanded 0.15,
+0.30 and 0.45 rad/s, it reported 0.142, 0.270 and 0.407 against a true 0.142, 0.235 and
+0.356 (tools/turncheck.py).
+
+The second version of this tool did not actually test that, and the reason is worth
+knowing: it subscribed to "/mobile_base_controller/odom", which does not exist here. The
+only odometry topic is "/odom". So the rotation term was always zero and the corrected
+version was arithmetically identical to the uncorrected one. A subscription to a topic
+nobody publishes does not fail; it quietly reports whatever the variable was initialised
+to. For a point fixed in the world, seen from
 a base moving at v and turning at w,
 
     dp/dt = -v - w x p        so    vx = -dpx/dt + w*py
@@ -46,7 +54,7 @@ from geometry_msgs.msg import PointStamped, Twist
 from nav_msgs.msg import Odometry
 
 BOOK = "/avaa/perception/target_book_point"
-ODOM = "/mobile_base_controller/odom"
+ODOM = "/odom"
 MAX_SPEED = 0.06
 # A coast is a few millimetres a second. An estimate an order of magnitude above that
 # is not a coast, it is a bad fit, and driving on one is worse than doing nothing.

@@ -173,6 +173,33 @@ TUCK_TORSO = 0.10
 RIGHT_TUCK = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
 
 
+def turn_for(error_rad: float, period: float, share: float = 0.5,
+             fastest: float = 0.45, slowest_period: float = 0.25) -> float:
+    """Pick a turn rate from how often the bearing that steers it actually arrives.
+
+    A turn controller may not move further between two measurements than the error it
+    is correcting, and this one did. The bearing comes from perception, and perception
+    processes a frame about every two SIMULATED seconds -- watched in the approach's own
+    log, where the reported bearing changed at 468255, 468257 and 468259 and then held
+    the same value for the next sample. Turning at the 0.45 rad/s the gain saturated to
+    sweeps 0.9 rad in that gap. The head camera sees about 1.0 rad in total.
+
+    So the base swung most of its field of view between one look and the next, the
+    marker left the frame, and the state stood with no bearing at all until its
+    out-of-view timeout fired twelve seconds later. Three cycles of that in one run, and
+    the pixel error logged as unchanged each time because the log and the sensor were
+    both slower than the motion.
+
+    A fixed gain cannot fix this, because the period is not a constant of the system:
+    the real-time factor in this project has been measured between 0.013 and 0.60, a
+    span of forty-five, and the frame rate goes with it. The rate has to come from the
+    period. Take ``share`` of the error per measurement, so the turn converges
+    geometrically rather than overshooting, and never move faster than ``fastest``.
+    """
+    period = max(period, slowest_period)
+    return float(max(-fastest, min(fastest, share * error_rad / period)))
+
+
 def sighting_gate(allowance: float, speed: float, gap: float,
                   longest: float = 1.5) -> float:
     """How far the book may honestly have moved in base_link since the last sighting.
@@ -324,6 +351,15 @@ class ApproachNode(Node):
         self.unsquared_since: Optional[float] = None
         self.search_timeout = float(self.get_parameter("search_timeout_sec").value)
         self.image_width = int(self.get_parameter("image_width_px").value)
+        # The head camera's horizontal focal length in pixels, for turning a bearing
+        # in pixels into one in radians. Read from CameraInfo at startup; this is the
+        # measured value from the depth stream and is only the fallback.
+        self.focal_px = 337.2
+        # How often the steering bearing actually arrives, in simulated seconds,
+        # measured rather than assumed. See turn_for.
+        self.bearing_period = 1.0
+        self.bearing_last_at = None
+        self.bearing_last_value = None
         self.tuck_time = float(self.get_parameter("tuck_time_sec").value)
 
         self.column_cx: Optional[float] = None
@@ -1484,6 +1520,28 @@ class ApproachNode(Node):
         # with perception reporting no red book in view for the rest of the state.
         return (float(target[0]) - self.acquire_range, float(target[1]))
 
+    def _note_bearing(self, value: float) -> None:
+        """Track how often a NEW bearing arrives, which sets how fast we may turn.
+
+        New, not merely republished: the same number arriving twice says the camera has
+        not looked again, and turning on it is turning blind.
+        """
+        now = self._now()
+        if self.bearing_last_value is None or value != self.bearing_last_value:
+            if self.bearing_last_at is not None:
+                gap = now - self.bearing_last_at
+                if 0.0 < gap < 10.0:
+                    # Slow to trust a fast frame, quick to believe a slow one: an
+                    # over-estimate of the rate is what caused the problem.
+                    self.bearing_period = (max(gap, self.bearing_period)
+                                           if gap > self.bearing_period
+                                           else 0.7 * self.bearing_period + 0.3 * gap)
+            self.bearing_last_at = now
+            self.bearing_last_value = value
+
+    def _bearing_rad(self, error_px: float) -> float:
+        return math.atan2(error_px, self.focal_px)
+
     def _do_centre(self) -> None:
         column_cx = self._column_cx_fresh()
         if column_cx is None:
@@ -1523,12 +1581,24 @@ class ApproachNode(Node):
             self._enter(State.APPROACH)
             return
         # Positive error means the column is right of centre, so turn clockwise.
+        #
+        # The rate comes from how often the bearing arrives, not from a fixed gain on
+        # the pixel error. See turn_for: at the 0.45 rad/s the old gain saturated to,
+        # with a bearing that updates about every two simulated seconds, the base swept
+        # most of its field of view between one look and the next and lost the marker
+        # three times in a single run.
+        self._note_bearing(column_cx)
         cmd = Twist()
-        cmd.angular.z = self._turn(-error_px, 0.004)
+        wanted = turn_for(-self._bearing_rad(error_px), self.bearing_period,
+                          fastest=self.max_yaw)
+        cmd.angular.z = float(max(-self.max_yaw, min(
+            self.max_yaw, wanted - self.turn_damping * self.yaw_rate)))
         self.pub_cmd.publish(cmd)
         self.get_logger().info(
-            "centring: %+.0f px off, turning at %+.2f rad/s (base already turning "
-            "%+.2f)" % (error_px, cmd.angular.z, self.yaw_rate),
+            "centring: %+.0f px off (%.0f deg), turning at %+.2f rad/s for a bearing "
+            "that arrives every %.1f s (base already turning %+.2f)"
+            % (error_px, math.degrees(self._bearing_rad(error_px)), cmd.angular.z,
+               self.bearing_period, self.yaw_rate),
             throttle_duration_sec=3.0)
 
     def _do_approach(self) -> None:

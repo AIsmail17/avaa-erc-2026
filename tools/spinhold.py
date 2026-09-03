@@ -9,10 +9,26 @@ second of unwanted spin looks like 7 mm/s of the book sliding across the frame -
 same order as the whole translational coast, and it is why an estimate of that coast
 built on the book alone came out ten times too large.
 
-Odom is the right sensor for this one. It cannot see a slide, which is why nothing else
-here trusts it, but turning genuinely rotates these wheels, so its yaw rate is real. The
-approach already damps its own turns against it; the base hold does not, and publishes a
-plain zero twist that the wheels have no friction to enforce.
+Odom's yaw rate is real, and tools/turncheck.py is the check: commanded 0.15, 0.30 and
+0.45 rad/s, odom reported 0.142, 0.270 and 0.407 while Gazebo measured 0.142, 0.235 and
+0.356. It agrees on commanded turns.
+
+READ THE RESULTS OF THIS TOOL WITH CARE. Its first version subscribed to
+"/mobile_base_controller/odom", which does not exist on this robot -- the only odometry
+topic is "/odom" -- so it read the initial value of its own variable, zero, and drove
+against nothing. It reported a 23 per cent improvement at a gain of 2, which was noise,
+and that number went into a commit message as evidence that odom cannot see rotation. It
+can.
+
+Corrected, the answer is that driving against it makes the turn WORSE: 0.060 deg per
+simulated second with nothing commanded, 0.646 with a zero twist, then 0.657, 0.795 and
+0.814 at gains of 0.5, 1.0 and 2.0. And those numbers should not be trusted far either,
+because this tool has a flaw it cannot fix: each window inherits whatever velocity the
+previous one left, and a base that coasts has no way to settle between them. A spread of
+0.06 to 0.81 across conditions that ought to be comparable is that flaw, not a finding.
+
+What can be said is narrow and worth keeping: odom's yaw rate is accurate for commanded
+turns, and cancelling this rotation is not simply a matter of feeding it back.
 
 Measured against Gazebo, per SIMULATED second, so the answer is about the robot rather
 than about how long the instance has been up.
@@ -26,7 +42,7 @@ import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 
-ODOM = "/mobile_base_controller/odom"
+ODOM = "/odom"
 MAX_RATE = 0.35
 
 
