@@ -151,7 +151,22 @@ class DeliverNode(Node):
         # The head angle while hunting for the bin, before there is a range to aim at.
         self.declare_parameter("search_tilt_rad", -0.30)
         self.declare_parameter("carry_point", [0.34, 0.10, 1.00])
+        # Holding the base against the bin. Gentle: the coast is 8 mm/s, so there is
+        # nothing here that needs a fast loop, and the book is hanging from an arm that
+        # every base movement swings.
+        self.declare_parameter("hold_gain", 1.5)
+        self.declare_parameter("hold_max_speed_m_s", 0.040)
+        self.declare_parameter("hold_deadband_m", 0.015)
+        # Past this the reading is disbelieved rather than driven on.
+        self.declare_parameter("hold_limit_m", 0.25)
 
+        self.hold_gain = float(self.get_parameter("hold_gain").value)
+        self.hold_max_speed = float(
+            self.get_parameter("hold_max_speed_m_s").value)
+        self.hold_deadband = float(self.get_parameter("hold_deadband_m").value)
+        self.hold_limit = float(self.get_parameter("hold_limit_m").value)
+        self.hold_ref = None
+        self.hold_last = None
         self.standoff = float(self.get_parameter("standoff_m").value)
         self.standoff_tol = float(self.get_parameter("standoff_tol_m").value)
         self.bearing_tol = float(self.get_parameter("bearing_tol_rad").value)
@@ -395,17 +410,71 @@ class DeliverNode(Node):
     # ------------------------------------------------------------------ states
 
     def _hold_base(self) -> None:
-        """Ask the wheels to stand still while the arm works.
+        """Hold the base against the bin, because a zero twist does not hold anything.
 
-        Silence on /cmd_vel is not an instruction to stay put, and the difference is
-        large. Measured against Gazebo per simulated second with the arm swinging,
-        9.8 mm/s and 0.88 deg/s uncommanded against 2.1 mm/s and 0.43 deg/s with a zero
-        twist at 20 Hz. Only in the states where this node is not itself driving --
-        SEEK and DRIVE publish their own commands and must not be argued with.
+        What used to be here published a zero twist and cited a measurement that has
+        since been re-taken and did not survive it. The old figures had a zero twist at
+        20 Hz cutting drift from 9.8 mm/s to 2.1 and from 0.88 deg/s to 0.43. Measured
+        again across four conditions (tools/drift.py, tools/coast.py), it does nothing
+        at all: 7.72 mm per simulated second against 8.01 with nothing commanded, 0.551
+        deg/s against 0.567. What the old table caught was a base that had been standing
+        long enough to shed its velocity, which is not the state this node inherits --
+        it takes over from a drive.
+
+        The base coasts. Eight consecutive windows at 6.8 to 8.7 mm/s on one heading,
+        agreement 0.98 of 1.0, because mu2 is 0 across the roller axis so nothing damps
+        a slide, and commanding zero wheel speed asks the wheels not to turn rather than
+        asking the base to stop. Over the forty seconds this node spends holding the
+        book over the bin, that is a third of a metre, and the bin mouth is not a third
+        of a metre wide.
+
+        So it holds against the thing it is aiming at, the same way the grasp holds
+        against the book: remember where the bin was when the placement was planned, and
+        drive to put it back there. Perception locates the bin to about 20 mm, which is
+        well inside what this needs.
+
+        Only in the states where this node is not itself driving -- SEEK and DRIVE
+        publish their own commands and must not be argued with.
         """
         if self.state in (State.SEEK, State.DRIVE, State.IDLE):
             return
-        self.pub_cmd.publish(Twist())
+        self.pub_cmd.publish(self._hold_command())
+
+    def _hold_command(self) -> Twist:
+        """Work out the correction, holding the last one if the bin is out of sight."""
+        twist = Twist()
+        target = self._bin_now()
+        if target is not None and self.hold_ref is not None:
+            error = np.asarray(target, dtype=float)[:2] - self.hold_ref
+            if float(np.linalg.norm(error)) <= self.hold_limit:
+                for index, value in enumerate(error):
+                    if abs(value) <= self.hold_deadband:
+                        continue
+                    speed = float(np.clip(self.hold_gain * value,
+                                          -self.hold_max_speed, self.hold_max_speed))
+                    if index == 0:
+                        twist.linear.x = speed
+                    else:
+                        twist.linear.y = speed
+
+        if twist.linear.x or twist.linear.y:
+            self.hold_last = twist
+            return twist
+        # A coast is a constant velocity, so when the arm is over the bin and in the
+        # way of the camera, the last correction for it is still the right one.
+        if target is None and self.hold_last is not None:
+            return self.hold_last
+        return twist
+
+    def _start_holding(self) -> None:
+        """Remember where the bin was, so the base can be held against it."""
+        target = self._bin_now()
+        if target is not None:
+            self.hold_ref = np.asarray(target, dtype=float)[:2].copy()
+            self.hold_last = None
+            self.get_logger().info(
+                "holding the base against the bin at %s"
+                % np.round(self.hold_ref, 3).tolist())
 
     def _tick(self) -> None:
         self.pub_state.publish(String(data=self.state.value))
@@ -550,6 +619,7 @@ class DeliverNode(Node):
         above = np.array([float(target[0]), float(target[1]),
                           rim + BOOK_BELOW_GRIP + self.rim_clearance])
         self.above_point = above
+        self._start_holding()
         path = self._straight(start, here, above, steps=6)
         if path is None:
             self.get_logger().error(

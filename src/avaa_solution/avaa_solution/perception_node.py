@@ -230,10 +230,14 @@ class PerceptionNode(Node):
     def _track_book_without_marker(self, frame, books: List[bd.Book]) -> None:
         """Keep publishing the target book once the marker is out of frame.
 
-        Only valid after the column and row have been established, which is why it does
-        nothing until then. Of the target-coloured books in view, it takes the one nearest
-        the image centre: the robot has already centred and driven in on the target
-        column, so the closest to centre is the one in front of it.
+        Only valid after the column and row have been established, AND after the marker
+        has identified which book is the target at least once. Both are required and
+        only the first used to be checked.
+
+        What this can do is follow a book it already knows. What it cannot do is pick
+        one out of several: the marker is the only thing that says which of five
+        same-coloured books belongs to the target column, and once it has left the frame
+        there is nothing in the picture that distinguishes them.
         """
         if self.reported_row is None or not self.book_colour:
             return
@@ -260,23 +264,43 @@ class PerceptionNode(Node):
         # across a column. So the candidate nearest where the target was last seen is
         # the target, and if nothing is near enough, the honest answer is that the book
         # has been lost rather than that some other book will do.
-        centre = frame.shape[1] / 2.0
-        if self.last_book_cx is not None:
-            target = min(candidates, key=lambda b: abs(b.cx - self.last_book_cx))
-            jump = abs(target.cx - self.last_book_cx)
-            if jump > self.book_jump_px:
-                # Say so, but still publish. Going silent here starved the approach of
-                # the 3D fix it drives to and left it squaring at the shelf for its whole
-                # timeout: the head tilts and the base slides between one processed frame
-                # and the next, so a large jump is common and is not proof of the wrong
-                # book. Preferring the nearest to where the target was IS the fix; the
-                # threshold is only worth a warning.
-                self.get_logger().warn(
-                    "the %s book jumped %.0f px since the last frame; still the nearest "
-                    "to where the target was, so following it"
-                    % (self.book_colour, jump), throttle_duration_sec=5.0)
-        else:
-            target = min(candidates, key=lambda b: abs(b.cx - centre))
+        if self.last_book_cx is None:
+            # The marker has never identified a book, so there is nothing here to
+            # recognise the target BY, and nearest-the-centre is a guess.
+            #
+            # The comment below already says what that guess costs, and the range gate
+            # further down was written to stop it -- but it gates the steering BEARING
+            # only, and the approach does not navigate on the bearing. It navigates on
+            # the 3D point, which was published from any range at all.
+            #
+            # Measured on the run that found this: from 2.92 m out, with the robot
+            # centred on its marker to 5.5 px, this published a book 1.37 m to the
+            # side. The approach fixed its target on it, drove sideways with its
+            # lateral command saturated for the whole run, ended up between two
+            # columns, and went back to searching. The bearing gate never fired,
+            # because the bearing was never the problem.
+            #
+            # Silence is the honest answer. The approach stops and looks again, which
+            # is what it is for.
+            self.get_logger().warn(
+                "%d %s book(s) in view but the marker has not identified which is the "
+                "target; not offering a fix on a guess"
+                % (len(candidates), self.book_colour),
+                throttle_duration_sec=5.0)
+            return
+        target = min(candidates, key=lambda b: abs(b.cx - self.last_book_cx))
+        jump = abs(target.cx - self.last_book_cx)
+        if jump > self.book_jump_px:
+            # Say so, but still publish. Going silent here starved the approach of
+            # the 3D fix it drives to and left it squaring at the shelf for its whole
+            # timeout: the head tilts and the base slides between one processed frame
+            # and the next, so a large jump is common and is not proof of the wrong
+            # book. Preferring the nearest to where the target was IS the fix; the
+            # threshold is only worth a warning.
+            self.get_logger().warn(
+                "the %s book jumped %.0f px since the last frame; still the nearest "
+                "to where the target was, so following it"
+                % (self.book_colour, jump), throttle_duration_sec=5.0)
         self.last_book_cx = float(target.cx)
         self.pub_row.publish(Int32(data=self.reported_row))
         self._publish_book_point(target)

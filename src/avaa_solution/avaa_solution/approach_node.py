@@ -173,6 +173,35 @@ TUCK_TORSO = 0.10
 RIGHT_TUCK = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
 
 
+def sighting_gate(allowance: float, speed: float, gap: float,
+                  longest: float = 1.5) -> float:
+    """How far the book may honestly have moved in base_link since the last sighting.
+
+    Module level so it can be tested without a simulator. It replaces a gate held in
+    ODOM, which is the one frame here that must not be used for this: measured during a
+    run held to 17 mm of true error, odom accumulated 813 mm of travel that never
+    happened, because holding this base still means driving the wheels against a slide
+    and odom faithfully integrates every one of those turns. A target anchored in a
+    frame that drifts is a target that walks away, and it did -- one run rejected 24
+    consecutive correct sightings as "2.42 m from the anchored target" and then reversed
+    2.98 m away from the shelf hunting for a book that was in front of it.
+
+    The job the gate is actually for is narrow: refuse a bearing that has jumped to a
+    DIFFERENT book of the same colour. Columns are about 0.95 m apart and rows 0.33 m,
+    and those are distances in the robot's own frame right now, not in any accumulated
+    one. So compare each sighting against the last accepted one, in base_link, and allow
+    for how far the base could have carried the book in between -- which is its own
+    driving speed, plus the coast measured at 8 mm per simulated second, plus what
+    perception's error looks like at 15-35 mm.
+
+    ``gap`` is capped at ``longest`` because the budget must not grow without limit while
+    the book is out of view: a sighting that arrives after a long silence has nothing
+    recent to be continuous with, and is better handled by making it agree with several
+    others than by widening the gate until it admits the whole shelf.
+    """
+    return allowance + speed * min(max(0.0, gap), longest)
+
+
 class State(Enum):
     WAITING = "waiting"
     TUCK = "tucking"
@@ -337,32 +366,25 @@ class ApproachNode(Node):
         self.approach_target = self.acquire_range
         # Retry budget for losing the book on the final drive.
         self.retreats = 0
-        # The book position, held in odom once it has been measured from a range
-        # where the marker above the column is still legible.
-        self.target_odom = None
-        # How far a later sighting may sit from that anchor and still be believed.
-        # Column spacing is about 0.95 m, so this stays well inside the distance to
-        # the neighbouring column while allowing for depth noise and odom drift.
-        # How far a sighting may sit from the anchored one and still be believed.
-        #
-        # Was 0.30 m, and it had become the thing stopping the approach. Measured over
-        # several runs, the acquire state stood squared at the shelf refusing every
-        # sighting until it timed out -- perception saying plainly that it could see the
-        # book, the approach saying it had no fix it would accept.
-        #
-        # The gate is held in ODOM, and this project has measured what odom does here:
-        # during one run held to 17 mm of true error it accumulated 813 mm of travel
-        # that never happened, because the base slides across wheels that do not turn.
-        # So the anchor drifts away from the book while the robot drives, and then
-        # rejects the correct sighting for disagreeing with a stale number.
-        #
-        # It was guarding against being talked out of a good fix by a bad one -- the
-        # bearing jumping to a different book of the same colour. Perception now guards
-        # that at source, by following the book nearest where the marker last put the
-        # target rather than whichever is nearest the middle of the frame, which is both
-        # earlier and better placed to know. So this is widened to reject only wild
-        # outliers rather than to arbitrate between candidates.
-        self.anchor_gate = 1.20
+        # The book position, in base_link, from the last sighting that was believed.
+        # NOT in odom: see sighting_gate for what odom does to a stored target here.
+        self.target_base = None
+        self.target_base_at = None
+        # How far two consecutive sightings of the same book may sit apart in
+        # base_link, over and above the base's own travel between them. Perception
+        # measures the book to 15-35 mm, so this is a little over twice its own error.
+        self.sighting_allowance = 0.08
+        # Past this the target in base_link is no longer about where the robot is
+        # now, and a new fix is collected from scratch rather than continued.
+        self.sighting_stale = 1.5
+        # The speed the gap is multiplied by: the fastest the base drives, 0.22 m/s,
+        # plus the coast at 0.008, plus margin. Being generous here costs an outlier
+        # admitted; being tight costs the correct sighting refused, which is what the
+        # odom version did 24 times in a row.
+        self.sighting_speed = 0.35
+        # Sightings still have to agree with each other before one is trusted at all,
+        # and that spread is judged against this. Column spacing is 0.95 m.
+        self.anchor_gate = 0.45
         # Sightings waiting to agree with each other before one of them is trusted, and
         # sightings that disagreed with the anchor. Both need to be consistent among
         # themselves before they are acted on. See _accept_sighting.
@@ -657,7 +679,8 @@ class ApproachNode(Node):
     def _enter(self, state: State) -> None:
         if state is State.RETREAT:
             # Start the anchor again: if it had been right we would not be retreating.
-            self.target_odom = None
+            self.target_base = None
+            self.target_base_at = None
             self.anchor_candidates.clear()
             self.anchor_disagree.clear()
         if state is not self.state:
@@ -905,70 +928,88 @@ class ApproachNode(Node):
         return rotation @ np.asarray(point, dtype=float) + np.array([t.x, t.y, t.z])
 
     def _accept_sighting(self, point: np.ndarray, frame_id: str) -> bool:
-        """Decide whether a sighting is the book we set out for, and anchor it.
+        """Decide whether a sighting is the book we set out for.
 
-        The column bearing comes from a marker mounted above the shelf, and that
-        marker leaves the camera as the robot closes in. One run had the bearing jump
-        310 px in a single step at 1 m out, which strafed the base into the divider
-        between two columns and left it facing neither: ground truth put the two
-        nearest red books at +33.5 and -39.6 degrees off the nose, both at the edge of
-        the frame, and perception reported no red book in view for the rest of the run.
+        The column bearing comes from a marker mounted above the shelf, and that marker
+        leaves the camera as the robot closes in. One run had the bearing jump 310 px in
+        a single step at 1 m out, which strafed the base into the divider between two
+        columns and left it facing neither: ground truth put the two nearest red books
+        at +33.5 and -39.6 degrees off the nose, both at the edge of the frame, and
+        perception reported no red book in view for the rest of the run. Refusing that
+        jump is the whole purpose here.
 
-        So once the target has been measured from a range where the marker is still
-        legible, its position is held in odom, and later sightings are believed only
-        if they agree with it. Odom drift over the last metre is far smaller than the
-        error being rejected. This is not navigating to an odometry estimate, which the
-        arm could not be placed from -- the grasp still uses the live measurement. It
-        is refusing to be talked out of a good fix by a bad one.
+        It used to be done by holding the target in odom and rejecting sightings that
+        disagreed with it, and that was the wrong frame for the job -- see sighting_gate
+        for the measurement, and for the run where it rejected two dozen correct
+        sightings and drove away from the shelf.
+
+        Continuity in base_link does the same job without odom. Consecutive sightings of
+        one book are a few centimetres apart plus whatever the base drove; a jump to the
+        next column is 0.95 m, which no gap between sightings can account for.
         """
         if self.state not in (State.ACQUIRE, State.APPROACH,
                               State.SQUARE, State.VERIFY):
             return True
-        tf = self._lookup(ODOM_FRAME, frame_id)
-        if tf is None:
-            return True   # nothing to check against; a sighting beats none
-        in_odom = self._apply_transform(tf, point)
+        if frame_id and frame_id not in (BASE_FRAME, "base_link"):
+            tf = self._lookup(BASE_FRAME, frame_id)
+            if tf is None:
+                return True   # nothing to compare in; a sighting beats none
+            point = self._apply_transform(tf, point)
 
-        if self.target_odom is None:
-            # Do not anchor to a single sighting. With no marker in view perception picks
+        now = self._now()
+        stale = (self.target_base_at is None
+                 or (now - self.target_base_at) > self.sighting_stale)
+        if self.target_base is None or stale:
+            # Do not trust a single sighting. With no marker in view perception picks
             # one of several same-coloured books, and whichever it picked first would
             # become the target for the whole run.
-            self.anchor_candidates.append(in_odom)
+            self.anchor_candidates.append(point)
             settled = self._agreeing(self.anchor_candidates)
             if settled is None:
                 return False
-            self.target_odom = settled
+            self.target_base = settled
+            self.target_base_at = now
+            self.anchor_candidates.clear()
             self.get_logger().info(
-                "target anchored at odom [%.2f, %.2f, %.2f] from %d agreeing sightings"
-                % (settled[0], settled[1], settled[2], len(self.anchor_candidates)))
+                "target fixed at [%.2f, %.2f, %.2f] in base_link from %d agreeing "
+                "sightings" % (settled[0], settled[1], settled[2],
+                               self.anchor_candidates.maxlen))
             return True
 
-        drift = float(np.linalg.norm(in_odom[:2] - self.target_odom[:2]))
-        if drift > self.anchor_gate:
+        gap = now - self.target_base_at
+        step = float(np.linalg.norm(point[:2] - self.target_base[:2]))
+        budget = sighting_gate(self.sighting_allowance, self.sighting_speed, gap)
+        if step > budget:
             self.anchor_rejects += 1
-            self.anchor_disagree.append(in_odom)
+            self.anchor_disagree.append(point)
             # An outlier gate with no way out turns one bad fix into a permanent one. A
-            # run anchored to the wrong book and then rejected the right one 217 times in
-            # a row, all at the same 1.24 m, until the approach timed out. Sightings that
-            # disagree with the anchor but agree with each other are the better answer.
+            # run anchored to the wrong book rejected the right one 217 times in a row,
+            # all at the same 1.24 m, until the approach timed out. Sightings that
+            # disagree with the last accepted one but agree with each other are the
+            # better answer.
             replacement = self._agreeing(self.anchor_disagree)
             if replacement is not None:
                 self.get_logger().warn(
-                    "re-anchoring: %d sightings agree with each other %.2f m from the "
-                    "anchor, so the anchor was wrong"
-                    % (len(self.anchor_disagree), drift))
-                self.target_odom = replacement
+                    "re-fixing the target: %d sightings agree with each other %.2f m "
+                    "from the last accepted one, so that one was wrong"
+                    % (len(self.anchor_disagree), step))
+                self.target_base = replacement
+                self.target_base_at = now
                 self.anchor_disagree.clear()
                 return True
             self.get_logger().warn(
-                "ignoring a sighting %.2f m from the anchored target (%d so far)"
-                % (drift, self.anchor_rejects), throttle_duration_sec=3.0)
+                "ignoring a sighting %.2f m from the last accepted, %.0f mm allowed "
+                "for a %.1f s gap (%d so far)"
+                % (step, budget * 1000, gap, self.anchor_rejects),
+                throttle_duration_sec=3.0)
             return False
 
-        # Sightings that agree refine the anchor: the book has not moved, but the fix
-        # on it gets better as the robot closes in.
+        # Believed. Take it as it stands rather than smoothing towards it: base_link
+        # moves with the robot, so an average of sightings taken while driving is an
+        # average over places the robot no longer is.
         self.anchor_disagree.clear()
-        self.target_odom = 0.7 * self.target_odom + 0.3 * in_odom
+        self.target_base = point
+        self.target_base_at = now
         return True
 
     def _agreeing(self, sightings):
@@ -983,13 +1024,18 @@ class ApproachNode(Node):
         return centre
 
     def _target_in_base(self):
-        """Give the anchored target as (x, y, z) in base_footprint, or None."""
-        if self.target_odom is None:
+        """Give the believed target as (x, y, z) in base_footprint, or None.
+
+        It has to be recent to mean anything. base_link travels with the robot, so a
+        target held in it goes stale at the speed the base drives -- which is the
+        opposite of the old odom version, where the number stayed put and the frame
+        underneath it was what moved.
+        """
+        if self.target_base is None or self.target_base_at is None:
             return None
-        tf = self._lookup(BASE_FRAME, ODOM_FRAME)
-        if tf is None:
+        if (self._now() - self.target_base_at) > self.sighting_stale:
             return None
-        return self._apply_transform(tf, self.target_odom)
+        return self.target_base
 
     def _distance_to_face(self) -> Optional[float]:
         """Distance to the shelf face, preferring the book over the LiDAR.
@@ -1287,7 +1333,8 @@ class ApproachNode(Node):
                     "squared for %.0f s with no fix on the book that the anchor will "
                     "accept; searching again" % self.nofix_grace)
                 self.nofix_since = None
-                self.target_odom = None
+                self.target_base = None
+                self.target_base_at = None
                 self.anchor_candidates.clear()
                 self.anchor_disagree.clear()
                 self.anchor_rejects = 0
