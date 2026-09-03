@@ -32,6 +32,7 @@ from std_msgs.msg import Float32, Int32
 from tf2_ros import Buffer, TransformListener
 
 from avaa_solution.vision import depth_locator as dl
+from avaa_solution.vision import shelf_plane as sp
 from vision_msgs.msg import (
     BoundingBox2D,
     Detection2D,
@@ -54,6 +55,8 @@ TOPIC_BIN_POINT = "/avaa/perception/bin_point"
 # The column's position on the shelf, 1-5, as opposed to its index among
 # whichever columns happen to be in frame. This is the one the judges want.
 TOPIC_SHELF_COLUMN = "/avaa/perception/shelf_column"
+# The base's yaw error against the shelf, measured from the depth image.
+TOPIC_SHELF_YAW = "/avaa/perception/shelf_yaw"
 
 # Where the grasp controller wants the book expressed.
 GRASP_FRAME = "base_link"
@@ -174,6 +177,8 @@ class PerceptionNode(Node):
             PointStamped, TOPIC_BIN_POINT, 10)
         self.pub_shelf_column = self.create_publisher(
             Int32, TOPIC_SHELF_COLUMN, 10)
+        self.pub_shelf_yaw = self.create_publisher(
+            Float32, TOPIC_SHELF_YAW, 10)
         self.pub_detections = self.create_publisher(Detection2DArray, TOPIC_DETECTIONS, 10)
         self.pub_row = self.create_publisher(Int32, TOPIC_TARGET_ROW, 10)
         self.pub_column = self.create_publisher(Int32, TOPIC_TARGET_COLUMN, 10)
@@ -458,6 +463,7 @@ class PerceptionNode(Node):
             books = bd.detect_books(frame)
             markers = sorted(mr.read_markers(frame), key=lambda m: m.cx)
             self._publish_shelf_column(markers)
+            self._publish_shelf_yaw()
             # The markers define the columns. Falling back to gap clustering only when
             # none are visible, since that cannot identify a target column anyway.
             if markers:
@@ -591,6 +597,54 @@ class PerceptionNode(Node):
             self._save_book_image(frame, books, target, row)
 
     # ------------------------------------------------------------------ helpers
+
+    def _publish_shelf_yaw(self) -> None:
+        """Publish how far the base is turned away from the shelf, from the depth image.
+
+        The approach needs a heading reference and has never had a good one. The laser
+        cannot supply it: it sits 209 mm off the floor, where the shelf is an open
+        compartment, and measured at 0.74 m from the front it returned 163 beams with
+        none inside two metres and 110 of them on the far wall. The overhead marker
+        cannot either -- it is small, it drops out constantly, and a pixel bearing says
+        nothing about orientation.
+
+        The depth camera can. Measured against Gazebo, six samples from about 2300
+        points each: -34.5, -34.5, -35.3, -34.7, -34.2, -34.5 degrees against a true
+        -35.9. Better than a degree and a half, and steady.
+
+        The plane it locks onto is usually the shelf's BACK panel rather than its front,
+        because at book height most of the view is open shelf. That is fine here and only
+        here: the two are parallel, so either gives the same heading. It is emphatically
+        not fine for distance, which is why only the angle is published.
+        """
+        if self.depth_image is None or self.intrinsics is None or not self.depth_frame:
+            return
+        if self.reported_row is None:
+            return
+        height = ROW_HEIGHTS_BASE[self.reported_row - 1] if (
+            1 <= self.reported_row <= len(ROW_HEIGHTS_BASE)) else None
+        if height is None:
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                GRASP_FRAME, self.depth_frame, rclpy.time.Time()).transform
+        except Exception:  # noqa: BLE001 - the transform may not be up yet
+            return
+        q, t = tf.rotation, tf.translation
+        xx, yy, zz = q.x * q.x, q.y * q.y, q.z * q.z
+        xy, xz, yz = q.x * q.y, q.x * q.z, q.y * q.z
+        wx, wy, wz = q.w * q.x, q.w * q.y, q.w * q.z
+        rotation = np.array([
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)]])
+        result = sp.face_from_depth(
+            self.depth_image, self.intrinsics, rotation,
+            np.array([t.x, t.y, t.z]), float(height))
+        if result is None:
+            return
+        _, yaw, _ = result
+        self.pub_shelf_yaw.publish(Float32(data=float(yaw)))
 
     def _publish_shelf_column(self, markers: List[mr.Marker]) -> None:
         """Publish WHICH COLUMN of the shelf carries the target marker, 1 to 5.

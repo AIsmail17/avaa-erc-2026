@@ -90,6 +90,7 @@ SELF_FILTER_RADIUS = 0.45
 SHELF_FRONT_TO_BOOK_FACE = 0.065
 
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
+TOPIC_SHELF_YAW = "/avaa/perception/shelf_yaw"
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
 TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
@@ -330,6 +331,8 @@ class ApproachNode(Node):
         self.book_point_at: Optional[float] = None
         self.book_seen_at: Optional[float] = None
         self.book_live = None
+        self.shelf_yaw: Optional[float] = None
+        self.shelf_yaw_at: Optional[float] = None
         self.book_x: Optional[float] = None
         self.approach_target = self.acquire_range
         # Retry budget for losing the book on the final drive.
@@ -398,6 +401,8 @@ class ApproachNode(Node):
             JointTrajectory, "/head_controller/joint_trajectory", 10)
         self.create_subscription(Int32, TOPIC_TARGET_ROW, self._on_row, 10)
         self.create_subscription(Float32, TOPIC_TARGET_COLUMN_X, self._on_column_x, 10)
+        self.create_subscription(
+            Float32, TOPIC_SHELF_YAW, self._on_shelf_yaw, 10)
         self.create_subscription(LaserScan, TOPIC_SCAN, self._on_scan, SENSOR_QOS)
         # Odometry is used for ONE thing: the yaw rate, to damp the turns.
         # It is not trusted for position -- the base slides across its wheels
@@ -460,6 +465,34 @@ class ApproachNode(Node):
             wanted += math.copysign(floor, wanted)
         command = wanted - self.turn_damping * self.yaw_rate
         return float(max(-self.max_yaw, min(self.max_yaw, command)))
+
+    def _on_shelf_yaw(self, msg: Float32) -> None:
+        self.shelf_yaw = float(msg.data)
+        self.shelf_yaw_at = self._now()
+
+    def _heading_error(self, max_age: float = 2.0) -> Optional[float]:
+        """How far the base is turned off square to the shelf, best source first.
+
+        The depth camera is the only sensor here that can actually see the shelf. The
+        laser is 209 mm off the floor, where the unit is an open compartment: measured
+        at 0.74 m from the front, 163 returns in the forward cone, none inside two
+        metres, 110 of them on the far wall. Every heading the approach has taken from
+        it has been a heading to something else.
+
+        Measured against Gazebo, the depth fit gives -34.5, -34.5, -35.3, -34.7, -34.2,
+        -34.5 degrees against a true -35.9 -- better than a degree and a half, steady,
+        from about 2300 points. That is the number this controller has been missing; one
+        run reached the standoff 38.9 degrees off square, at which angle the camera looks
+        along the shelf rather than at it and the book leaves the frame entirely.
+
+        The laser fit stays as the fallback. It is not useless -- it will find whatever
+        plane genuinely is in front of the robot, and early in a run, before the head has
+        found a row to measure a band around, that is better than nothing.
+        """
+        if (self.shelf_yaw is not None and self.shelf_yaw_at is not None
+                and (self._now() - self.shelf_yaw_at) <= max_age):
+            return self.shelf_yaw
+        return self._shelf_angle()
 
     def _on_scan(self, msg: LaserScan) -> None:
         self.scan = msg
@@ -1124,7 +1157,7 @@ class ApproachNode(Node):
         # has it keeps, and reversing blind for twenty seconds is long enough to lose
         # the shelf entirely. Square against it if it can be seen; otherwise damp the
         # rate, which needs nothing but odometry.
-        angle = self._shelf_angle()
+        angle = self._heading_error()
         cmd.angular.z = (self._turn(-angle, 0.8) if angle is not None
                          else self._turn(0.0, 0.0, floor=0.0))
         self.pub_cmd.publish(cmd)
@@ -1160,7 +1193,7 @@ class ApproachNode(Node):
         # shelf front still reads as a flat face, means the final drive runs along the
         # shelf normal.
         goal = self._acquire_goal()
-        angle = self._shelf_angle()
+        angle = self._heading_error()
 
         # Square first only while there is no pose to drive to. Once there is, the pose
         # controller owns the heading: arriving square is what it is for, and it has to
@@ -1504,7 +1537,7 @@ class ApproachNode(Node):
         # This is the third state in this file to need the same thing. Any state that
         # commands motion on this base has to hold the heading too; the base will not
         # do it for us.
-        face = self._shelf_angle()
+        face = self._heading_error()
         cmd.angular.z = (self._turn(-face, 0.8, floor=0.0) if face is not None
                          else self._turn(0.0, 0.0, floor=0.0))
 
@@ -1552,7 +1585,7 @@ class ApproachNode(Node):
         )
 
     def _do_square(self) -> None:
-        angle = self._shelf_angle()
+        angle = self._heading_error()
         if angle is None:
             # No credible flat surface ahead. Do NOT carry on: the grasp reaches
             # along the base's own x axis, so handing it an unsquared base aims
