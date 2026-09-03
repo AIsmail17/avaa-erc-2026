@@ -105,6 +105,15 @@ class PerceptionNode(Node):
         # -1 (the default) means work it out from the marker digits.
         self.declare_parameter("target_column_index", -1)
         self.declare_parameter("columns_left_to_right", True)
+        # Inside this range the book is a better bearing than the marker,
+        # because the marker has left the top of the frame. Outside it the
+        # marker is the only thing that identifies WHICH column.
+        self.declare_parameter("book_steering_range_m", 1.60)
+        # How far a book may appear to move between frames and still be
+        # believed to be the same book. Generous, because the base slides
+        # and the head tilts; far short of the gap between columns, which
+        # is what this is there to refuse.
+        self.declare_parameter("book_jump_px", 120.0)
         self.declare_parameter("save_images", True)
         # Only src/ is bind-mounted into the container, so this is the deepest path that
         # still lands inside the git repository on the host. See PERCEPTION.md.
@@ -116,6 +125,9 @@ class PerceptionNode(Node):
         self.target_digit = int(self.get_parameter("shelf_column_number").value)
         self.columns_left_to_right = bool(
             self.get_parameter("columns_left_to_right").value)
+        self.close_range = float(
+            self.get_parameter("book_steering_range_m").value)
+        self.book_jump_px = float(self.get_parameter("book_jump_px").value)
         self.image_dir = str(self.get_parameter("image_dir").value)
         self.save_images = bool(self.get_parameter("save_images").value)
         self.min_save_interval = float(self.get_parameter("min_save_interval_sec").value)
@@ -127,6 +139,8 @@ class PerceptionNode(Node):
         self.last_book_save: Optional[float] = None
         self.reported_column: Optional[int] = None
         self.shelf_column: Optional[int] = None
+        self.last_book_range: Optional[float] = None
+        self.last_book_cx: Optional[float] = None
         self.reported_row: Optional[int] = None
         # Confident row readings, voted on before anything is latched. See _publish_row.
         self.row_votes = deque(maxlen=15)
@@ -226,17 +240,68 @@ class PerceptionNode(Node):
             )
             return
 
+        # Follow the SAME book, not whichever one is nearest the middle of the picture.
+        #
+        # Nearest-the-centre is only right if the robot is already in front of its
+        # column, and it is worst exactly when it matters. Measured on a run that got
+        # this far: the robot stood at (2.35, -0.24) with column 3's green book 0.55 m
+        # ahead and 0.24 m to its left, and perception handed the grasp a book 0.87 m
+        # ahead and 0.72 m to its RIGHT -- column 4's green book, which happened to sit
+        # nearer the middle of the frame. The grasp then planned a reach into the wrong
+        # column.
+        #
+        # The marker identified the right book while it was still in frame, so its image
+        # position is known. Between frames a book moves a little; it does not jump
+        # across a column. So the candidate nearest where the target was last seen is
+        # the target, and if nothing is near enough, the honest answer is that the book
+        # has been lost rather than that some other book will do.
         centre = frame.shape[1] / 2.0
-        target = min(candidates, key=lambda b: abs(b.cx - centre))
+        if self.last_book_cx is not None:
+            target = min(candidates, key=lambda b: abs(b.cx - self.last_book_cx))
+            jump = abs(target.cx - self.last_book_cx)
+            if jump > self.book_jump_px:
+                # Say so, but still publish. Going silent here starved the approach of
+                # the 3D fix it drives to and left it squaring at the shelf for its whole
+                # timeout: the head tilts and the base slides between one processed frame
+                # and the next, so a large jump is common and is not proof of the wrong
+                # book. Preferring the nearest to where the target was IS the fix; the
+                # threshold is only worth a warning.
+                self.get_logger().warn(
+                    "the %s book jumped %.0f px since the last frame; still the nearest "
+                    "to where the target was, so following it"
+                    % (self.book_colour, jump), throttle_duration_sec=5.0)
+        else:
+            target = min(candidates, key=lambda b: abs(b.cx - centre))
+        self.last_book_cx = float(target.cx)
         self.pub_row.publish(Int32(data=self.reported_row))
-
-        # Keep feeding a bearing as well as a point. The marker leaves the frame roughly a
-        # metre out, and without a bearing the approach drives the last stretch open-loop
-        # and drifts sideways -- one run finished at the end upright of the shelf unit,
-        # looking along it rather than at the target column. The book itself is the right
-        # thing to steer by once the marker is gone.
-        self.pub_column_x.publish(Float32(data=float(target.cx)))
         self._publish_book_point(target)
+
+        # Steer by the book only when the robot is CLOSE to it.
+        #
+        # This exists because the marker leaves the frame about a metre out, and without
+        # a bearing the approach drives the last stretch open-loop and drifts sideways.
+        # It was publishing at every range, and that turned it from a last-metre aid
+        # into a hijack: the bearing is whichever book of the target colour is nearest
+        # the middle of the picture, and from three metres back with the head level that
+        # is any one of five columns. In one run it published 113 times while the base
+        # was still centring on the marker, and the approach spent ninety seconds
+        # turning towards a book in the wrong column with the pixel error never
+        # improving, because the error was measured against a different book each frame.
+        #
+        # Beyond this range the marker is the thing to steer by and it should be
+        # visible; if it is not, the robot is not looking at its column, and silence is
+        # the honest answer. The approach stops and looks again rather than driving
+        # confidently at the wrong shelf.
+        if self.last_book_range is not None and self.last_book_range <= self.close_range:
+            self.pub_column_x.publish(Float32(data=float(target.cx)))
+        else:
+            self.get_logger().info(
+                "the %s book is %s away and the marker is not in frame; not offering a "
+                "bearing from a book that far off"
+                % (self.book_colour,
+                   "an unknown distance" if self.last_book_range is None
+                   else "%.1f m" % self.last_book_range),
+                throttle_duration_sec=5.0)
         self.get_logger().info(
             f"tracking {self.book_colour} book without marker "
             f"({len(candidates)} candidate(s), row {self.reported_row})",
@@ -339,6 +404,7 @@ class PerceptionNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.point.x, msg.point.y, msg.point.z = (float(v) for v in point)
         self.pub_book_point.publish(msg)
+        self.last_book_range = float(point[0])
         self._cross_check_row(point)
 
     def _publish_bin_point(self, frame) -> None:
@@ -438,6 +504,10 @@ class PerceptionNode(Node):
         target_book = (bd.find_book(columns, column_index, self.book_colour)
                        if self.book_colour else None)
         steer_x = target_book.cx if target_book is not None else markers[column_index].cx
+        if target_book is not None:
+            # Remember where the RIGHT book was, so it can be recognised again once the
+            # marker that identified it has left the frame.
+            self.last_book_cx = float(target_book.cx)
         self.pub_column_x.publish(Float32(data=float(steer_x)))
         self._save_column_image(frame, books, columns, markers, column_index)
 

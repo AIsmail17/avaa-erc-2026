@@ -216,6 +216,9 @@ class ApproachNode(Node):
         # 190 mm to go on a run that was converging steadily.
         self.declare_parameter("acquire_timeout_sec", 120.0)
         self.declare_parameter("search_rate", 0.35)
+        # How long the target column may be out of view before the robot
+        # gives up centring on it and sweeps for it again.
+        self.declare_parameter("lost_grace_sec", 4.0)
         self.declare_parameter("row_heights", DEFAULT_ROW_HEIGHTS)
         # Where to pause and confirm the book before committing to the final drive.
         #
@@ -252,6 +255,8 @@ class ApproachNode(Node):
         self.acquire_timeout = float(
             self.get_parameter("acquire_timeout_sec").value)
         self.search_rate = float(self.get_parameter("search_rate").value)
+        self.lost_grace = float(self.get_parameter("lost_grace_sec").value)
+        self.lost_since: Optional[float] = None
         self.search_timeout = float(self.get_parameter("search_timeout_sec").value)
         self.image_width = int(self.get_parameter("image_width_px").value)
         self.tuck_time = float(self.get_parameter("tuck_time_sec").value)
@@ -968,6 +973,31 @@ class ApproachNode(Node):
         # in at 20 mm per correction, and the state ran out of time with 190 mm still to
         # go while the shelf angle wandered between -5 and -11 degrees.
         if goal is None:
+            # Back off if the reason there is no fix is that the robot is too close.
+            #
+            # This was a deadlock, and it swallowed a whole run. The forward LiDAR reads
+            # THROUGH the open shelf to its back panel, so it overstates the distance to
+            # the face by about the shelf's depth, and the drive to the acquire
+            # checkpoint overshoots. Measured on the run that found this: the robot
+            # finished 0.51 m from a book on the TOP row, and at that range the camera
+            # cannot tilt far enough up to see it -- "no green book in view at close
+            # range", every frame, for the whole state. No sighting means no fix, no fix
+            # means the pose controller has nowhere to drive, and nothing was left that
+            # could undo the one thing causing it.
+            #
+            # Reversing needs no fix on the book. The LiDAR overstates the range, so if
+            # even IT says the shelf is nearer than the checkpoint, the robot is much
+            # too close, and backing up can only improve the view.
+            ahead = self._range_ahead()
+            if ahead is not None and ahead < self.acquire_range - self.standoff_tol:
+                cmd = Twist()
+                cmd.linear.x = -min(self.max_fwd, 0.5 * (self.acquire_range - ahead))
+                self.pub_cmd.publish(cmd)
+                self.get_logger().warn(
+                    "acquiring: no fix and the shelf is only %.2f m ahead, which is "
+                    "closer than the %.2f m checkpoint; backing off to see the book"
+                    % (ahead, self.acquire_range), throttle_duration_sec=3.0)
+                return
             self._stop()
             if angle is not None and abs(angle) > self.square_tol:
                 cmd = Twist()
@@ -1089,8 +1119,26 @@ class ApproachNode(Node):
     def _do_centre(self) -> None:
         column_cx = self._column_cx_fresh()
         if column_cx is None:
+            # Lost the marker. Stop, and if it stays lost, go and look for it again
+            # rather than stand here until the state times out.
+            #
+            # Standing still was survivable while perception offered a bearing from
+            # whichever target-coloured book was nearest the middle of the frame, because
+            # something always arrived. Now that bearing is only offered from close
+            # range -- it was steering the robot at books in the wrong column -- so a
+            # marker that leaves the frame really does mean no bearing at all, and this
+            # state has to be able to recover from it.
             self._stop()
+            if self.lost_since is None:
+                self.lost_since = self._now()
+            elif self._now() - self.lost_since > self.lost_grace:
+                self.get_logger().warn(
+                    "the target column has been out of view for %.0f s; searching again"
+                    % self.lost_grace)
+                self.lost_since = None
+                self._enter(State.SEARCH)
             return
+        self.lost_since = None
         error_px = column_cx - self.image_width / 2.0
         if abs(error_px) <= self.centre_tol:
             self._stop()
