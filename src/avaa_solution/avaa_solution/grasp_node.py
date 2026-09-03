@@ -57,6 +57,11 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from avaa_solution.kinematics.arm_chain import ArmChain
 from avaa_solution.moveit_client import MoveItClient, error_name
+# Imported so the two nodes cannot disagree about where the unused arm
+# goes. They did once: the fixture tucked to one pose while the solution
+# used another, and every grasp after that was measured from a posture the
+# robot never actually drives in.
+from avaa_solution.approach_node import RIGHT_TUCK
 
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
@@ -65,6 +70,7 @@ GRIPPER_TOPIC = "/gripper_left_controller_raw/joint_trajectory"
 # The last few centimetres are servoed, not planned, so they are published straight
 # to the controller. See _do_servo for why planning cannot close this gap.
 ARM_TOPIC = "/arm_left_controller/joint_trajectory"
+ARM_RIGHT_TOPIC = "/arm_right_controller/joint_trajectory"
 TOPIC_CMD = "/cmd_vel"
 
 ARM_JOINTS = [f"arm_left_{i}_joint" for i in range(1, 8)]
@@ -505,6 +511,8 @@ class GraspNode(Node):
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
         self.pub_gripper = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
         self.pub_arm = self.create_publisher(JointTrajectory, ARM_TOPIC, 10)
+        self.pub_arm_right = self.create_publisher(
+            JointTrajectory, ARM_RIGHT_TOPIC, 10)
         self.pub_cmd = self.create_publisher(Twist, TOPIC_CMD, 10)
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
 
@@ -1007,6 +1015,13 @@ class GraspNode(Node):
             self.get_logger().error(
                 "no usable posture for the pre-grasp in %d tries: %d in collision, "
                 "%d beyond what the arm can hold" % (attempts, rejected, expensive))
+            if rejected:
+                # Name what it hit. "12 in collision" has no next step in it, and the
+                # service already knows the answer: it is nearly always the other arm,
+                # which sits 0.18 m inside the shelf if it was left where it spawned.
+                self.get_logger().error(
+                    "the last rejected posture was blocked by: %s"
+                    % self.moveit.why_invalid())
             return None
         self.get_logger().warn(
             "no posture gives a clear reach; the best of %d is %.0f%% and will be tried"
@@ -1250,7 +1265,31 @@ class GraspNode(Node):
             return
         self._enter(State.SCENE)
 
+    def _stow_right_arm(self) -> None:
+        """Get the unused arm out of the shelf before planning anything.
+
+        The right arm is never used for the pick -- the rules allow one arm -- but it is
+        part of the robot the planner checks, and left where it spawns
+        gripper_right_base_link sits at x=+0.86 in base_link, which at a 0.68 m standoff
+        is 0.18 m INSIDE the shelf. Every candidate pre-grasp posture then comes back in
+        collision, naming arm_right links against a shelf board, and the failure reads as
+        though the left arm cannot reach.
+
+        The approach controller already tucks it, so this is insurance rather than the
+        primary mechanism: it costs one message and it removes a failure that looks like
+        something else entirely.
+        """
+        traj = JointTrajectory()
+        traj.joint_names = ["arm_right_%d_joint" % i for i in range(1, 8)]
+        point = JointTrajectoryPoint()
+        point.positions = [float(v) for v in RIGHT_TUCK]
+        point.time_from_start = Duration(sec=6, nanosec=0)
+        traj.points = [point]
+        self.pub_arm_right.publish(traj)
+        self.get_logger().info("stowing the right arm clear of the shelf")
+
     def _do_scene(self) -> None:
+        self._stow_right_arm()
         if not self._add_shelf():
             self.get_logger().error("could not describe the shelf to the planner")
             self._enter(State.FAILED)

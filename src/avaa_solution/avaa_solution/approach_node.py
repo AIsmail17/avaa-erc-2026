@@ -1090,6 +1090,22 @@ class ApproachNode(Node):
                 self._stop()
                 return
             alpha = math.atan2(gy, gx)
+            # Reverse towards a goal that is behind, rather than turning to face it.
+            #
+            # This control law has a singularity at alpha = pi, and the robot found it.
+            # With the goal 1.15 m directly behind, the bearing read -178, -179, -180,
+            # +180 degrees on consecutive measurements, so the commanded turn changed
+            # sign every time and the base sat still: measured, 1.15 m to go for the
+            # whole of the state's two-minute budget, commanding a correction throughout.
+            #
+            # Driving backwards is also simply the right manoeuvre. Turning 180 degrees
+            # to reach a point behind means pointing the camera away from the shelf, and
+            # the shelf is the only thing that tells this controller where it is. The
+            # standard treatment is to fold the rear half-plane onto the front one and
+            # let the speed carry the sign.
+            backwards = abs(alpha) > math.pi / 2.0
+            if backwards:
+                alpha -= math.copysign(math.pi, alpha)
             beta = -alpha
             cmd = Twist()
             # Speed from the DISTANCE to the goal, not from how far ahead it is. Written
@@ -1097,13 +1113,14 @@ class ApproachNode(Node):
             # 350 mm to the side asked for 9 mm/s, and a base that cannot strafe cannot
             # close a lateral offset without driving. Measured, it crept in at 20 mm per
             # correction and ran out of time with 190 mm still to go.
-            cmd.linear.x = float(min(self.max_fwd, max(self.creep_speed,
-                                                       self.pose_gain * rho)))
+            speed = float(min(self.max_fwd, max(self.creep_speed,
+                                                self.pose_gain * rho)))
+            cmd.linear.x = -speed if backwards else speed
             cmd.angular.z = self._turn(1.30 * alpha - 0.40 * beta, 1.0, floor=0.0)
             self.pub_cmd.publish(cmd)
             self.get_logger().info(
-                f"acquiring: driving to the pose, {rho:.2f} m to go "
-                f"({gx:+.2f} ahead, {gy:+.2f} across, bearing "
+                f"acquiring: {'reversing' if backwards else 'driving'} to the pose, "
+                f"{rho:.2f} m to go ({gx:+.2f} ahead, {gy:+.2f} across, bearing "
                 f"{math.degrees(alpha):+.0f} deg)",
                 throttle_duration_sec=3.0)
             return

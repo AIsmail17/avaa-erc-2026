@@ -131,6 +131,7 @@ class MoveItClient:
         # One caller at a time, so two states can never have goals in flight together.
         self._lock = threading.Lock()
         self.last_failure = ""
+        self.last_contacts = []
         self._executor = MultiThreadedExecutor(num_threads=4)
         self._executor.add_node(self.node)
         self._thread = threading.Thread(target=self._executor.spin, daemon=True)
@@ -219,7 +220,33 @@ class MoveItClient:
         request.robot_state = state
         request.group_name = group
         result = self._wait(self.validity.call_async(request), timeout=10.0)
-        return None if result is None else bool(result.valid)
+        if result is None:
+            self.last_contacts = []
+            return None
+        # Keep what it collided WITH, not merely that it did.
+        #
+        # "none of 12 postures is even collision free" is a report with no next step in
+        # it. The service already says which two bodies touched and it was being thrown
+        # away, so a day went into narrowing down by elimination -- is it the arm, the
+        # distance, the shelf, the driving posture -- what one line of the answer would
+        # have named. It is nearly always the OTHER arm: left where it spawns,
+        # gripper_right_base_link sits at x=+0.86 in base_link, which at a 0.68 m
+        # standoff is 0.18 m inside the shelf.
+        self.last_contacts = [
+            "%s/%s" % (c.contact_body_1, c.contact_body_2)
+            for c in getattr(result, "contacts", [])]
+        return bool(result.valid)
+
+    def why_invalid(self) -> str:
+        """Name what the last state_valid call collided with, for a log line."""
+        contacts = getattr(self, "last_contacts", [])
+        if not contacts:
+            return "no contact reported"
+        unique = []
+        for pair in contacts:
+            if pair not in unique:
+                unique.append(pair)
+        return ", ".join(unique[:3])
 
     # ------------------------------------------------------------------ motion
 
