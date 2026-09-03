@@ -29,6 +29,9 @@ OLD_RIGHT = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
 NEW_RIGHT = [-0.2398, -1.5290, -0.1046, 1.1345, 2.4498, 3.0020, 1.5282]
 
 ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
+BOARD_DROP = 0.125 + 0.02
+SHELF_DEPTH = 0.30
+SHELF_WIDTH = 4.8
 BELOW_CENTRE = 0.045
 STANDOFF = 0.15
 FACE_X = 0.60
@@ -52,13 +55,33 @@ def main():
     # back is a longer, flatter reach that passes closer to the board above it, so the
     # question is not "is row 4 reachable" but "from how far away". The approach's
     # standoff is a parameter; this says what to set it to.
+    # With the shelf in the planning scene, which is the difference between this and
+    # the run that failed. The boards are placed exactly as grasp_node places them.
+    shelf = len(sys.argv) > 1 and sys.argv[1] == "shelf"
     faces = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
+    placed = []
     print("clear pre-grasp postures out of 12, by row and by distance to the book face")
+    print("shelf in the planning scene: %s" % ("YES" if shelf else "no"))
     print("%-6s %s" % ("", "  ".join("%5.2f" % f for f in faces)))
     for index, height in enumerate(ROW_HEIGHTS):
         z = height - BELOW_CENTRE
         cells = []
         for face in faces:
+            if shelf:
+                for name in list(placed):
+                    client.remove_object(name)
+                placed.clear()
+                centre_x = face + SHELF_DEPTH / 2.0 - 0.05
+                for j, board in enumerate(ROW_HEIGHTS):
+                    name = "shelf_board_%d" % j
+                    if client.add_box(name, "base_link",
+                                      (centre_x, 0.0, board - BOARD_DROP),
+                                      (SHELF_DEPTH, SHELF_WIDTH, 0.04)):
+                        placed.append(name)
+                if client.add_box("shelf_back", "base_link",
+                                  (face + SHELF_DEPTH, 0.0, 0.9),
+                                  (0.04, SHELF_WIDTH, 1.8)):
+                    placed.append("shelf_back")
             point = np.array([max(face - STANDOFF, 0.34), 0.16, z])
             clear = 0
             for attempt in range(12):
@@ -73,6 +96,8 @@ def main():
             cells.append("%5d" % clear)
         print("row %-2d %s" % (index + 1, "  ".join(cells)))
 
+    for name in placed:
+        client.remove_object(name)
     client.shutdown()
     rclpy.shutdown()
 
