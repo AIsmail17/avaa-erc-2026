@@ -266,7 +266,7 @@ cmd_gui() {
         -e MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
         -e LD_LIBRARY_PATH=/usr/lib/wsl/lib \
         "$CONTAINER" bash -c \
-        'mkdir -p /tmp/runtime-root; exec gz sim -g > /tmp/gui.log 2>&1'
+        'mkdir -p /tmp/runtime-root; exec gz sim -g --gui-config /opt/erc_ws/src/avaa_solution/config/gui.config > /tmp/gui.log 2>&1'
 
     # Give it time to fail. A GUI that cannot make an OpenGL context dies within a few
     # seconds, and saying so here is worth more than leaving the user watching an empty
