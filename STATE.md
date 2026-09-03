@@ -69,12 +69,12 @@ Use `tools/drift.py` (per simulated second, prints the RTF beside the answer) an
 | Approach — search, centre | ⚠️ **improved, still not reliable** |
 | Approach — acquire, square | ⚠️ **improved, still not reliable** |
 | Arm kinematics + IK | ✅ exact to 0.7 mm; all four rows reachable |
-| Grasp controller | ⚠️ written; **never yet run at a healthy real-time factor** |
+| Grasp controller | ⚠️ reaches the pre-grasp to 3 mm; **blocked on the base coast** |
 | Place in bin | ⚠️ **written, never run end to end** |
 | Video (D2) | ❌ not started |
 | Report (D3) | ❌ not started |
 
-**115 unit tests**, no simulator required:
+**133 unit tests**, no simulator required:
 
 ```bash
 sim shell
@@ -118,22 +118,53 @@ target-coloured book is nearest the image centre — reasonable when parked in f
 right column, wrong when the robot has turned away from it. It should probably not
 publish a bearing at all until the column has been reached.
 
-### The other thing that would move the needle
+### The base coasts, and this is the thing to fix
 
-**Hold the base whenever nothing is driving it.** Silence on `/cmd_vel` is not an
-instruction to stay put, and no node was doing this. Measured against Gazebo per
-simulated second:
+**Corrected 2026-09-03. The table that used to be here was wrong, and the conclusion
+drawn from it — that a zero twist holds the base — does not survive re-measurement.**
+
+The base keeps whatever velocity it is given, indefinitely, and nothing damps it. The
+wheel model asks for exactly that: `mu2` is 0 across the roller axis, so there is no
+friction to shed a slide, and commanding zero wheel speed asks the wheels not to turn
+rather than asking the base to stop.
+
+`tools/coast.py`, eight consecutive windows with a zero twist published at 20 Hz
+throughout, per simulated second against Gazebo:
+
+| window | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| speed (mm/s) | 8.1 | 7.4 | 6.9 | 8.5 | 8.7 | 6.8 | 7.7 | 7.8 |
+| heading (deg) | −155 | −159 | −162 | −172 | −156 | −179 | −173 | +177 |
+
+Heading agreement **0.98 of 1.0**. That is one velocity held, not a wander.
+
+And a zero twist does nothing to it. Four conditions that should have differed:
 
 | | translation | yaw |
 |---|---|---|
-| arm still, nothing commanded | 6.8 mm/s | 0.81 deg/s |
-| arm still, zero twist at 20 Hz | 3.1 mm/s | 0.42 deg/s |
-| arm swinging, nothing commanded | 9.8 mm/s | 0.88 deg/s |
-| arm swinging, zero twist at 20 Hz | 2.1 mm/s | 0.43 deg/s |
+| arm still, nothing commanded | 6.5 mm/s | 0.57 deg/s |
+| arm still, zero twist at 20 Hz | 7.1 mm/s | 0.55 deg/s |
+| arm swinging, nothing commanded | 7.2 mm/s | 0.73 deg/s |
+| arm swinging, zero twist at 20 Hz | 7.1 mm/s | 0.39 deg/s |
 
-The grasp and the delivery now both do it. An earlier version of this experiment
-concluded a zero twist changed nothing; it was measured per wall second at RTF 0.013,
-where almost no simulated time passes and every condition looks identical.
+**Why the old table read differently.** It was taken with the robot standing where it
+had stood for a long time, which is a robot that has already shed its velocity. That is
+not the state the grasp inherits — the approach hands over having just been driving.
+Over a 100 s grasp this is 700 mm of travel and 55 degrees of turn, which is enough on
+its own to explain every grasp failure recorded here.
+
+**What can and cannot see it:**
+
+| sensor | verdict |
+|---|---|
+| odom, translation | blind — a wheel that is not turning reports nothing |
+| odom, rotation | **also blind.** `tools/spinhold.py`: driving against odom's yaw rate gives 0.524, 0.481, 0.436 deg/s at gains 0.5, 1.0, 2.0 against 0.551 for a zero twist. 23% at a gain of 2, where a sensor that could see it would have over-corrected |
+| the book alone | **not enough.** `tools/bookcoast.py` fitted 61.9 and −76.9 mm/s against a true 6.0 and −6.0, and driving on it made the drift worse, 8.5 → 22.3 mm/s. `dp/dt = −v − w × p`, so at 0.8 m the rotation swamps the translation |
+| the depth camera | the only instrument left, and the one the shelf-plane fit already uses |
+
+**Cancelling it works, once it is measured.** `tools/stopcoast.py`, taking the slide
+from Gazebo: 7.07 mm/s coasting, 3.39 at a gain of 1, 2.02 at a gain of 2, overshooting
+back to 4.82 at 4. The wheels can do it. The problem is entirely one of measurement.
 
 ---
 
