@@ -137,13 +137,13 @@ SENSOR_QOS = QoSProfile(
 # keeping the most compact one with at least 0.15 rad of room at every joint stop.
 # It is also tighter than the old one: the gripper sits 0.29 m from the base axis
 # rather than 0.49 m.
-TUCK_POSE = [2.3940, 1.1345, 1.3129, -2.0287, 1.0423, 1.5420, 1.1028]
+TUCK_POSE = [0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0]
 # The tuck is an eight-joint posture, torso included, and only the eight together
 # are collision free. Commanding the arm alone and leaving the torso down folds
 # arm_left_5, arm_left_6 and the gripper into base_link -- MoveIt reports exactly
 # those three contacts -- and the planner then refuses every request from that
 # start state, in 0.4 s, with no indication that the torso is the reason.
-TUCK_TORSO = 0.15
+TUCK_TORSO = 0.10
 
 # The right arm is never used, but it still has to be out of the way, and mirroring
 # the left tuck by flipping two joints does not do that: it leaves arm_right_4_link
@@ -160,7 +160,7 @@ TUCK_TORSO = 0.15
 # inside the shelf, against shelf_back. This one reaches 0.204 m forward and is
 # checked at both torso heights, because raising the torso for the top rows takes
 # the whole upper body with it.
-RIGHT_TUCK = [-0.2398, -1.5290, -0.1046, 1.1345, 2.4498, 3.0020, 1.5282]
+RIGHT_TUCK = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
 
 
 class State(Enum):

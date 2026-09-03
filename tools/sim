@@ -234,7 +234,17 @@ cmd_gui() {
         return 0
     fi
 
-    grn "Attaching a viewer..."
+    # Retry, because the failure is intermittent rather than a misconfiguration.
+    #
+    # The same command succeeds one minute and aborts the next, and the difference is
+    # whether WSL currently has the virtual GPU. When it does, gz sim -g starts clean;
+    # when it has dropped, Mesa falls back to a software driver that does not work in
+    # this container and Qt aborts. Nothing here fixes that, but it comes back on its
+    # own, so trying again turns an intermittent failure into a slow start.
+    local attempt=1
+    local tries="${GUI_TRIES:-3}"
+    while [ "$attempt" -le "$tries" ]; do
+    grn "Attaching a viewer (attempt $attempt of $tries)..."
     # The environment is passed with -e rather than exported inside a login shell.
     #
     # 'bash -lc' sources the profile, and that loses LD_LIBRARY_PATH. Without
@@ -266,11 +276,18 @@ cmd_gui() {
         sleep 1
         waited=$((waited + 1))
         if ! docker exec "$CONTAINER" pgrep -f '[g]z sim -g' >/dev/null 2>&1; then
-            red "The viewer died after ${waited}s. The usual cause is WSL dropping the"
-            red "virtual GPU; check for 'failed to create drisw screen' in:"
+            if [ "$attempt" -lt "$tries" ]; then
+                ylw "The viewer died after ${waited}s; the GPU was probably away. Retrying."
+                attempt=$((attempt + 1))
+                sleep 5
+                continue 2
+            fi
+            red "The viewer died after ${waited}s on every attempt. The usual cause is"
+            red "WSL dropping the virtual GPU; look for 'drisw' in:"
             echo "    docker exec $CONTAINER tail -30 /tmp/gui.log"
             echo
-            echo "The simulation itself is unaffected and still running."
+            echo "The simulation itself is unaffected and still running, and"
+            echo "tools/in-sim liveview.py serves a view that needs no GPU at all."
             return 1
         fi
         if [ "$waited" -ge 12 ]; then break; fi
@@ -278,6 +295,9 @@ cmd_gui() {
 
     grn "Viewer running (the simulation is untouched if it crashes)."
     unminimize_window
+    return 0
+    done
+    return 1
 }
 
 cmd_stop() {

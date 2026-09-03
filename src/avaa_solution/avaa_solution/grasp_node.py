@@ -166,8 +166,8 @@ DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 # keeping the most compact one with at least 0.15 rad of room at every joint stop. It is
 # also tighter than the old one: the gripper sits 0.29 m from the base axis rather than
 # 0.49 m.
-TUCK_POSE = [2.3940, 1.1345, 1.3129, -2.0287, 1.0423, 1.5420, 1.1028]
-TUCK_TORSO = 0.15
+TUCK_POSE = [0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0]
+TUCK_TORSO = 0.10
 
 # The wrist, in base_link: reach along +x, close the fingers across y. Both come from the
 # URDF -- the fingers sit at y = +/-0.0288 offset +0.0756 along z in gripper_left_base_link,

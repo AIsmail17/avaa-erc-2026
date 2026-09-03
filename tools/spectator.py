@@ -12,7 +12,8 @@ camera in the world, off to one side and above, pointed at the grasp. Spawned at
 runtime through the create service, so no supplied file is touched and it vanishes
 when the simulation restarts.
 
-    python3 spectator.py            # default view of column 3
+    python3 spectator.py follow     # aimed at wherever the robot is now
+    python3 spectator.py            # the fixed wide view of the room
     python3 spectator.py 1.6 -1.8 1.9 2.75 0.0 1.15        # eye, then target
     python3 spectator.py 1.6 -1.8 1.9 2.75 0.0 1.15 0.9    # ...and a longer lens
 """
@@ -30,6 +31,36 @@ def look_at(eye, target):
     yaw = math.atan2(dy, dx)
     pitch = -math.atan2(dz, math.hypot(dx, dy))
     return pitch, yaw
+
+
+def robot_pose():
+    """Where the robot is, or None. Used to aim the camera at it rather than at a spot."""
+    out = subprocess.run(["gz", "model", "-m", "tiago_pro", "-p"],
+                         capture_output=True, text=True, timeout=25).stdout
+    lines = [l.strip() for l in out.splitlines()]
+    for i, line in enumerate(lines):
+        if line.startswith("[") and i + 1 < len(lines) and lines[i + 1].startswith("["):
+            try:
+                return [float(v) for v in line.strip("[]").split()]
+            except ValueError:
+                return None
+    return None
+
+
+def framing_for(where, back=2.6, side=-2.2, up=1.9, look_at_z=0.85):
+    """A camera pose that puts the robot in the middle of the picture.
+
+    Aiming at a fixed spot in the room was the whole problem with this tool. The robot
+    drives four metres during a trial, so any fixed aim is right for one moment of it:
+    every framing tried by hand had the robot at the edge of the frame, half cut off, or
+    out of it entirely, and each attempt cost a spawn, a bridge and a look.
+
+    Aimed at the robot instead, one command always gives a usable shot. The offsets put
+    the camera behind and to the robot's right, high enough to see over the base and
+    down into the shelf it is working at.
+    """
+    x, y = where[0], where[1]
+    return (x - back, y + side, up), (x, y, look_at_z)
 
 
 def sdf(eye, pitch, yaw, width=1280, height=720, fov=1.25):
@@ -56,9 +87,18 @@ def sdf(eye, pitch, yaw, width=1280, height=720, fov=1.25):
 
 def main():
     fov = 1.25
-    if len(sys.argv) >= 8:
-        fov = float(sys.argv[7])
-    if len(sys.argv) >= 7:
+    if len(sys.argv) >= 2 and sys.argv[1] == "follow":
+        where = robot_pose()
+        if where is None:
+            print("cannot read the robot's pose; falling back to the fixed framing")
+            eye, target = (1.05, -4.30, 2.85), (2.10, 0.00, 0.40)
+        else:
+            back = float(sys.argv[2]) if len(sys.argv) > 2 else 2.6
+            eye, target = framing_for(where, back=back)
+            print("following the robot at [%.2f, %.2f]" % (where[0], where[1]))
+    elif len(sys.argv) >= 7:
+        if len(sys.argv) >= 8:
+            fov = float(sys.argv[7])
         eye = tuple(float(v) for v in sys.argv[1:4])
         target = tuple(float(v) for v in sys.argv[4:7])
     else:
