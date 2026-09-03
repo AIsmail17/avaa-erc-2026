@@ -189,8 +189,65 @@ BOARD_DROP = 0.125 + 0.02
 # Height of the left shoulder above base_link when the torso is fully down, measured from
 # the chain: arm_left_1 sits at z = 0.677 + torso.
 SHOULDER_BASE_Z = 0.677
+
+# The greatest distance the gripper can get from the shoulder, in metres. Measured
+# rather than derived -- the link offsets are not collinear, so the sum of the link
+# lengths is an upper bound the arm cannot attain -- by sampling four thousand postures
+# and hill climbing from the best (tools/reach.py). It does not depend on the torso,
+# which lifts the whole shoulder.
+ARM_MAX_REACH = 1.088
+
+# How many segments the reach into the shelf is walked in -- by the check that chooses
+# the pre-grasp posture AND by the reach that is then executed. They have to be the same
+# number, and were not: the check used 4 and the reach used 8, so the check sampled the
+# line every 25 per cent and the reach every 11, and a posture was chosen on a walk that
+# never looked where the reach was going to stop. Measured: a posture accepted as fully
+# clear, adopted to within 3 mm, and the reach from it then refused at 38 per cent of the
+# way in -- an obstruction sitting between the coarse check's samples at 25 and 50.
+#
+# They also seed each waypoint's IK from the previous one, so a different step count is
+# not merely a coarser look at the same line, it is a different chain of postures. Two
+# numbers here can never be made to agree; one can.
+REACH_STEPS = 8
 SHELF_DEPTH = 0.30
 SHELF_WIDTH = 4.8
+
+
+def reaim_budget(allowance: float, rate: float, since: float) -> float:
+    """How far a fresh sighting may move the grasp target before it is disbelieved.
+
+    Split out from the node so it can be tested without a simulator, because the number
+    in it is the whole point, and the first version of it had the number badly wrong.
+
+    What the base does is COAST. Measured against Gazebo over eight consecutive windows
+    with a zero twist published at 20 Hz throughout (tools/coast.py): 8.1, 7.4, 6.9,
+    8.5, 8.7, 6.8, 7.7 and 7.8 mm per simulated second, on headings of -155, -159, -162,
+    -172, -156, -179, -173 and +177 degrees. Heading agreement 0.98 of 1.0. That is not
+    a wander that averages out, it is one velocity held, and it is exactly what the
+    wheel model asks for: mu2 is 0 across the roller axis, so nothing damps a slide, and
+    commanding zero wheel speed asks the wheels not to turn rather than asking the base
+    to stop. Four conditions that should have differed -- arm still or swinging, zero
+    twist or nothing commanded at all -- gave 6.5, 7.1, 7.2 and 7.1 mm/s.
+
+    So a sighting that moves the book a long way after a long gap is very likely the
+    robot having really travelled, and the first version of this refused those: it
+    capped the budget at 120 mm on the belief that a held base sits still, which the
+    measurement above says it does not. That cap would have thrown away true
+    corrections of 167 and 184 mm in a run where the base had had 33 and 18 seconds to
+    make them.
+
+    What stays refused is the physically impossible. The correction that actually broke
+    a grasp arrived 0.6 seconds after the one before it and asked to move the book
+    169 mm -- 280 mm a second, thirty-five times the coast -- and it put the target past
+    the end of the arm, after which the servo rejected two hundred consecutive solves.
+    A rate bound catches that and admits the rest, which is the whole job.
+
+    ``allowance`` covers what perception's own error looks like, measured at 15-35 mm in
+    x. ``rate`` is per second since the target was set, and wants to be generous against
+    the coast rather than tight to it: the cost of admitting a bad reading is one
+    re-aim, and the cost of refusing a true one is reaching for where the book is not.
+    """
+    return allowance + rate * max(0.0, since)
 
 
 def row_to_height(row: int, heights: List[float], top_down: bool = True) -> Optional[float]:
@@ -328,6 +385,21 @@ class GraspNode(Node):
         # closer is what actually lowers the torque the arm has to hold, which is the
         # thing that has been stopping the reach.
         self.declare_parameter("min_pregrasp_x_m", 0.34)
+        # How far a fresh sighting may move the target, in metres, before it is
+        # treated as a bad look rather than a moved book. Perception measures the book
+        # to 15-35 mm in x against ground truth, so the fixed part is a little over
+        # twice its own error; the rate is per second since the target was set, and is
+        # generous against a base measured at 0.0 mm per simulated second while held.
+        self.declare_parameter("reaim_allowance_m", 0.06)
+        # Per second since the target was set. The base coasts at 7.7 mm a simulated
+        # second (tools/coast.py, eight windows, heading agreement 0.98), so this is
+        # set above that rather than at it: refusing a true correction costs a reach
+        # for where the book is not, and admitting a doubtful one costs a re-aim.
+        self.declare_parameter("reaim_rate_m_per_s", 0.012)
+        # How much of the arm's measured maximum reach a target may sit at. Only a
+        # sanity bound -- the arm holds 88 per cent of it to a millimetre -- so this is
+        # set where the kinematics genuinely run out rather than where the torque does.
+        self.declare_parameter("reach_margin", 0.97)
         # How long to let the arm settle after MoveIt says the trajectory is done.
         # It is not done: the controller reports success when the trajectory time
         # has elapsed, and this arm is still travelling. Judged immediately, a reach
@@ -405,6 +477,10 @@ class GraspNode(Node):
         # enough that a single good frame cannot trigger a grasp on its own.
         self.declare_parameter("servo_hold_ticks", 3)
         self.declare_parameter("servo_timeout_sec", 40.0)
+        # How many refusals in a row end the servo. At 5 Hz this is a few seconds,
+        # which is long enough to ride out a momentary loss of the sighting and short
+        # enough that a genuinely stuck arm is reported while there is still run left.
+        self.declare_parameter("servo_stuck_limit", 25)
         # Keep tracking the book while the jaws close. The gripper is force limited and
         # takes three to seven seconds to shut, and the base does not stop sliding for
         # it -- this is what the old wait-for-quiet gate was trying to buy, except the
@@ -437,6 +513,11 @@ class GraspNode(Node):
             self.get_parameter("max_torque_fraction").value)
         self.min_pregrasp_x = float(
             self.get_parameter("min_pregrasp_x_m").value)
+        self.reaim_allowance = float(
+            self.get_parameter("reaim_allowance_m").value)
+        self.reaim_rate = float(self.get_parameter("reaim_rate_m_per_s").value)
+        self.reach_margin = float(self.get_parameter("reach_margin").value)
+        self.target_set_at = None
         self.reaches = 0
         self.leg = 0
         self.leg_target = None
@@ -457,6 +538,9 @@ class GraspNode(Node):
         self.servo_release_span = float(
             self.get_parameter("servo_release_span_m").value)
         self.servo_since = None
+        self.servo_stuck = 0
+        self.servo_stuck_limit = int(
+            self.get_parameter("servo_stuck_limit").value)
         self.servo_good = 0
         self.servo_best = None
         self.servo_rejected = 0
@@ -738,10 +822,33 @@ class GraspNode(Node):
                                 y, height])
                 grasp = np.array([face_x + self.grasp_depth, y, height])
                 moved = float(np.linalg.norm(grasp - self.grasp_target))
+                budget = self._reaim_budget()
+                if moved > budget:
+                    # Refuse it, and say what it was rather than what it was assumed
+                    # to be. The old line here read "the base has slid" and moved the
+                    # target however far the sighting asked, which on the run that
+                    # provoked this meant 130, 119, 67 and 169 mm inside a single
+                    # grasp -- 485 mm of correction for a base that was being held
+                    # still. The last of those landed the target outside the arm's
+                    # reach, and the servo then rejected two hundred consecutive IK
+                    # solves and timed out 442 mm away.
+                    self.get_logger().warn(
+                        "ignoring a sighting that moves the book %.0f mm, over the "
+                        "%.0f mm the base could have carried it: a fresh look at the "
+                        "gripper is still a bad look at the book"
+                        % (moved * 1000, budget * 1000))
+                    return
+                if not self._within_reach(grasp):
+                    self.get_logger().warn(
+                        "ignoring a sighting %.0f mm from the shoulder; the arm "
+                        "reaches %.0f mm" % (self._from_shoulder(grasp) * 1000,
+                                             ARM_MAX_REACH * 1000))
+                    return
                 if moved > 0.005:
                     self.get_logger().info(
-                        "the base has slid; re-aimed from perception, target moved "
-                        "%.0f mm" % (moved * 1000))
+                        "re-aimed from perception, target moved %.0f mm"
+                        % (moved * 1000))
+                self.target_set_at = self._now()
                 self.face_x = face_x
                 self.pre_target = pre
                 self.grasp_target = grasp
@@ -755,6 +862,44 @@ class GraspNode(Node):
             "no fresh sighting (%s); holding the last measured target rather than "
             "correcting from odom, which counts wheel turns the base did not make"
             % age)
+
+    def _reaim_budget(self) -> float:
+        """How far the book may honestly have moved since the target was last set.
+
+        The base is what carries it, and the base coasts: 7.7 mm per simulated second
+        averaged over eight windows, on one heading, with a zero twist published at
+        20 Hz the whole time. See reaim_budget for the numbers and for what they cost
+        when they were guessed at instead.
+
+        The point of the bound is not to stop the target moving. It is to stop it
+        jumping: the arm and the open gripper end up between the camera and the book by
+        construction, the code below has always known that -- "the arm occludes the book
+        on the way in" -- and a reading of the gripper is a fresh reading of the wrong
+        thing. Occlusion makes a reading wrong rather than old, so the freshness test
+        cannot see it. A rate can.
+        """
+        since = 0.0 if self.target_set_at is None else max(
+            0.0, self._now() - self.target_set_at)
+        return reaim_budget(self.reaim_allowance, self.reaim_rate, since)
+
+    def _from_shoulder(self, point) -> float:
+        """How far a point is from the shoulder, which is what the arm has to span."""
+        joints = self._current_joints()
+        torso = float(joints[0]) if joints else 0.0
+        shoulder = self.chain.joint_origins([torso] + [0.0] * 7)[1]
+        return float(np.linalg.norm(np.asarray(point, dtype=float) - shoulder))
+
+    def _within_reach(self, point) -> bool:
+        """Whether the arm could put its gripper there at all.
+
+        Not a judgement about whether the posture is a good one -- measured, the arm
+        holds 85 and even 88 per cent of its maximum extension to within 3 mm, so
+        there is no cliff to keep clear of here. This is only about targets that are
+        arithmetically impossible, which a bad sighting will happily produce: the run
+        that failed ended up aiming past the end of the arm, and every symptom after
+        that was the arm being asked for somewhere it cannot go.
+        """
+        return self._from_shoulder(point) <= ARM_MAX_REACH * self.reach_margin
 
     def _gripper_now(self) -> Optional[np.ndarray]:
         """Where the gripper actually is, from the joints rather than from a promise."""
@@ -821,6 +966,7 @@ class GraspNode(Node):
 
         self.pre_odom = self._to_odom(self.pre_target)
         self.grasp_odom = self._to_odom(self.grasp_target)
+        self.target_set_at = self._now()
         if self.grasp_odom is None:
             self.get_logger().warn(
                 "no odom transform; the target cannot be held against base movement")
@@ -938,7 +1084,7 @@ class GraspNode(Node):
                 values.append(float(value))
         return names, values
 
-    def _posture_that_can_reach_in(self, attempts: int = 12):
+    def _posture_that_can_reach_in(self, attempts: int = 24):
         """Choose a pre-grasp posture by whether the reach works FROM it.
 
         Two conditions, and the second is the one that was missing. A posture has to be
@@ -950,6 +1096,13 @@ class GraspNode(Node):
 
         Testing costs a Cartesian plan per candidate, no motion, and it replaces a
         failure that was intermittent and looked like bad luck.
+
+        The attempt budget is generous because the search stops as soon as it has
+        collected enough candidates, so the extra tries cost nothing on the rows where
+        postures are plentiful and are only spent where they are scarce. The bottom row
+        is where that bites: standing 0.81 m out and reaching down to z=0.356, one run
+        found a single posture that reached in twelve tries, and the one it found was
+        the one that failed.
         """
         best = None
         usable = None
@@ -1048,6 +1201,14 @@ class GraspNode(Node):
 
         The slack lets it trade a little height for reach, without handing the whole job
         back to the arm.
+
+        On the top two rows none of that applies, and it is worth being plain about it
+        rather than leaving the paragraph above to imply otherwise. The torso tops out
+        at 0.35 m, which puts the shoulder at 1.027; row 2 sits at 1.061 and row 1 at
+        1.391, so the clip binds and the arm reaches UP by 34 mm and 319 mm rather than
+        down. There is nothing to be done about that -- it is the length of the torso --
+        and it is not the disaster it sounds: measured with tools/sagcheck.py, the arm
+        holds a 0.935 m reach to the top row within 3 mm, and 0.97 m within 1 mm.
         """
         ideal = float(np.clip(height - SHOULDER_BASE_Z + 0.25, 0.0, 0.35))
         return {"torso_lift_joint": (ideal, 0.10)}
@@ -1129,7 +1290,7 @@ class GraspNode(Node):
         return True
 
     def _reach_clearance(self, start_solution, start_point, end_point,
-                         steps: int = 4) -> float:
+                         steps: int = REACH_STEPS) -> float:
         """How far along a straight line this posture can get, as a fraction.
 
         The same walk as _straight_path, without building the trajectory, so a candidate
@@ -1157,7 +1318,8 @@ class GraspNode(Node):
             seed = solution
         return 1.0
 
-    def _straight_path(self, start_solution, start_point, end_point, steps: int = 8):
+    def _straight_path(self, start_solution, start_point, end_point,
+                       steps: int = REACH_STEPS):
         """Joint waypoints tracing a straight line in space, each one checked.
 
         The analytic solver is seeded from the previous waypoint so consecutive postures
@@ -1561,6 +1723,7 @@ class GraspNode(Node):
         self.servo_good = 0
         self.servo_best = None
         self.servo_rejected = 0
+        self.servo_stuck = 0
         self._enter(State.SERVO)
 
     # ------------------------------------------------------------------ servo
@@ -1604,6 +1767,21 @@ class GraspNode(Node):
             self._enter(State.CLAMP)
             return
 
+        # Consecutive refusals mean the loop has nothing left to try, and waiting
+        # changes nothing: the servo only ever moves 12 mm at a time towards a target
+        # that is not moving either. Forty seconds of that is forty seconds the run
+        # does not get back, and the state it ends in is the state it was in after the
+        # first few ticks.
+        if self.servo_stuck >= self.servo_stuck_limit:
+            self.get_logger().error(
+                "the servo has refused %d corrections in a row at %s. %s"
+                % (self.servo_stuck, self._miss(target),
+                   "The book is past the end of the arm."
+                   if not self._within_reach(target)
+                   else "The arm cannot get there from where it is."))
+            self._enter(State.FAILED)
+            return
+
         if self._now() - self.servo_since > self.servo_timeout:
             self.get_logger().error(
                 "the servo could not hold the book: %s after %.0f s, closest it came "
@@ -1643,11 +1821,21 @@ class GraspNode(Node):
 
         if solution is None:
             self.servo_rejected += 1
+            self.servo_stuck += 1
             if self.servo_rejected % 10 == 1:
+                # Say how far away it is. The old line said "holding", which sounds
+                # like a controller waiting out a transient; on the run that provoked
+                # this it printed twenty times over forty seconds while the gripper
+                # sat 442 mm from a target the arm could not have reached, and read
+                # the same at 12 mm as at 442.
                 self.get_logger().warn(
-                    "no neighbouring solve for a %.0f mm correction; holding"
-                    % (min(self.servo_step, distance) * 1000))
+                    "no neighbouring solve for a %.0f mm correction, %.0f mm from "
+                    "the book%s"
+                    % (min(self.servo_step, distance) * 1000, distance * 1000,
+                       "" if self._within_reach(self.grasp_target)
+                       else " -- which is past the end of the arm"))
             return False
+        self.servo_stuck = 0
 
         # Ask for the standing error again on top of the solve, so the command outlives
         # the joint friction that would otherwise stall it short.
