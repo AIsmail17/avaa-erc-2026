@@ -52,7 +52,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
-from std_msgs.msg import Int32, String
+from std_msgs.msg import Float32, Int32, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from avaa_solution.kinematics.arm_chain import ArmChain
@@ -65,6 +65,9 @@ from avaa_solution.approach_node import RIGHT_TUCK
 
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
+# The yaw error against the shelf, from the depth image. The only measurement
+# of this robot's orientation against the world that it has.
+TOPIC_SHELF_YAW = "/avaa/perception/shelf_yaw"
 TOPIC_STATE = "/avaa/grasp/state"
 GRIPPER_TOPIC = "/gripper_left_controller_raw/joint_trajectory"
 # The last few centimetres are servoed, not planned, so they are published straight
@@ -390,6 +393,19 @@ class GraspNode(Node):
         # to 15-35 mm in x against ground truth, so the fixed part is a little over
         # twice its own error; the rate is per second since the target was set, and is
         # generous against a base measured at 0.0 mm per simulated second while held.
+        # Holding the base against the camera. The gains are deliberately gentle: a
+        # coast is 8 mm/s, so nothing here needs a fast loop, and every millimetre of
+        # base motion while the arm is inside the shelf is a millimetre the gripper is
+        # dragged. The cap is what stops a bad sighting driving the robot into the
+        # shelf, which costs half a point each time.
+        self.declare_parameter("hold_gain", 1.5)
+        self.declare_parameter("hold_yaw_gain", 0.8)
+        self.declare_parameter("hold_max_speed_m_s", 0.040)
+        self.declare_parameter("hold_max_yaw_rad_s", 0.15)
+        self.declare_parameter("hold_deadband_m", 0.012)
+        self.declare_parameter("hold_yaw_deadband_rad", 0.02)
+        # Beyond this the reading is disbelieved rather than driven on.
+        self.declare_parameter("hold_limit_m", 0.20)
         self.declare_parameter("reaim_allowance_m", 0.06)
         # Per second since the target was set. The base coasts at 7.7 mm a simulated
         # second (tools/coast.py, eight windows, heading agreement 0.98), so this is
@@ -513,6 +529,19 @@ class GraspNode(Node):
             self.get_parameter("max_torque_fraction").value)
         self.min_pregrasp_x = float(
             self.get_parameter("min_pregrasp_x_m").value)
+        self.hold_gain = float(self.get_parameter("hold_gain").value)
+        self.hold_yaw_gain = float(self.get_parameter("hold_yaw_gain").value)
+        self.hold_max_speed = float(
+            self.get_parameter("hold_max_speed_m_s").value)
+        self.hold_max_yaw = float(self.get_parameter("hold_max_yaw_rad_s").value)
+        self.hold_deadband = float(self.get_parameter("hold_deadband_m").value)
+        self.hold_yaw_deadband = float(
+            self.get_parameter("hold_yaw_deadband_rad").value)
+        self.hold_limit = float(self.get_parameter("hold_limit_m").value)
+        self.hold_ref = None
+        self.hold_last = None
+        self.shelf_yaw = None
+        self.shelf_yaw_at = None
         self.reaim_allowance = float(
             self.get_parameter("reaim_allowance_m").value)
         self.reaim_rate = float(self.get_parameter("reaim_rate_m_per_s").value)
@@ -593,6 +622,8 @@ class GraspNode(Node):
         self.create_subscription(
             String, "/avaa/mission/phase", self._on_phase, 10)
         self.create_subscription(PointStamped, TOPIC_BOOK_POINT, self._on_book, 10)
+        self.create_subscription(
+            Float32, TOPIC_SHELF_YAW, self._on_shelf_yaw, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
         self.pub_gripper = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
         self.pub_arm = self.create_publisher(JointTrajectory, ARM_TOPIC, 10)
@@ -967,6 +998,7 @@ class GraspNode(Node):
         self.pre_odom = self._to_odom(self.pre_target)
         self.grasp_odom = self._to_odom(self.grasp_target)
         self.target_set_at = self._now()
+        self._start_holding()
         if self.grasp_odom is None:
             self.get_logger().warn(
                 "no odom transform; the target cannot be held against base movement")
@@ -1377,16 +1409,95 @@ class GraspNode(Node):
 
     # ------------------------------------------------------------------ states
 
-    def _hold_base(self) -> None:
-        """Ask the wheels to stand still, which is not what silence asks them.
+    def _on_shelf_yaw(self, msg: Float32) -> None:
+        self.shelf_yaw = float(msg.data)
+        self.shelf_yaw_at = self._now()
 
-        Only once the grasp is under way. While this node is IDLE the approach
-        controller still owns the base, and two publishers on /cmd_vel disagreeing at
-        20 Hz would be worse than either alone.
+    def _hold_base(self) -> None:
+        """Hold the base against what the camera sees, because nothing else can see it.
+
+        A zero twist was what used to be here, and it does nothing. Measured against
+        Gazebo over four conditions (tools/drift.py, tools/coast.py): 7.72 mm per
+        simulated second with a zero twist published at 20 Hz against 8.01 with nothing
+        commanded at all, and 0.551 deg/s against 0.567. The base coasts -- eight
+        windows at 6.8 to 8.7 mm/s on one heading, agreement 0.98 of 1.0 -- and the
+        wheel model is why: mu2 is 0 across the roller axis, so there is no friction to
+        shed a slide, and commanding zero wheel speed asks the wheels not to turn
+        rather than asking the base to stop.
+
+        Cancelling it works once it is measured -- 7.07 mm/s down to 2.02 driving
+        against it at a gain of 2 (tools/stopcoast.py) -- and the whole difficulty is
+        the measurement. Odom cannot supply it: blind to a slide by construction, and
+        measured blind to this rotation too, since driving against its yaw rate at a
+        gain of 2 removes 23 per cent of a turn a real sensor would have over-corrected.
+
+        So this closes the loop on the two things the camera does measure, and the
+        useful part is that it does not need to know which of them moved:
+
+            the book position in base_link        ->  linear correction
+            the shelf yaw from the depth image    ->  angular correction
+
+        The arm does not care whether the base slid or turned. It cares that the book
+        is where it was aimed, in base_link, and that the way into the shelf is still
+        square. Those are exactly the two quantities here, and both are measured rather
+        than integrated: the book to 15-35 mm, the shelf yaw to 1.4 degrees.
+
+        When the arm occludes the book -- which it will, going in -- the last command is
+        held rather than dropped. A coast is a constant velocity, so a stale correction
+        for it is still the right correction, where a zero twist is not.
         """
         if self.state is State.IDLE and not self._my_turn():
             return
-        self.pub_cmd.publish(Twist())
+        self.pub_cmd.publish(self._hold_command())
+
+    def _hold_command(self) -> Twist:
+        """Work out the correction to publish, holding the last if the camera is blind."""
+        twist = Twist()
+        fresh = (self.book is not None and self.book_at is not None
+                 and (self.get_clock().now() - self.book_at).nanoseconds / 1e9
+                 <= self.book_fresh)
+
+        if fresh and self.hold_ref is not None:
+            error = np.asarray(self.book, dtype=float)[:2] - self.hold_ref
+            size = float(np.linalg.norm(error))
+            # An error this large is not a base that has drifted, it is a bad look --
+            # the same reading the re-aim bound refuses. Driving on one would put the
+            # base into the shelf, which costs half a point every time it happens.
+            if size <= self.hold_limit:
+                for index, value in enumerate(error):
+                    if abs(value) <= self.hold_deadband:
+                        continue
+                    speed = float(np.clip(self.hold_gain * value,
+                                          -self.hold_max_speed, self.hold_max_speed))
+                    if index == 0:
+                        twist.linear.x = speed
+                    else:
+                        twist.linear.y = speed
+
+        if (self.shelf_yaw is not None and self.shelf_yaw_at is not None
+                and (self._now() - self.shelf_yaw_at) <= self.book_fresh
+                and abs(self.shelf_yaw) > self.hold_yaw_deadband):
+            twist.angular.z = float(np.clip(
+                -self.hold_yaw_gain * self.shelf_yaw,
+                -self.hold_max_yaw, self.hold_max_yaw))
+
+        if twist.linear.x or twist.linear.y or twist.angular.z:
+            self.hold_last = twist
+            return twist
+        # Nothing measurable this tick. Keep correcting the coast rather than asking
+        # the wheels for a zero they have no friction to enforce.
+        if not fresh and self.hold_last is not None:
+            return self.hold_last
+        return twist
+
+    def _start_holding(self) -> None:
+        """Remember where the book was, so the base can be held against it."""
+        if self.book is not None:
+            self.hold_ref = np.asarray(self.book, dtype=float)[:2].copy()
+            self.hold_last = None
+            self.get_logger().info(
+                "holding the base against the book at %s"
+                % np.round(self.hold_ref, 3).tolist())
 
     def _my_turn(self) -> bool:
         """Whether the mission has handed this controller the base.
