@@ -96,14 +96,20 @@ def nearest_book(colour):
     return best
 
 
-TUCK_POSE = [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
-# The right arm is never used and it still has to be out of the shelf. Left at the pose
-# it spawns in, gripper_right_base_link sits at x=+0.86 in base_link, which at a 0.68 m
-# standoff is 0.18 m inside the shelf: every pre-grasp posture then comes back in
-# collision -- arm_right_4/5/6/7 against shelf_board_2 -- and the grasp fails before it
-# has moved. Tucked, the same link sits at x=-0.52, behind the robot.
-RIGHT_TUCK = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
-TUCK_TORSO = 0.15
+# Imported, not copied.
+#
+# These were three literals here, and they went stale the moment the driving posture
+# changed: the fixture would have gone on tucking the arms to the old pose while the
+# solution used the new one, and every grasp measured afterwards would have started from
+# a posture the robot never actually drives in. A fixture that disagrees with the thing
+# it is testing is worse than no fixture.
+#
+# The right arm matters as much as the left here. Left at the pose it spawns in,
+# gripper_right_base_link sits at x=+0.86 in base_link, which at a 0.68 m standoff is
+# 0.18 m inside the shelf: every pre-grasp posture then comes back in collision --
+# arm_right_4/5/6/7 against shelf_board_2 -- and the grasp fails before it has moved.
+from avaa_solution.approach_node import (  # noqa: E402
+    RIGHT_TUCK, TUCK_POSE, TUCK_TORSO)
 
 
 def hold_the_base(node):

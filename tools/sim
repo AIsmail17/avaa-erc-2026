@@ -182,6 +182,16 @@ ORPHAN_PATTERNS=(
     # TF_OLD_DATA, and a real-time factor down at 0.08. Every measurement taken in that
     # state is worthless, and it is not obvious from the logs that anything is wrong.
     'avaa_solution/lib'
+    # move_group above all. It is not started by the simulation launch, so nothing swept
+    # it up, and every 'sim restart' left the previous one running: three were found
+    # alive at once, each burning 14 per cent of a core with about 48 minutes of
+    # accumulated CPU time. That is not merely waste. They all subscribe to
+    # /joint_states, all publish a planning scene, and all answer /check_state_validity
+    # and the plan and execute actions, so a request can be served by any of them and
+    # each holds its own idea of where the shelf is.
+    '[m]ove_group'
+    # The live view and its bridge outlive the simulation they were watching.
+    '[l]iveview'
 )
 
 stop_orphans() {
