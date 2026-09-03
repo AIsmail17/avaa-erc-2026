@@ -45,24 +45,33 @@ def main():
         print("move_group is not running")
         return
 
-    print("%-6s %-26s %-14s %-14s" % ("row", "pre-grasp point", "solves?", "clear?"))
+    # Sweep the standing distance, because that is the thing we can choose.
+    #
+    # The grasp failed with all twelve candidate pre-grasp postures for row 4 in
+    # collision, reaching from a face 0.764 m away. Reaching the bottom row from further
+    # back is a longer, flatter reach that passes closer to the board above it, so the
+    # question is not "is row 4 reachable" but "from how far away". The approach's
+    # standoff is a parameter; this says what to set it to.
+    faces = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
+    print("clear pre-grasp postures out of 12, by row and by distance to the book face")
+    print("%-6s %s" % ("", "  ".join("%5.2f" % f for f in faces)))
     for index, height in enumerate(ROW_HEIGHTS):
         z = height - BELOW_CENTRE
-        point = np.array([max(FACE_X - STANDOFF, 0.34), 0.16, z])
-        found = 0
-        clear = 0
-        for attempt in range(12):
-            seed = None if attempt == 0 else [
-                float(np.random.uniform(lo, hi)) for lo, hi in chain.limits]
-            solution = chain.ik(point, seed=seed, approach=APPROACH, closing=CLOSING)
-            if solution is None:
-                continue
-            found += 1
-            if client.state_valid(CHAIN, list(solution)) is not False:
-                clear += 1
-        print("%-6d %-26s %-14s %-14s"
-              % (index + 1, np.round(point, 3).tolist(),
-                 "%d of 12" % found, "%d of %d" % (clear, found)))
+        cells = []
+        for face in faces:
+            point = np.array([max(face - STANDOFF, 0.34), 0.16, z])
+            clear = 0
+            for attempt in range(12):
+                seed = None if attempt == 0 else [
+                    float(np.random.uniform(lo, hi)) for lo, hi in chain.limits]
+                solution = chain.ik(point, seed=seed, approach=APPROACH,
+                                    closing=CLOSING)
+                if solution is None:
+                    continue
+                if client.state_valid(CHAIN, list(solution)) is not False:
+                    clear += 1
+            cells.append("%5d" % clear)
+        print("row %-2d %s" % (index + 1, "  ".join(cells)))
 
     client.shutdown()
     rclpy.shutdown()
