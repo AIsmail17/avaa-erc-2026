@@ -257,6 +257,7 @@ class ApproachNode(Node):
         self.search_rate = float(self.get_parameter("search_rate").value)
         self.lost_grace = float(self.get_parameter("lost_grace_sec").value)
         self.lost_since: Optional[float] = None
+        self.unsquared_since: Optional[float] = None
         self.search_timeout = float(self.get_parameter("search_timeout_sec").value)
         self.image_width = int(self.get_parameter("image_width_px").value)
         self.tuck_time = float(self.get_parameter("tuck_time_sec").value)
@@ -992,12 +993,45 @@ class ApproachNode(Node):
             if ahead is not None and ahead < self.acquire_range - self.standoff_tol:
                 cmd = Twist()
                 cmd.linear.x = -min(self.max_fwd, 0.5 * (self.acquire_range - ahead))
+                # Hold the heading while reversing, or the reverse becomes a pirouette.
+                #
+                # The first version commanded linear velocity alone, on the reasoning
+                # that backing straight up needs no steering. It does on this base:
+                # there is no friction across the roller axis, so whatever rotation the
+                # robot already had it keeps, and nothing was cancelling it. Measured on
+                # the run that found this, the robot backed off from 0.74 m to 1.4 m and
+                # arrived facing -95 degrees -- side-on to the shelf, with the LiDAR
+                # reading 3.92 m down the room and no book in view anywhere. It had
+                # solved the problem it was reversing to solve and created a worse one.
+                #
+                # Squaring against the shelf if it can be seen; otherwise simply damping
+                # the rate, which needs nothing but odometry and stops the drift.
+                cmd.angular.z = (self._turn(-angle, 0.8) if angle is not None
+                                 else self._turn(0.0, 0.0, floor=0.0))
                 self.pub_cmd.publish(cmd)
                 self.get_logger().warn(
                     "acquiring: no fix and the shelf is only %.2f m ahead, which is "
                     "closer than the %.2f m checkpoint; backing off to see the book"
                     % (ahead, self.acquire_range), throttle_duration_sec=3.0)
                 return
+
+            # No fix, and no flat face to square against either: the robot is not
+            # looking at the shelf at all. Sweep for the marker again rather than stand
+            # here reasoning about a shelf that is not in front of it.
+            if angle is None:
+                if self.unsquared_since is None:
+                    self.unsquared_since = self._now()
+                elif self._now() - self.unsquared_since > self.lost_grace:
+                    self.get_logger().warn(
+                        "no book and no shelf face for %.0f s; the robot is not facing "
+                        "the shelf, so searching again" % self.lost_grace)
+                    self.unsquared_since = None
+                    self._stop()
+                    self._enter(State.SEARCH)
+                    return
+            else:
+                self.unsquared_since = None
+
             self._stop()
             if angle is not None and abs(angle) > self.square_tol:
                 cmd = Twist()
