@@ -216,14 +216,24 @@ class ApproachNode(Node):
         # 190 mm to go on a run that was converging steadily.
         self.declare_parameter("acquire_timeout_sec", 120.0)
         self.declare_parameter("search_rate", 0.35)
-        # How long the target column may be out of view before the robot
-        # gives up centring on it and sweeps for it again.
-        self.declare_parameter("lost_grace_sec", 4.0)
+        # How long the target column may be out of view before the robot gives up
+        # centring on it and sweeps for it again.
+        #
+        # Four seconds was far too eager. The overhead marker is small and read from a
+        # moving base with a moving head, so it drops out of a frame or two constantly;
+        # measured, the approach re-searched six times in three minutes and never got
+        # past centring, losing the marker four seconds into each attempt. The bearing
+        # it steers by is still required to be fresh -- this only governs when to give
+        # up on the column altogether, which is a much rarer event than a missed read.
+        self.declare_parameter("lost_grace_sec", 12.0)
         # How far the book may sit off the reaching arm's centre line and
         # still be worth handing to the grasp. The pre-grasp is chosen from
         # twelve candidate postures and they run out well before the arm
         # does; 0.25 m is comfortably inside where they still solve.
         self.declare_parameter("lateral_tolerance_m", 0.25)
+        # How long to stand squared with no acceptable fix before giving
+        # up on the anchor and sweeping for the marker again.
+        self.declare_parameter("nofix_grace_sec", 20.0)
         self.declare_parameter("row_heights", DEFAULT_ROW_HEIGHTS)
         # Where to pause and confirm the book before committing to the final drive.
         #
@@ -263,6 +273,8 @@ class ApproachNode(Node):
         self.lost_grace = float(self.get_parameter("lost_grace_sec").value)
         self.lateral_tol = float(
             self.get_parameter("lateral_tolerance_m").value)
+        self.nofix_grace = float(self.get_parameter("nofix_grace_sec").value)
+        self.nofix_since: Optional[float] = None
         self.lost_since: Optional[float] = None
         self.unsquared_since: Optional[float] = None
         self.search_timeout = float(self.get_parameter("search_timeout_sec").value)
@@ -311,7 +323,26 @@ class ApproachNode(Node):
         # How far a later sighting may sit from that anchor and still be believed.
         # Column spacing is about 0.95 m, so this stays well inside the distance to
         # the neighbouring column while allowing for depth noise and odom drift.
-        self.anchor_gate = 0.30
+        # How far a sighting may sit from the anchored one and still be believed.
+        #
+        # Was 0.30 m, and it had become the thing stopping the approach. Measured over
+        # several runs, the acquire state stood squared at the shelf refusing every
+        # sighting until it timed out -- perception saying plainly that it could see the
+        # book, the approach saying it had no fix it would accept.
+        #
+        # The gate is held in ODOM, and this project has measured what odom does here:
+        # during one run held to 17 mm of true error it accumulated 813 mm of travel
+        # that never happened, because the base slides across wheels that do not turn.
+        # So the anchor drifts away from the book while the robot drives, and then
+        # rejects the correct sighting for disagreeing with a stale number.
+        #
+        # It was guarding against being talked out of a good fix by a bad one -- the
+        # bearing jumping to a different book of the same colour. Perception now guards
+        # that at source, by following the book nearest where the marker last put the
+        # target rather than whichever is nearest the middle of the frame, which is both
+        # earlier and better placed to know. So this is widened to reject only wild
+        # outliers rather than to arbitrate between candidates.
+        self.anchor_gate = 1.20
         # Sightings waiting to agree with each other before one of them is trusted, and
         # sightings that disagreed with the anchor. Both need to be consistent among
         # themselves before they are acted on. See _accept_sighting.
@@ -1063,7 +1094,11 @@ class ApproachNode(Node):
             else:
                 self.unsquared_since = None
 
-            self._stop()
+            # No _stop() before the turn. This is the same fault that made the
+            # squaring look dead once before: a zero twist published on the tick, then
+            # a turn published on the same tick, and the base given stop, turn, stop,
+            # turn. Measured again here, the shelf angle read -5.2 degrees for a
+            # minute and a half while a correction was commanded throughout.
             if angle is not None and abs(angle) > self.square_tol:
                 cmd = Twist()
                 cmd.angular.z = self._turn(-angle, 0.8)
@@ -1071,6 +1106,26 @@ class ApproachNode(Node):
                 self.get_logger().info(
                     "acquiring: squaring to look for the book, face %+.1f deg"
                     % math.degrees(angle), throttle_duration_sec=3.0)
+                return
+
+            # Squared, and still no fix. Perception can see the book -- it says so --
+            # but every sighting is being refused by the anchor gate, so the approach
+            # has a target it will not believe. Standing here squared and blind until
+            # the state times out achieves nothing; go and look again, which clears the
+            # anchor along with everything else.
+            self._stop()
+            if self.nofix_since is None:
+                self.nofix_since = self._now()
+            elif self._now() - self.nofix_since > self.nofix_grace:
+                self.get_logger().warn(
+                    "squared for %.0f s with no fix on the book that the anchor will "
+                    "accept; searching again" % self.nofix_grace)
+                self.nofix_since = None
+                self.target_odom = None
+                self.anchor_candidates.clear()
+                self.anchor_disagree.clear()
+                self.anchor_rejects = 0
+                self._enter(State.SEARCH)
                 return
             self.get_logger().warn(
                 "acquiring: no metric fix on the book to drive to",
@@ -1110,6 +1165,7 @@ class ApproachNode(Node):
         # is asymptotically stable for k_rho > 0, k_beta < 0, k_alpha > k_rho. It curves
         # into the goal and arrives square, which is exactly the manoeuvre a strafe was
         # standing in for.
+        self.nofix_since = None
         gx, gy = goal
         rho = math.hypot(gx, gy)
         if rho > self.acquire_pose_tol:
