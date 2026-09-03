@@ -80,6 +80,15 @@ DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 # outside that.
 SELF_FILTER_RADIUS = 0.45
 
+# How far the book faces sit BEHIND the shelf's own front edge.
+#
+# Measured from the supplied mesh rather than assumed: erc_base_shelf.STL spans 0.35 m
+# in the depth direction and the world places it so its front edge is at x=2.755, while
+# the books stand with their faces at x=2.820. So a laser range to the shelf face
+# understates the distance to the book by this much, and saying so once here is better
+# than each caller guessing.
+SHELF_FRONT_TO_BOOK_FACE = 0.065
+
 TOPIC_TARGET_COLUMN_X = "/avaa/perception/target_column_x"
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
@@ -523,52 +532,92 @@ class ApproachNode(Node):
             return None
         return float(min(math.hypot(x, y) for x, y in points))
 
-    def _shelf_angle(self) -> Optional[float]:
-        """Yaw error against the shelf face: 0 when square on, positive when yawed CCW.
+    def _shelf_face(self, half_angle: float = 0.45):
+        """Find the shelf's front face: (perpendicular distance, yaw error), or None.
 
-        Fits a line to the forward returns. The shelf front is flat and 5.25 m wide, so
-        within a narrow cone it is a clean straight edge. For a robot yawed by theta, a
-        surface of constant world x appears in the robot frame with dx/dy = tan(theta), so
-        the fitted slope is the yaw error directly.
+        The one measurement the whole approach should be built on, and the reason it is
+        worth its own method rather than being two loosely related ones.
 
-        Returns None when the fit is not credible, rather than squaring up to whatever
-        happens to be in front. Without that guard a robot that has turned away from the
-        shelf will happily square itself to the far wall.
+        The shelf front is flat and 5.25 m wide, which makes it the most reliable thing
+        any sensor on this robot can see -- far more reliable than a small overhead
+        marker read from a moving base, which is what the approach steered by and which
+        dropped out constantly. Four of the Amazon Picking Challenge teams used a laser
+        on the base for exactly this: aligning to the shelf, not finding objects.
+
+        Why the NEAREST large surface rather than the largest. _shelf_angle takes the
+        biggest consensus set, and through an open shelf the biggest is not always the
+        front: the beam passes through the unstocked bottom shelf and the row openings to
+        the back panel 0.35 m behind, and when enough of it does, the back panel wins the
+        vote. Then the reported range is a third of a metre too far, the drive overshoots
+        by that much, and on the top row that is the difference between seeing the book
+        and being stuck too close to see it. Measured: the squaring read a face at -20.7
+        and then -38.9 degrees at the standoff, and could not fit anything at all a
+        moment later.
+
+        Taking the nearest surface that has enough points behind it separates all three
+        cases the scan actually contains:
+
+          - the front face: many points, nearest          -> chosen
+          - the back panel: many points, 0.35 m further   -> rejected, further away
+          - one book pulled proud of the shelf: nearest,
+            but only a handful of points                  -> rejected, too few
+
+        Distance and angle come from the same fit, so they cannot disagree about which
+        surface they describe -- which two separate helpers reading the same scan could,
+        and did.
         """
-        points = self._forward_points(half_angle=0.45)
+        points = self._forward_points(half_angle=half_angle)
         if len(points) < 12:
             return None
         xs = np.array([p[0] for p in points])
         ys = np.array([p[1] for p in points])
 
-        # Fit the surface most of the returns agree on, not all of them at once.
-        # Two different scenes broke a plain least-squares line here. Far from the
-        # shelf the cone reaches past the end of it to the wall 2.5 m beyond, and
-        # those returns pulled the angle from -34 to -53 degrees. Close in, a flat
-        # face at x = 0.85 spanning the whole cone had one object sticking out to
-        # x = 0.55 in front of it, and 46 such points out of 207 held the residual at
-        # 0.10 m while the robot was in fact already square to within half a degree.
-        # Neither a nearest-return nor a median slab separates those two cases; a
-        # consensus fit does.
-        inliers = _largest_collinear_set(xs, ys, tolerance=self.face_tolerance)
-        if inliers is None:
-            return None
-        # Squaring to a minority surface is how the robot ends up facing a shelf
-        # upright, or one pulled-out book, instead of the shelf itself.
-        if int(inliers.sum()) < max(12, int(self.face_consensus * len(xs))):
-            return None
-        xs, ys = xs[inliers], ys[inliers]
+        floor = max(12, int(self.face_consensus * len(xs)))
+        best = None
+        remaining = np.ones(len(xs), dtype=bool)
 
-        # x as a function of y: the face is roughly parallel to the robot's y axis,
-        # so this avoids the vertical-line singularity of fitting y = f(x).
-        slope, intercept = np.polyfit(ys, xs, 1)
+        # Peel off surfaces one at a time. Three passes is enough for this scene: the
+        # front face, the back panel, and whatever else is in the cone.
+        for _ in range(3):
+            if int(remaining.sum()) < floor:
+                break
+            sub_x, sub_y = xs[remaining], ys[remaining]
+            inliers = _largest_collinear_set(
+                sub_x, sub_y, tolerance=self.face_tolerance)
+            if inliers is None or int(inliers.sum()) < floor:
+                break
+            face_x, face_y = sub_x[inliers], sub_y[inliers]
+            slope, intercept = np.polyfit(face_y, face_x, 1)
+            residual = float(np.std(face_x - (slope * face_y + intercept)))
+            if residual <= 0.05:
+                # Perpendicular distance from the base to the fitted line. The line is
+                # x = slope*y + intercept, so the foot of the perpendicular from the
+                # origin is at intercept / sqrt(1 + slope^2).
+                distance = abs(float(intercept)) / math.sqrt(1.0 + slope * slope)
+                if best is None or distance < best[0]:
+                    best = (distance, float(math.atan(slope)), int(inliers.sum()))
+            # Drop this surface's points and look for the next one.
+            index = np.where(remaining)[0]
+            remaining[index[inliers]] = False
 
-        # The consensus step has already separated the surfaces, so what is left
-        # should be tight. A clean face measured 0.02 m.
-        residual = float(np.std(xs - (slope * ys + intercept)))
-        if residual > 0.05:
+        if best is None:
             return None
-        return float(math.atan(slope))
+        distance, angle, count = best
+        self.get_logger().debug(
+            "shelf face at %.2f m, %+.1f deg, from %d returns"
+            % (distance, math.degrees(angle), count))
+        return distance, angle
+
+    def _shelf_angle(self) -> Optional[float]:
+        """Yaw error against the shelf face: 0 when square on, positive when yawed CCW.
+
+        Now a thin wrapper over _shelf_face, so the angle and the distance can never
+        describe two different surfaces. They could before, and did: one helper took the
+        largest consensus set and the other took the median of a narrow cone, and through
+        an open shelf those are the back panel and the front face respectively.
+        """
+        face = self._shelf_face()
+        return None if face is None else face[1]
 
     # ------------------------------------------------------------------ control
 
@@ -922,6 +971,18 @@ class ApproachNode(Node):
         back to the LiDAR only before the book has been found, when a rough range is
         enough to close the initial distance.
         """
+        # The shelf face first, the book second, the raw scan last.
+        #
+        # This used to prefer the book's own depth, on the grounds that it measures the
+        # thing we care about. It does, and it is also the measurement that disappears
+        # exactly when the robot most needs a range -- when the head has tilted, or the
+        # base has turned, or the target row has gone out of frame. The shelf face is
+        # always there, is 5.25 m of flat surface, and sits a known 65 mm in front of
+        # the book faces (measured from the mesh: shelf front at world x=2.755, book
+        # faces at 2.820).
+        face = self._shelf_face()
+        if face is not None:
+            return face[0] + SHELF_FRONT_TO_BOOK_FACE
         if self._book_located() and self.book_x is not None:
             return self.book_x
         # The NEAREST return in a wide cone, not the median of a narrow one.
