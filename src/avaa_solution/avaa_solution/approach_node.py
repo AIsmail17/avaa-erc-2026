@@ -219,6 +219,11 @@ class ApproachNode(Node):
         # How long the target column may be out of view before the robot
         # gives up centring on it and sweeps for it again.
         self.declare_parameter("lost_grace_sec", 4.0)
+        # How far the book may sit off the reaching arm's centre line and
+        # still be worth handing to the grasp. The pre-grasp is chosen from
+        # twelve candidate postures and they run out well before the arm
+        # does; 0.25 m is comfortably inside where they still solve.
+        self.declare_parameter("lateral_tolerance_m", 0.25)
         self.declare_parameter("row_heights", DEFAULT_ROW_HEIGHTS)
         # Where to pause and confirm the book before committing to the final drive.
         #
@@ -256,6 +261,8 @@ class ApproachNode(Node):
             self.get_parameter("acquire_timeout_sec").value)
         self.search_rate = float(self.get_parameter("search_rate").value)
         self.lost_grace = float(self.get_parameter("lost_grace_sec").value)
+        self.lateral_tol = float(
+            self.get_parameter("lateral_tolerance_m").value)
         self.lost_since: Optional[float] = None
         self.unsquared_since: Optional[float] = None
         self.search_timeout = float(self.get_parameter("search_timeout_sec").value)
@@ -885,6 +892,30 @@ class ApproachNode(Node):
                 self.book_held_since = self._now()
             held = self._now() - self.book_held_since
             if held >= self.book_hold_time:
+                # Being the right DISTANCE away is not being in front of it.
+                #
+                # This declared the approach complete on range alone, and the grasp then
+                # inherited whatever sideways error was left. Measured on one run: the
+                # approach reported "book held for 3.0 s at 0.56 m" and handed over a
+                # book 0.639 m to the RIGHT of base_link -- most of a metre off the left
+                # shoulder's centre line, at the very edge of its reach. The grasp
+                # answered honestly, with none of twelve postures solving, and the
+                # failure read as an arm problem.
+                #
+                # The lateral offset is measured, not inferred: the book's own 3D fix
+                # carries it. If it is too large the robot goes back to acquiring, where
+                # the pose controller exists precisely to close it.
+                target = self._target_in_base()
+                if target is not None:
+                    sideways = float(target[1]) - SHOULDER_OFFSET_Y
+                    if abs(sideways) > self.lateral_tol:
+                        self.get_logger().warn(
+                            "the book is %.0f mm off the arm's centre line, which is "
+                            "more than the %.0f mm the grasp can take; lining up again"
+                            % (sideways * 1000, self.lateral_tol * 1000))
+                        self.book_held_since = None
+                        self._enter(State.ACQUIRE)
+                        return
                 ahead = self._distance_to_face()
                 self.get_logger().info(
                     f"approach complete — book held for {held:.1f}s at "
