@@ -971,18 +971,19 @@ class ApproachNode(Node):
         back to the LiDAR only before the book has been found, when a rough range is
         enough to close the initial distance.
         """
-        # The shelf face first, the book second, the raw scan last.
+        # The book first. The shelf face is NOT available here.
         #
-        # This used to prefer the book's own depth, on the grounds that it measures the
-        # thing we care about. It does, and it is also the measurement that disappears
-        # exactly when the robot most needs a range -- when the head has tilted, or the
-        # base has turned, or the target row has gone out of frame. The shelf face is
-        # always there, is 5.25 m of flat surface, and sits a known 65 mm in front of
-        # the book faces (measured from the mesh: shelf front at world x=2.755, book
-        # faces at 2.820).
-        face = self._shelf_face()
-        if face is not None:
-            return face[0] + SHELF_FRONT_TO_BOOK_FACE
+        # This briefly preferred a laser fit to the shelf front, on the reasoning that a
+        # 5.25 m flat surface is the most reliable thing any sensor here can see. It is
+        # not visible to this one. The laser sits 209 mm off the floor and at that height
+        # the shelf is an open compartment -- measured at 0.74 m from the front, the
+        # forward cone returned 163 beams and not one of them inside two metres, with 110
+        # of them landing on the far wall 4.5 m away, straight through the unit. See
+        # tools/ranges.py.
+        #
+        # So the range comes from the book when perception can see it, and from the
+        # nearest laser return otherwise, which at least measures something solid even if
+        # it is an upright rather than the face.
         if self._book_located() and self.book_x is not None:
             return self.book_x
         # The NEAREST return in a wide cone, not the median of a narrow one.
