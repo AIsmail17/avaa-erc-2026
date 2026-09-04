@@ -233,7 +233,6 @@ class PerceptionNode(Node):
     # ------------------------------------------------------------------ callbacks
 
     def _on_image(self, msg: Image) -> None:
-        self._count_frame()
         try:
             self.latest_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             self.latest_header = msg.header
@@ -257,6 +256,59 @@ class PerceptionNode(Node):
                 f"cx={live.cx:.1f} cy={live.cy:.1f}"
             )
 
+    def _tally(self, markers, hits) -> None:
+        """Count why the target marker is or is not identified, and say so.
+
+        This is the number that separates a centring that works from one that does not.
+        Watched across runs: when a bearing arrives every 0.2 to 0.3 s the state
+        converges cleanly -- -301, -199, -77, -14 px, tracking the base rotation exactly
+        -- and when it arrives every 0.8 s or slower the error sits still through tens of
+        degrees of turn. Perception reads every frame it is given, 30.3 a second
+        measured, so the gap is not the frame rate. It is how often a frame yields
+        exactly one confident marker carrying the target digit, which is what
+        _target_column_index demands before it will publish anything.
+
+        So: of the frames with markers in view, how many gave no confident read of the
+        target, how many gave one, and how many gave more than one. The last of those is
+        the interesting column, because two markers both read as the target digit means
+        the reader is confident and wrong.
+        """
+        self._seen = getattr(self, "_seen", 0) + 1
+        self._digits = getattr(self, "_digits", {})
+        self._scores = getattr(self, "_scores", {})
+        for m in markers:
+            key = "%s%s" % (m.digit, "" if m.confident else "?")
+            self._digits[key] = self._digits.get(key, 0) + 1
+            self._scores[key] = max(self._scores.get(key, 0.0), float(m.score))
+        if not hits:
+            self._none = getattr(self, "_none", 0) + 1
+        elif len(hits) > 1:
+            self._many = getattr(self, "_many", 0) + 1
+        else:
+            self._one = getattr(self, "_one", 0) + 1
+        now = self.get_clock().now().nanoseconds * 1e-9
+        since = getattr(self, "_tally_at", None)
+        if since is None:
+            self._tally_at = now
+            return
+        if now - since >= 10.0:
+            self.get_logger().info(
+                "marker %s identified on %d of %d frames in %.0f s: %d found none, "
+                "%d found more than one; %d markers in view on the last of them"
+                % (self.target_digit, getattr(self, "_one", 0), self._seen,
+                   now - since, getattr(self, "_none", 0), getattr(self, "_many", 0),
+                   len(markers)))
+            if self._digits:
+                self.get_logger().info(
+                    "  digits read in that window: %s"
+                    % ", ".join("%s x%d (best score %.2f)"
+                                % (d, n, self._scores.get(d, 0.0))
+                                for d, n in sorted(self._digits.items())))
+            self._seen = self._one = self._none = self._many = 0
+            self._digits = {}
+            self._scores = {}
+            self._tally_at = now
+
     def _count_frame(self) -> None:
         """Say how fast this node is actually looking, in SIMULATED frames a second.
 
@@ -265,6 +317,13 @@ class PerceptionNode(Node):
         bearings and has reported anything from 0.2 to 7.7 seconds, but that figure is
         contaminated -- a gap spanning a state change inflates it -- so it cannot settle
         the question. This can: it counts frames where they arrive.
+
+        Counted where the work is DONE, not where the frames arrive. The first version
+        of this sat in _on_image, which only stores the picture, and so reported the
+        camera's 30 Hz as though it were the detection rate. The detector runs on its
+        own timer at 5 Hz, which is ample for a controller that needs to turn a few
+        degrees between looks -- so this closes off the frame rate as an explanation
+        rather than confirming it.
 
         Per simulated second, because the real-time factor moves by a factor of forty
         over a session and a rate per wall second says as much about how long the
@@ -603,6 +662,7 @@ class PerceptionNode(Node):
         self.pub_bin_point.publish(msg)
 
     def _process(self) -> None:
+        self._count_frame()
         if self.latest_frame is None:
             return
         frame = self.latest_frame
@@ -890,6 +950,7 @@ class PerceptionNode(Node):
         hits = [i for i, m in enumerate(markers)
                 if m.digit == self.target_digit and m.confident
                 and abs(m.cx - self.image_centre_px) <= limit]
+        self._tally(markers, hits)
         if len(hits) != 1:
             edge = [m.digit for m in markers
                     if m.digit == self.target_digit and m.confident
