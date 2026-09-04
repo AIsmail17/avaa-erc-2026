@@ -870,10 +870,14 @@ class GraspNode(Node):
                         % (moved * 1000, budget * 1000))
                     return
                 if not self._within_reach(grasp):
+                    # Throttled. This fires on every frame once perception starts
+                    # offering a book in the wrong place, and a hundred identical
+                    # lines bury the one message that says what the run then did.
                     self.get_logger().warn(
                         "ignoring a sighting %.0f mm from the shoulder; the arm "
                         "reaches %.0f mm" % (self._from_shoulder(grasp) * 1000,
-                                             ARM_MAX_REACH * 1000))
+                                             ARM_MAX_REACH * 1000),
+                        throttle_duration_sec=5.0)
                     return
                 if moved > 0.005:
                     self.get_logger().info(
@@ -1917,17 +1921,44 @@ class GraspNode(Node):
         # step can be satisfied by a completely different posture with the same
         # fingertip position -- this arm has seven joints for three constraints -- and
         # executing that as a 0.35 s trajectory would swing the elbow through the shelf.
+        # Shorten the step, and if that is not enough, loosen the wrist.
+        #
+        # Refusing everything is what this loop did: 25 corrections in a row with the
+        # gripper 43 mm from the book, having got there along a line that was checked
+        # waypoint by waypoint. 43 mm is not a reach problem -- the arm was at 0.89 m
+        # of a possible 1.088 -- and it is not a step-size problem, because a 3 mm step
+        # was refused as flatly as a 12 mm one. What is left is the orientation: every
+        # candidate has to hold the approach and closing axes to within 0.26 rad AND
+        # stay inside 0.25 rad of where the arm already is, and deep inside a shelf
+        # there is often nothing that does both.
+        #
+        # So the wrist gives first. A few degrees of extra yaw on the last four
+        # centimetres costs far less than not arriving: the jaws are 100 mm apart at
+        # GRIPPER_OPEN and the book is 30 mm across the spine, so there is room. The
+        # ladder stops well short of the position-only solve that would let the hand
+        # arrive from the far side of the book, which was measured putting the approach
+        # axis 78 degrees off.
         solution = None
-        for scale in (1.0, 0.5, 0.25):
-            step = min(self.servo_step * scale, distance)
-            goal = here + error * (step / distance)
-            candidate = self.chain.ik(
-                goal, seed=joints, approach=GRASP_APPROACH, closing=GRASP_CLOSING,
-                pin={"torso_lift_joint": (joints[0], 0.004)})
-            if candidate is None:
-                continue
-            if max(abs(a - b) for a, b in zip(candidate, joints)) <= self.servo_max_joint:
-                solution = candidate
+        for tolerance in (0.26, 0.40, 0.55):
+            for scale in (1.0, 0.5, 0.25):
+                step = min(self.servo_step * scale, distance)
+                goal = here + error * (step / distance)
+                candidate = self.chain.ik(
+                    goal, seed=joints, approach=GRASP_APPROACH, closing=GRASP_CLOSING,
+                    orientation_tolerance=tolerance,
+                    pin={"torso_lift_joint": (joints[0], 0.004)})
+                if candidate is None:
+                    continue
+                if max(abs(a - b)
+                       for a, b in zip(candidate, joints)) <= self.servo_max_joint:
+                    solution = candidate
+                    break
+            if solution is not None:
+                if tolerance > 0.26:
+                    self.get_logger().info(
+                        "the wrist had to give %.0f degrees to close the last %.0f mm"
+                        % (math.degrees(tolerance - 0.26), distance * 1000),
+                        throttle_duration_sec=5.0)
                 break
 
         if solution is None:

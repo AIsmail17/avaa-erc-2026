@@ -365,8 +365,39 @@ cmd_status() {
         rtf=$(docker exec "$CONTAINER" /entrypoint.sh bash -c \
               "timeout 6 gz topic -t /stats -e -n 1 2>/dev/null | grep real_time_factor" 2>/dev/null)
         [ -n "$rtf" ] && echo "  $rtf"
+        echo
+        echo "== Sensors =="
+        # A simulator that is "running" but blind looks exactly like broken
+        # perception, and telling the two apart costs an afternoon.
+        #
+        # Measured on 2026-09-04: one instance came up with every controller
+        # reporting "Configured and activated" in the launch log, gz reporting a
+        # healthy 0.34 real-time factor, and the colour camera never publishing a
+        # single frame. Perception sat there logging nothing while the base swept a
+        # full circle looking for a marker it could not have seen. Nothing in
+        # 'sim status' said a word about it, because nothing in 'sim status' looked
+        # at a sensor.
+        #
+        # These are the two that matter: no colour frames means perception is blind,
+        # and no joint states means nothing knows where the arm is.
+        stream_check "colour camera" \
+            /head_front_camera/head_front_camera/color/image_raw
+        stream_check "joint states " /joint_states
     else
         red "  gazebo    : not running (run 'sim start')"
+    fi
+}
+
+# Is anything actually coming out of this topic? Prints one line either way.
+stream_check() {
+    local label="$1" topic="$2" seen
+    seen=$(docker exec "$CONTAINER" /entrypoint.sh bash -c \
+        "source /opt/erc_ws/install/setup.bash && timeout 6 ros2 topic hz $topic 2>&1 \
+         | grep -c 'average rate'" 2>/dev/null)
+    if [ "${seen:-0}" -gt 0 ]; then
+        grn "  $label : streaming"
+    else
+        red "  $label : SILENT — the simulation is up but blind. 'sim restart'."
     fi
 }
 

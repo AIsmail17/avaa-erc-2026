@@ -196,7 +196,31 @@ def generate_launch_description():
 
     # ── Controllers ──
     def spawner(name, params=None):
-        args = [name, '-c', '/controller_manager']
+        # --controller-manager-timeout, and it is not a nicety.
+        #
+        # Two timeouts, because the failure used both. The spawner waits for
+        # /controller_manager to exist, then CALLS its services, and each of those
+        # defaults to 10 s with three attempts. These fire on a fixed 8 s timer after
+        # Gazebo starts, and on a loaded machine the manager exists but is not
+        # answering yet, so all seven spawners exhaust their retries and die:
+        #
+        #     RuntimeError: Could not successfully call service
+        #     /controller_manager/list_controllers after 3 attempts
+        #
+        # The launch does not stop. It carries on with NO controllers at all, which
+        # means no /joint_states, no arm, no head, and a colour camera that never
+        # publishes a frame. Gazebo reports a healthy real-time factor throughout, and
+        # 'sim status' called it running. From the outside it looks exactly like broken
+        # perception, and it cost most of a day on 2026-09-04 to tell apart -- a
+        # standalone perception node logging nothing while the base swept a full circle
+        # hunting for a marker it had no camera to see.
+        #
+        # 120 s costs nothing when the manager is ready quickly, because the spawner
+        # returns as soon as the service appears. It only ever spends the time that
+        # would otherwise have been spent failing.
+        args = [name, '-c', '/controller_manager',
+                '--controller-manager-timeout', '120',
+                '--service-call-timeout', '60']
         if params:
             args += ['--param-file', params]
         return Node(package='controller_manager', executable='spawner',

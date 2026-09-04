@@ -53,6 +53,9 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 BASE_FRAME = "base_footprint"
 ODOM_FRAME = "odom"
+# The approach ticks at 10 Hz -- see create_timer in __init__. Named so the
+# diagnostics can turn a commanded rate into an amount of turn asked for.
+TICK_PERIOD = 0.1
 
 # Where the left shoulder sits, sideways, in base_link. The base is not the thing that
 # has to line up with the book: the arm is, and its first joint is 0.159 m to the left of
@@ -364,8 +367,18 @@ class ApproachNode(Node):
 
         self.column_cx: Optional[float] = None
         self.column_cx_at: Optional[float] = None
+        self.column_cx_new_at: Optional[float] = None
+        # Per visit to CENTRE: how much turn has been commanded, how much the base
+        # has actually turned, and how many ticks asked for nothing at all. A
+        # controller that is right but only running a fifth of the time looks exactly
+        # like a controller with the wrong gain, and these tell them apart.
+        self.centre_asked = 0.0
+        self.centre_ticks = 0
+        self.centre_idle = 0
+        self.centre_yaw0 = None
         self.scan: Optional[LaserScan] = None
         self.yaw_rate = 0.0
+        self.odom_yaw = None
         self.state = State.WAITING
         self.state_since = self._now()
 
@@ -486,7 +499,15 @@ class ApproachNode(Node):
         return self.get_clock().now().nanoseconds / 1e9
 
     def _on_column_x(self, msg: Float32) -> None:
-        self.column_cx = float(msg.data)
+        value = float(msg.data)
+        # Two timestamps, not one, and the difference between them is the whole
+        # question. column_cx_at is when a message last ARRIVED, which is what the
+        # freshness test wants. column_cx_new_at is when the NUMBER last changed, which
+        # is what a controller wants: perception can republish a value it computed
+        # several looks ago, and steering on that is steering on the past.
+        if self.column_cx is None or abs(value - self.column_cx) > 0.5:
+            self.column_cx_new_at = self._now()
+        self.column_cx = value
         self.column_cx_at = self._now()
 
     def _column_cx_fresh(self, max_age: float = 1.5) -> Optional[float]:
@@ -503,6 +524,9 @@ class ApproachNode(Node):
 
     def _on_odom(self, msg: Odometry) -> None:
         self.yaw_rate = float(msg.twist.twist.angular.z)
+        q = msg.pose.pose.orientation
+        self.odom_yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                   1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
     def _turn(self, error: float, gain: float, floor: float = 0.08) -> float:
         """Command a damped turn: proportional to the error, against the measured rate.
@@ -723,6 +747,14 @@ class ApproachNode(Node):
             self.get_logger().info(f"{self.state.value} -> {state.value}")
             self.state = state
             self.state_since = self._now()
+            if state is State.CENTRE:
+                # Only on a real transition: these count one visit to the state, and
+                # resetting them on a re-entry that is not a change would hide exactly
+                # the pattern they exist to show.
+                self.centre_asked = 0.0
+                self.centre_ticks = 0
+                self.centre_idle = 0
+                self.centre_yaw0 = self.odom_yaw
 
     def _publish_state(self) -> None:
         self.pub_state.publish(String(data=self.state.value))
@@ -1555,6 +1587,8 @@ class ApproachNode(Node):
             # marker that leaves the frame really does mean no bearing at all, and this
             # state has to be able to recover from it.
             self._stop()
+            self.centre_ticks += 1
+            self.centre_idle += 1
             if self.lost_since is None:
                 self.lost_since = self._now()
             elif self._now() - self.lost_since > self.lost_grace:
@@ -1594,11 +1628,23 @@ class ApproachNode(Node):
         cmd.angular.z = float(max(-self.max_yaw, min(
             self.max_yaw, wanted - self.turn_damping * self.yaw_rate)))
         self.pub_cmd.publish(cmd)
+        age = (0.0 if self.column_cx_new_at is None
+               else self._now() - self.column_cx_new_at)
+        self.centre_ticks += 1
+        self.centre_asked += abs(cmd.angular.z) * TICK_PERIOD
+        if self.centre_yaw0 is None and self.odom_yaw is not None:
+            self.centre_yaw0 = self.odom_yaw
+        turned = 0.0
+        if self.centre_yaw0 is not None and self.odom_yaw is not None:
+            turned = abs((self.odom_yaw - self.centre_yaw0 + math.pi)
+                         % (2 * math.pi) - math.pi)
         self.get_logger().info(
-            "centring: %+.0f px off (%.0f deg), turning at %+.2f rad/s for a bearing "
-            "that arrives every %.1f s (base already turning %+.2f)"
+            "centring: %+.0f px off (%.0f deg), turning at %+.2f rad/s; bearing "
+            "changed %.1f s ago, arrives every %.1f s; asked for %.0f deg of turn "
+            "over %d ticks (%d of them idle), base has turned %.0f deg"
             % (error_px, math.degrees(self._bearing_rad(error_px)), cmd.angular.z,
-               self.bearing_period, self.yaw_rate),
+               age, self.bearing_period, math.degrees(self.centre_asked),
+               self.centre_ticks, self.centre_idle, math.degrees(turned)),
             throttle_duration_sec=3.0)
 
     def _do_approach(self) -> None:
