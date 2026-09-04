@@ -24,6 +24,12 @@ if [ "$ok" -eq 0 ]; then echo "the simulator came up blind; not launching"; exit
 timeout 800 docker exec erc_sim /entrypoint.sh bash -c \
   'source /opt/erc_ws/install/setup.bash && ros2 launch avaa_solution solution.launch.py shelf_column_number:=3 book_colour:=red' \
   > /tmp/run_raw.log 2>&1 || true
-echo "=== done"
+# Keep it. /tmp is cleared out from under this often enough that two separate
+# investigations lost the log they were reading halfway through, and a run costs
+# thirteen minutes to reproduce.
+mkdir -p ~/erc/runs
+cp /tmp/run_raw.log ~/erc/runs/"run-$(date +%Y%m%d-%H%M%S).log"
+ls -t ~/erc/runs/*.log | tail -n +21 | xargs -r rm -f
+echo "=== done, kept at ~/erc/runs/"
 grep -E 'avaa_grasp|avaa_mission|avaa_approach' /tmp/run_raw.log | grep -v throttle | tail -30
 exit 0
