@@ -10,7 +10,38 @@ if docker exec erc_sim bash -c 'ps -eo args | grep -v grep | grep -q "[r]os2 lau
   exit 2
 fi
 
-./tools/sim restart 2>&1 | tail -3
+# Headless, and not as an optimisation.
+#
+# Started with the GUI, this launch intermittently comes up with Gazebo never
+# initialising: zero controllers reach "Configured and activated", all seven spawners die
+# with "Could not successfully call service /controller_manager/list_controllers after 3
+# attempts", and no colour frames are ever published. Counted over one evening it
+# happened on roughly a third of restarts, and the generous spawner timeouts added in
+# 15982e4 did not help, because the manager they are waiting for never exists.
+#
+# Nothing here needs to be watched. Use `sim gui` to attach a viewer to a running
+# simulation when there is something worth looking at, and the GUI for recording the
+# deliverable video.
+# Headless, and not as an optimisation.
+#
+# Started with the GUI, this launch intermittently comes up with Gazebo never
+# initialising: zero controllers reach "Configured and activated", all seven spawners die
+# on "Could not successfully call service /controller_manager/list_controllers after 3
+# attempts", and no colour frames are ever published. It happened on roughly a third of
+# restarts over one evening, and the generous spawner timeouts in 15982e4 did not help,
+# because the controller manager they wait for never exists.
+#
+# I very nearly reverted this. The first headless run looked like it had killed
+# perception outright -- no frame-rate lines, no marker tallies -- and I had a revert
+# written before checking the kept log rather than the thirty tail lines the task
+# printed. The full log has perception running perfectly: 5.0 frames per simulated
+# second, and one ten-second window with the target marker identified on 31 frames of
+# 50, the best rate yet recorded. The evidence for the revert was an artefact of where I
+# was reading.
+#
+# Nothing here needs watching. `sim gui` attaches a viewer to a running simulation when
+# there is something worth seeing, and the GUI is still the way to record the video.
+./tools/sim restart --fast --headless 2>&1 | tail -3
 echo "=== waiting for the camera to actually stream"
 ok=0
 for i in $(seq 1 12); do

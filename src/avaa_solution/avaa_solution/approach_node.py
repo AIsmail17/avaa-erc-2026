@@ -256,7 +256,31 @@ class ApproachNode(Node):
         #
         # Provisional. The right value is whatever puts the books inside the arm's working
         # envelope, which cannot be settled until grasping exists.
-        self.declare_parameter("standoff_m", 0.75)
+        # Was 0.75, and 0.75 is too far. Measured with tools/reach.py, which finds the
+        # arm's greatest shoulder-to-tip distance by sampling and hill climbing -- 1.088
+        # m -- and then works out what fraction of it each row and standoff needs:
+        #
+        #     standoff   row 1   row 2   row 3   row 4
+        #     0.60       62%     52%     57%     58%
+        #     0.65       66%     57%     61%     62%
+        #     0.75       74%     66%     70%     70%
+        #     0.85       82%     75%     78%     79%
+        #
+        # Those are all inside the envelope, so 0.75 looks safe on paper. What the table
+        # cannot show is that the base does not stop where it is told. Watched in a run,
+        # the grasp measured its target at 1126 mm from the shoulder against a maximum
+        # of 1088 -- about 0.27 m beyond where a 0.75 m standoff would have put it --
+        # and every one of twenty-four candidate postures failed at the first waypoint
+        # because the point simply cannot be occupied.
+        #
+        # 0.65 keeps the same margin against the shelf that mattered before (the bumper
+        # is 0.36 m out, so this leaves about 0.21 m of clearance ahead of it) while
+        # putting a comparable overshoot back inside the arm's reach.
+        #
+        # The better fix is for the grasp to close the gap itself when it finds the book
+        # out of reach -- it holds the base already and knows the shortfall to the
+        # millimetre. That is worth doing and is not done here.
+        self.declare_parameter("standoff_m", 0.65)
         self.declare_parameter("centre_tolerance_px", 12.0)
         self.declare_parameter("standoff_tolerance_m", 0.05)
         # 0.05 rad is 2.9 degrees, and the shelf angle reads to about that, so the
