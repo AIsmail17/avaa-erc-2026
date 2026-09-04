@@ -145,6 +145,28 @@ class PerceptionNode(Node):
         self.reported_column: Optional[int] = None
         self.shelf_column: Optional[int] = None
         self.last_book_range: Optional[float] = None
+        # Half the image width, and how far off centre a marker may be and still have
+        # its digit believed.
+        #
+        # This was 230 px -- 34 degrees at fx 337.2 -- on the theory that every
+        # acquisition happening at 40 to 43 degrees meant the digit was being misread on
+        # a badly foreshortened plate. Tried, and it stopped the approach finding a
+        # marker at all: 150 seconds of searching, a dozen full turns, not one accepted
+        # reading, and the state timed out.
+        #
+        # What that ruled out is worth more than the change. A marker first ENTERS the
+        # frame at the edge, so a search that stops on first sight will always stop
+        # there; that part is expected. What is not is that a full sweep never once
+        # caught it nearer the middle, and the reason is in the bearing period the
+        # approach now measures: 7.7, 5.4, 2.8 seconds between one changed reading and
+        # the next. Turning at the 0.35 rad/s search rate, the robot sweeps 150 degrees
+        # between frames. The marker is not being read badly at the edge. It is
+        # hardly being SAMPLED, and no visual controller can work at that rate.
+        #
+        # So this stays wide open until perception is fast enough for it to mean
+        # anything, and the number to fix is the frame rate, not the gate.
+        self.image_centre_px = 320.0
+        self.marker_edge_px = 1000.0
         self.last_book_cx: Optional[float] = None
         # The base's heading when last_book_cx was measured, so the next frame can be
         # matched against where the book will have MOVED to rather than where it was.
@@ -211,6 +233,7 @@ class PerceptionNode(Node):
     # ------------------------------------------------------------------ callbacks
 
     def _on_image(self, msg: Image) -> None:
+        self._count_frame()
         try:
             self.latest_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             self.latest_header = msg.header
@@ -233,6 +256,32 @@ class PerceptionNode(Node):
                 f"depth intrinsics from CameraInfo: fx={live.fx:.1f} "
                 f"cx={live.cx:.1f} cy={live.cy:.1f}"
             )
+
+    def _count_frame(self) -> None:
+        """Say how fast this node is actually looking, in SIMULATED frames a second.
+
+        Everything downstream is a visual controller, and a visual controller cannot
+        beat its own sensor. The approach measures the interval between changed
+        bearings and has reported anything from 0.2 to 7.7 seconds, but that figure is
+        contaminated -- a gap spanning a state change inflates it -- so it cannot settle
+        the question. This can: it counts frames where they arrive.
+
+        Per simulated second, because the real-time factor moves by a factor of forty
+        over a session and a rate per wall second says as much about how long the
+        instance has been up as about the robot.
+        """
+        now = self.get_clock().now().nanoseconds * 1e-9
+        self._frames = getattr(self, "_frames", 0) + 1
+        since = getattr(self, "_frames_at", None)
+        if since is None:
+            self._frames_at = now
+            return
+        if now - since >= 10.0:
+            self.get_logger().info(
+                "looking at %.1f frames per simulated second (%d in %.0f s)"
+                % (self._frames / (now - since), self._frames, now - since))
+            self._frames = 0
+            self._frames_at = now
 
     def _on_odom(self, msg: Odometry) -> None:
         q = msg.pose.pose.orientation
@@ -821,10 +870,38 @@ class PerceptionNode(Node):
             return override
         if not self.target_digit:
             return None
+        # Only believe a digit read near the middle of the picture.
+        #
+        # The camera's half-angle is 43.5 degrees -- fx 337.2 on a 640-wide image -- and
+        # a marker at the very edge of that is a flat plate seen at 43 degrees of
+        # obliquity, a few pixels of ink, foreshortened to almost nothing.
+        #
+        # Watched over one run, EVERY acquisition happened there: the approach found
+        # "marker 3" at +282, +312, +278, +298, +313, +300 and -313 px, which is 40 to
+        # 43 degrees every single time, and then turned 24 degrees without the reading
+        # moving. Markers are about 18 degrees apart at that range, so what was being
+        # tracked was not one marker being followed but a succession of different ones
+        # arriving at the edge and being read, wrongly, as the target.
+        #
+        # Inside 30 degrees the plate is square enough to read and there is room to
+        # turn towards it. SEARCH simply keeps rotating until one is properly in view,
+        # which is what it is for.
+        limit = self.marker_edge_px
         hits = [i for i, m in enumerate(markers)
-                if m.digit == self.target_digit and m.confident]
+                if m.digit == self.target_digit and m.confident
+                and abs(m.cx - self.image_centre_px) <= limit]
         if len(hits) != 1:
-            return None  # absent, or read twice -- move for a better view
+            edge = [m.digit for m in markers
+                    if m.digit == self.target_digit and m.confident
+                    and abs(m.cx - self.image_centre_px) > limit]
+            if edge and not hits:
+                self.get_logger().info(
+                    "marker %s is in view but %.0f px off centre, too oblique to "
+                    "trust; turning further" % (self.target_digit, min(
+                        abs(m.cx - self.image_centre_px) for m in markers
+                        if m.digit == self.target_digit and m.confident)),
+                    throttle_duration_sec=3.0)
+            return None  # absent, too oblique, or read twice -- move for a better view
         return hits[0]
 
     def _publish_detections(self, books: List[bd.Book],
