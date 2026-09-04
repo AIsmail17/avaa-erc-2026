@@ -9,8 +9,40 @@ in the git history — which carries the reasoning, not just the diffs.
 
 ## Repository
 
-`https://github.com/AIsmail17/avaa-erc-2026` — branch **`avaa`**, private.
-Local: `~/erc/erc_sim_2026` inside WSL (physically on D: via the VHDX).
+`https://github.com/AIsmail17/avaa-erc-2026` — branch **`avaa`**, which is also the
+default branch, so a plain `git clone` lands on the right code. **Public.**
+
+Local on Ahmed's machine: `~/erc/erc_sim_2026` inside WSL (physically on D: via the
+VHDX). The VHDX itself is not in any repository and must not be — it is 15 GB, and
+GitHub refuses any file over 100 MB.
+
+### Starting from a fresh clone
+
+```bash
+git clone https://github.com/AIsmail17/avaa-erc-2026.git
+cd avaa-erc-2026
+```
+
+Then `SETUP.md`, which is the long one: it is the environment build with every trap
+hit along the way, and it is worth reading before running anything. `README.md` is the
+organisers' own and covers the base simulator only — it says nothing about our solution.
+
+Once the container is up:
+
+```bash
+tools/sim restart                    # from the host: relaunch Gazebo
+tools/sim gui                        # attach a viewer window to a running simulation
+```
+
+```bash
+# inside the container
+ros2 launch avaa_solution solution.launch.py shelf_column_number:=3 book_colour:=red
+```
+
+`tools/` holds about sixty small measurement programs, each answering one question and
+each carrying in its docstring what it measured and when. `tools/in-sim <tool>.py` runs
+one inside the container. When a number in this file disagrees with a number in a tool,
+the tool is the one that was run — check its date.
 
 The commit messages are the design record. `git log` is worth reading before changing
 anything, because most non-obvious decisions have a measurement behind them.
@@ -20,7 +52,7 @@ anything, because most non-obvious decisions have a measurement behind them.
 | File | What it holds |
 |---|---|
 | `NOTES.md` | Competition rules, scoring, deliverables |
-| `SETUP.md` | Environment build, with every trap hit along the way |
+| `SETUP.md` | Environment build, with every trap hit along the way — **start here on a fresh clone** |
 | `PERCEPTION.md` | Colour and marker detection, measured accuracy, 3D localisation |
 | `MANIPULATION.md` | Gripper curve, reach envelope, arm kinematics, tuck pose |
 | `ORGANISER_QUESTIONS.md` | Six items. The committee's answer was that teams solve these themselves; kept as the record, and item 1 is corrected in place |
