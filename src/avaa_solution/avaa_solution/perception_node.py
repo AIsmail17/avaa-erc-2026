@@ -618,6 +618,19 @@ class PerceptionNode(Node):
             # predict from and the tracker falls back to following itself.
             self.last_book_cx = float(target_book.cx)
             self.last_book_yaw = self.base_yaw
+        # Marker, book and heading together, because the three of them are what
+        # separates the possible faults. The bearing published here held at 305, 299,
+        # 299 px across 25 degrees of measured base rotation, which cannot be a book
+        # standing still in the world. If the marker's own cx moves and the book's does
+        # not, find_book is being handed the wrong column; if neither moves while the
+        # base does, the detection is older than its timestamp claims.
+        self.get_logger().info(
+            "steering on the %s book at %.0f px; its marker is at %.0f px, %d "
+            "marker(s) in view, base heading %+.1f deg"
+            % (self.book_colour or "target",
+               float(steer_x), float(markers[column_index].cx), len(markers),
+               math.degrees(self.base_yaw) if self.base_yaw is not None else float("nan")),
+            throttle_duration_sec=2.0)
         self.pub_column_x.publish(Float32(data=float(steer_x)))
         self._save_column_image(frame, books, columns, markers, column_index)
 
