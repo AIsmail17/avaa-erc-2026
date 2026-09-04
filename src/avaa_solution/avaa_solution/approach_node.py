@@ -294,7 +294,18 @@ class ApproachNode(Node):
         # past centring, losing the marker four seconds into each attempt. The bearing
         # it steers by is still required to be fresh -- this only governs when to give
         # up on the column altogether, which is a much rarer event than a missed read.
-        self.declare_parameter("lost_grace_sec", 12.0)
+        # How long to stand still with no bearing before going back to SEARCH.
+        #
+        # Was 12 s, and standing still for twelve seconds buys nothing: the base cannot
+        # find a marker it is not moving to look for, and SEARCH finds one again in two
+        # to six seconds every time it is asked. Measured over one run, this state spent
+        # 12 s waiting on three separate occasions -- 36 seconds of a 120 second budget
+        # doing nothing at all, and it timed out having never reached the shelf.
+        #
+        # Four seconds is still long enough to ride out a marker that flickers at the
+        # edge of the frame, and short enough that a lost marker costs one search rather
+        # than a third of the state's clock.
+        self.declare_parameter("lost_grace_sec", 4.0)
         # How far the book may sit off the reaching arm's centre line and
         # still be worth handing to the grasp. The pre-grasp is chosen from
         # twelve candidate postures and they run out well before the arm
@@ -368,6 +379,10 @@ class ApproachNode(Node):
         self.column_cx: Optional[float] = None
         self.column_cx_at: Optional[float] = None
         self.column_cx_new_at: Optional[float] = None
+        # How long a bearing may go without changing before the controller stops
+        # believing it. Bearings arrive at about 5 Hz when perception is publishing at
+        # all, so two seconds is many missed measurements, not a hiccup.
+        self.bearing_stale = 2.0
         # Per visit to CENTRE: how much turn has been commanded, how much the base
         # has actually turned, and how many ticks asked for nothing at all. A
         # controller that is right but only running a fifth of the time looks exactly
@@ -1583,6 +1598,21 @@ class ApproachNode(Node):
 
     def _do_centre(self) -> None:
         column_cx = self._column_cx_fresh()
+        # Arriving is not the same as being measured again, and steering on the
+        # difference is what stalled this state. Watched at 1788546390: perception
+        # published nothing at all on target_column_x for seven seconds -- confirmed
+        # with `ros2 topic hz`, no messages against a single publisher -- while this
+        # state reported a fresh bearing on every tick, zero idle ticks, and a pixel
+        # error that would not move through 25 degrees of measured base rotation.
+        #
+        # _column_cx_fresh tests when a message last ARRIVED. What a controller needs
+        # is when the number last CHANGED, because a value republished unchanged while
+        # the robot turns is a photograph of where the marker used to be. The age of
+        # the change was in the log the whole time, growing 0.2, 0.3, 1.4 s across
+        # exactly those samples, and nothing was reading it.
+        if column_cx is not None and self.column_cx_new_at is not None:
+            if (self._now() - self.column_cx_new_at) > self.bearing_stale:
+                column_cx = None
         if column_cx is None:
             # Lost the marker. Stop, and if it stays lost, go and look for it again
             # rather than stand here until the state times out.
