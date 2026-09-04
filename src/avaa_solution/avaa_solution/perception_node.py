@@ -256,6 +256,44 @@ class PerceptionNode(Node):
                 f"cx={live.cx:.1f} cy={live.cy:.1f}"
             )
 
+    def _watch_jump(self, point_optical, target) -> None:
+        """Report a book fix that moves further than the robot could have carried it.
+
+        The approach refuses these, correctly, and then has nothing left to drive to:
+        watched over ten seconds of APPROACH it rejected seven sightings, one of them
+        0.41 m from the last accepted after 0.2 s and another 0.76 m after 1.4 s, with
+        the base moving at 0.22 m/s. A gate doing the right thing with bad data leaves
+        the drive aiming at a stale target, so the question is what makes the data bad.
+
+        This says what the fix did and what the picture looked like when it did it: the
+        jump, the range, the size of the box it was measured over, and how many markers
+        were in view. If jumps coincide with the marker count falling, the column
+        grouping is losing its anchor; if they coincide with a small box, the depth
+        patch is landing on the gap behind the book; if with neither, the two image
+        streams are out of step.
+        """
+        if point_optical is None:
+            return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        previous = getattr(self, "_jump_point", None)
+        when = getattr(self, "_jump_at", None)
+        self._jump_point = np.asarray(point_optical, dtype=float)
+        self._jump_at = now
+        if previous is None or when is None:
+            return
+        gap = now - when
+        moved = float(np.linalg.norm(self._jump_point - previous))
+        # 0.22 m/s is the approach's top speed; anything past twice that in the time
+        # available is not the robot having moved.
+        if gap > 1e-3 and moved > 0.06 + 0.45 * gap:
+            _, _, w, h = target.bbox
+            self.get_logger().warn(
+                "the book fix jumped %.0f mm in %.2f s (%.1f m/s) at a range of "
+                "%.2f m, box %dx%d px, %d marker(s) in view"
+                % (moved * 1000, gap, moved / gap, float(point_optical[2]),
+                   w, h, getattr(self, "_markers_seen", -1)),
+                throttle_duration_sec=2.0)
+
     def _tally(self, markers, hits) -> None:
         """Count why the target marker is or is not identified, and say so.
 
@@ -273,6 +311,7 @@ class PerceptionNode(Node):
         the interesting column, because two markers both read as the target digit means
         the reader is confident and wrong.
         """
+        self._markers_seen = len(markers)
         self._seen = getattr(self, "_seen", 0) + 1
         self._digits = getattr(self, "_digits", {})
         self._scores = getattr(self, "_scores", {})
@@ -471,20 +510,38 @@ class PerceptionNode(Node):
         target = min(candidates, key=lambda b: abs(b.cx - expected))
         jump = abs(target.cx - expected)
         if jump > self.book_jump_px:
-            # Say so, but still publish. Going silent here starved the approach of
-            # the 3D fix it drives to and left it squaring at the shelf for its whole
-            # timeout: the head tilts and the base slides between one processed frame
-            # and the next, so a large jump is common and is not proof of the wrong
-            # book. Preferring the nearest to where the target was IS the fix; the
-            # threshold is only worth a warning.
+            # Do not follow it, and do not remember it.
+            #
+            # This used to warn and publish anyway, on the reasoning that a large jump
+            # is common while the head tilts and the base slides, and that going silent
+            # had once starved the approach. Measured, the cost of following is worse.
+            # Perception now reports what its own fix does, and every jump it logged in
+            # a run came with ZERO or one marker in view:
+            #
+            #     jumped 1071 mm in 0.20 s (5.4 m/s) at 1.72 m, 0 markers in view
+            #     jumped  716 mm in 0.20 s (3.6 m/s) at 1.63 m, 0 markers in view
+            #     jumped  717 mm in 0.20 s (3.6 m/s) at 0.90 m, 0 markers in view
+            #     jumped 1149 mm in 0.20 s (5.7 m/s) at 1.82 m, 0 markers in view
+            #
+            # Those are one column spacing, 0.95 m, and a base that moves at 0.22 m/s
+            # did not travel them. With no marker to say which column is the target,
+            # the nearest candidate to the prediction is simply the neighbouring
+            # column's book, and following it overwrites last_book_cx so the tracker
+            # can never come back. The approach then refuses the sighting anyway --
+            # correctly, its own gate catches 0.41 m in 0.2 s -- so publishing it buys
+            # nothing and costs the anchor.
+            #
+            # Holding the anchor is what lets the true book be recognised when it
+            # reappears, which is the whole point of predicting where it went.
             self.get_logger().warn(
                 "the %s book is %.0f px from where turning %.0f deg should have put "
-                "it; still the nearest, so following it"
+                "it; that is another column, so holding the old fix"
                 % (self.book_colour, jump,
                    math.degrees(0.0 if (self.base_yaw is None
                                         or self.last_book_yaw is None)
                                 else self.base_yaw - self.last_book_yaw)),
                 throttle_duration_sec=5.0)
+            return
         self.last_book_cx = float(target.cx)
         self.last_book_yaw = self.base_yaw
         self.pub_row.publish(Int32(data=self.reported_row))
@@ -594,6 +651,7 @@ class PerceptionNode(Node):
                     % ", ".join(missing), throttle_duration_sec=5.0)
             return
         point_optical = dl.locate(target.bbox, self.depth_image, self.intrinsics)
+        self._watch_jump(point_optical, target)
         if point_optical is None:
             self.get_logger().warn(
                 "no usable depth over the target book", throttle_duration_sec=5.0
