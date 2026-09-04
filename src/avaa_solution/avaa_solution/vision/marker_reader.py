@@ -59,7 +59,26 @@ MIN_MARKER_HEIGHT_PX = 12
 # distinct-digit constraint in assign_distinct() is a far stronger guard than any
 # runner-up gap: a correctly-read "5" measured a margin of only 0.042 because 5 and 3 look
 # alike at 15 px, and rejecting it would have lost a correct answer.
-MIN_SCORE = 0.35
+# Lowered from 0.35 on 2026-09-05, on measured evidence and not on hope.
+#
+# Perception now reports every digit it reads and its best score. Over eight windows of
+# a run, sweeping for the target, it read 1, 2, 4 and 5 -- digit 4 twelve times in one
+# window at scores up to 0.56 -- and read the digit it was looking for, 3, exactly once,
+# at 0.31. The threshold was 0.35, so that one reading was thrown away and the approach
+# swept a dozen full circles finding nothing.
+#
+# The 0.35 was calibrated on a frame where correct reads scored 0.43 to 0.75. The scores
+# actually seen in a run are lower than that across the board -- correct-looking reads at
+# 0.36, 0.38, 0.41, 0.42, 0.44, 0.46 -- because the calibration frame was closer and
+# squarer than a robot hunting from four metres. A threshold set from one favourable
+# frame was rejecting most of a run.
+#
+# The risk this guards against is real and is recorded above: an 8 px blob on a blank
+# wall once read as a confident "4" and stopped a search dead. But that was a SIZE
+# failure and MIN_MARKER_HEIGHT_PX now catches it independently, and assign_distinct()
+# still forbids two plates claiming the same digit. This threshold is not the only guard
+# and should not be set as though it were.
+MIN_SCORE = 0.30
 
 _TEMPLATE_CACHE: Optional[Dict[int, np.ndarray]] = None
 
