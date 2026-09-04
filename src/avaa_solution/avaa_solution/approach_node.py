@@ -1380,8 +1380,15 @@ class ApproachNode(Node):
             # turn. Measured again here, the shelf angle read -5.2 degrees for a
             # minute and a half while a correction was commanded throughout.
             if angle is not None and abs(angle) > self.square_tol:
+                # Sized from how often the shelf angle arrives, for the same reason
+                # centring is: a fixed gain on an angle that is measured a few times a
+                # second sweeps past the target between two looks. Watched in a run,
+                # this hunted -7.1, +8.7, -9.0, +7.8, -9.9 degrees and never landed
+                # inside its 5.2 degree tolerance, while the state ran out its clock.
                 cmd = Twist()
-                cmd.angular.z = self._turn(-angle, 0.8)
+                wanted = turn_for(-angle, self.bearing_period, fastest=self.max_yaw)
+                cmd.angular.z = float(max(-self.max_yaw, min(
+                    self.max_yaw, wanted - self.turn_damping * self.yaw_rate)))
                 self.pub_cmd.publish(cmd)
                 self.get_logger().info(
                     "acquiring: squaring to look for the book, face %+.1f deg"

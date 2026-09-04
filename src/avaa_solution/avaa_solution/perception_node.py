@@ -20,6 +20,7 @@ from collections import Counter, deque
 from typing import List, Optional, Tuple
 
 import cv2
+import math
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
@@ -27,6 +28,7 @@ from geometry_msgs.msg import PointStamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32, Int32
 from tf2_ros import Buffer, TransformListener
@@ -144,6 +146,10 @@ class PerceptionNode(Node):
         self.shelf_column: Optional[int] = None
         self.last_book_range: Optional[float] = None
         self.last_book_cx: Optional[float] = None
+        # The base's heading when last_book_cx was measured, so the next frame can be
+        # matched against where the book will have MOVED to rather than where it was.
+        self.last_book_yaw: Optional[float] = None
+        self.base_yaw: Optional[float] = None
         self.reported_row: Optional[int] = None
         # Confident row readings, voted on before anything is latched. See _publish_row.
         self.row_votes = deque(maxlen=15)
@@ -169,6 +175,7 @@ class PerceptionNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.create_subscription(Image, TOPIC_RGB, self._on_image, SENSOR_QOS)
+        self.create_subscription(Odometry, "/odom", self._on_odom, 10)
         self.create_subscription(Image, TOPIC_DEPTH, self._on_depth, SENSOR_QOS)
         self.create_subscription(CameraInfo, TOPIC_DEPTH_INFO, self._on_info, SENSOR_QOS)
         self.pub_book_point = self.create_publisher(
@@ -226,6 +233,51 @@ class PerceptionNode(Node):
                 f"depth intrinsics from CameraInfo: fx={live.fx:.1f} "
                 f"cx={live.cx:.1f} cy={live.cy:.1f}"
             )
+
+    def _on_odom(self, msg: Odometry) -> None:
+        q = msg.pose.pose.orientation
+        self.base_yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                   1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+    def _expected_cx(self, width: float) -> Optional[float]:
+        """Where the tracked book should appear now, given how far the base has turned.
+
+        Matching the nearest candidate to where the book was LAST seen is a tracker
+        that follows its own output, and on a shelf of identically coloured books it
+        will hop from one to the next to stay at the same place on the screen. Measured
+        in a run: the base turned 22 degrees against Gazebo's ground truth, with odom
+        agreeing, and the bearing this publishes moved from 286 px to 286 px. A marker
+        or book fixed in the world should have swept 136 px in that time. The camera
+        was live throughout -- consecutive frames differed by 30 grey levels -- so the
+        detector was seeing new pictures and choosing a different book out of each one.
+
+        The correction is to predict rather than assume. A point at image x sits at a
+        bearing atan((x - cx0) / fx) from the camera axis; turn the base left by dpsi
+        and that bearing shrinks by dpsi. So the same book will be found at
+        cx0 + fx * tan(theta - dpsi), and the nearest candidate to THAT is the one to
+        follow.
+
+        Odom is the right source for dpsi and only for dpsi. It cannot see this base
+        slide, but tools/turncheck.py measured its yaw against Gazebo over commanded
+        turns -- 0.142, 0.270 and 0.407 rad/s reported against 0.142, 0.235 and 0.356
+        true -- and over the fifth of a second between two frames even the worst of
+        that is a fraction of a pixel.
+        """
+        if self.last_book_cx is None:
+            return None
+        if self.last_book_yaw is None or self.base_yaw is None:
+            return self.last_book_cx
+        focal = self.intrinsics.fx if self.intrinsics is not None else 337.2
+        centre = width / 2.0
+        turned = math.atan2(math.sin(self.base_yaw - self.last_book_yaw),
+                            math.cos(self.base_yaw - self.last_book_yaw))
+        theta = math.atan2(self.last_book_cx - centre, focal)
+        moved = theta - turned
+        # Past a right angle the tangent stops meaning anything, and the book is well
+        # out of frame long before that.
+        if abs(moved) > 1.2:
+            return None
+        return centre + focal * math.tan(moved)
 
     def _track_book_without_marker(self, frame, books: List[bd.Book]) -> None:
         """Keep publishing the target book once the marker is out of frame.
@@ -288,8 +340,28 @@ class PerceptionNode(Node):
                 % (len(candidates), self.book_colour),
                 throttle_duration_sec=5.0)
             return
-        target = min(candidates, key=lambda b: abs(b.cx - self.last_book_cx))
-        jump = abs(target.cx - self.last_book_cx)
+        expected = self._expected_cx(float(frame.shape[1]))
+        if expected is None:
+            # The prediction has left the picture, so this tracker no longer knows
+            # which book is the target and cannot get that back on its own. Forget the
+            # fix rather than returning None for ever: with last_book_cx cleared, the
+            # branch above goes quiet and says why, and the marker path re-seeds the
+            # tracker the moment the marker is in frame again.
+            #
+            # Without this the node deadlocks. Watched in a run: the base swung 60
+            # degrees hunting for its column, the prediction went out of frame, and
+            # perception published no book point again for the rest of the attempt --
+            # the approach squaring back and forth reporting "no metric fix on the
+            # book to drive to" until it timed out.
+            self.get_logger().warn(
+                "the %s book has turned out of frame; waiting for the marker to say "
+                "which one is the target again" % self.book_colour,
+                throttle_duration_sec=5.0)
+            self.last_book_cx = None
+            self.last_book_yaw = None
+            return
+        target = min(candidates, key=lambda b: abs(b.cx - expected))
+        jump = abs(target.cx - expected)
         if jump > self.book_jump_px:
             # Say so, but still publish. Going silent here starved the approach of
             # the 3D fix it drives to and left it squaring at the shelf for its whole
@@ -298,10 +370,15 @@ class PerceptionNode(Node):
             # book. Preferring the nearest to where the target was IS the fix; the
             # threshold is only worth a warning.
             self.get_logger().warn(
-                "the %s book jumped %.0f px since the last frame; still the nearest "
-                "to where the target was, so following it"
-                % (self.book_colour, jump), throttle_duration_sec=5.0)
+                "the %s book is %.0f px from where turning %.0f deg should have put "
+                "it; still the nearest, so following it"
+                % (self.book_colour, jump,
+                   math.degrees(0.0 if (self.base_yaw is None
+                                        or self.last_book_yaw is None)
+                                else self.base_yaw - self.last_book_yaw)),
+                throttle_duration_sec=5.0)
         self.last_book_cx = float(target.cx)
+        self.last_book_yaw = self.base_yaw
         self.pub_row.publish(Int32(data=self.reported_row))
         self._publish_book_point(target)
 
@@ -535,9 +612,12 @@ class PerceptionNode(Node):
                        if self.book_colour else None)
         steer_x = target_book.cx if target_book is not None else markers[column_index].cx
         if target_book is not None:
-            # Remember where the RIGHT book was, so it can be recognised again once the
-            # marker that identified it has left the frame.
+            # Remember where the RIGHT book was, and the heading it was seen from,
+            # so it can be recognised again once the marker that identified it has
+            # left the frame. Without the heading the next frame has nothing to
+            # predict from and the tracker falls back to following itself.
             self.last_book_cx = float(target_book.cx)
+            self.last_book_yaw = self.base_yaw
         self.pub_column_x.publish(Float32(data=float(steer_x)))
         self._save_column_image(frame, books, columns, markers, column_index)
 
