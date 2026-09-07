@@ -213,7 +213,7 @@ RIGHT_TUCK = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
 
 
 def _wrap(angle: float) -> float:
-    """An angle difference brought back into [-pi, pi]."""
+    """Bring an angle difference back into [-pi, pi]."""
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 

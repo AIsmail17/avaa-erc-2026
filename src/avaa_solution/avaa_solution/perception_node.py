@@ -495,7 +495,7 @@ class PerceptionNode(Node):
         return self._predict_cx(self.last_book_cx, self.last_book_yaw, width)
 
     def _predict_cx(self, last_cx, last_yaw, width: float):
-        """The same prediction for anything fixed in the world: a book or a plate."""
+        """Predict where anything fixed in the world moved to: a book or a plate."""
         if last_cx is None:
             return None
         if last_yaw is None or self.base_yaw is None:
@@ -755,7 +755,7 @@ class PerceptionNode(Node):
         self.height_votes.clear()
 
     def _row_height(self):
-        """The identified row's gripper height in base_link, or None."""
+        """Give the identified row's gripper height in base_link, or None."""
         if self.reported_row is None:
             return None
         if not 1 <= self.reported_row <= len(ROW_HEIGHTS_BASE):
