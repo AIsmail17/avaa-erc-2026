@@ -993,3 +993,91 @@ Once every checkpoint passes, the build order is:
 6. **Deliverables** — the 5-minute unedited video and the 5-page report
 
 See `NOTES.md` for the full rules, scoring table, and deliverable requirements.
+
+---
+
+## The NUC (`nucserver`, 192.168.1.26)
+
+Set up 2026-09-07 as a second machine to run simulations on, because Gazebo under WSLg
+on the Windows workstation fails to start properly on roughly one restart in three —
+zero controllers activated, all seven spawners dead on `after 3 attempts`, and no camera
+frames, while Gazebo still reports a healthy real-time factor and `sim status` still says
+"running". That failure ate large parts of two working sessions before it was identified.
+
+**It is a second machine, not a move.** The repository is the shared point; both machines
+clone the same `avaa` branch and push to it. If the NUC misbehaves, work continues on the
+workstation with no migration.
+
+### What it is
+
+| | |
+|---|---|
+| OS | Ubuntu 24.04.4 LTS (noble) — same as the workstation's WSL |
+| CPU | Intel i7-7567U @ 3.5 GHz, 2 physical cores / 4 threads |
+| Memory | 23 GB |
+| Graphics | Intel Iris Plus 650 — **no NVIDIA**, and none is needed |
+| Docker | 29.8.0 with Compose v5.5.1, from Docker's own repository |
+
+`docker/up.sh` detects the absence of an NVIDIA runtime by itself and falls back to
+`/dev/dri` integrated rendering, so nothing in the project needed changing for it.
+
+### How it compares, measured
+
+| | WSLg workstation | NUC |
+|---|---|---|
+| real-time factor | 0.25 – 0.45 | **0.38 – 0.50** |
+| camera up on first try | about two thirds of restarts | first attempt |
+| workspace `colcon build` | minutes | **34 s** |
+| unit tests | 148 pass | 148 pass |
+
+Faster and more reliable, on a machine with two physical cores. The load average during
+a run is under 1.0, so the bottleneck was never the workstation's CPU.
+
+### Getting on it
+
+Key-based SSH from the workstation's WSL. Passwords are not used and not stored:
+
+```bash
+ssh -i ~/.ssh/nuc_ed25519 ahmedo@192.168.1.26
+```
+
+The key was authorised once by pasting the public half into `~/.ssh/authorized_keys` on
+the NUC, from a session the user already had open. Nothing else was needed.
+
+### Running a simulation on it
+
+Identical to the workstation, because the tools are the same:
+
+```bash
+cd ~/erc/erc_sim_2026
+./tools/sim restart --fast --headless    # start it
+./tools/run-once.sh                      # one full solution run, log kept
+```
+
+Runs are kept under `~/erc/runs/`, most recent last. Start them detached —
+`setsid nohup ./tools/run-once.sh > ~/erc/logs/run.log 2>&1 &` — so an SSH drop cannot
+take a thirteen-minute run down with it.
+
+For the deliverable video, the NUC has a real desktop and `DISPLAY` defaults to `:0`, so
+`./tools/sim gui` attaches a genuine Gazebo window rather than one bridged through
+Windows remote desktop.
+
+### Disk
+
+The Ubuntu Server installer allocated only half the disk, which is its default and is
+easy to miss:
+
+```
+sda                       119.2G
+└─sda3                    116.2G LVM2_member
+  └─ubuntu--vg-ubuntu--lv  58.1G ext4  /
+```
+
+58 GB of the volume group is unclaimed. To take it, online and without unmounting:
+
+```bash
+sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv && sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
+```
+
+The image is 5.9 GB and the build cache another 2.2 GB, so the 32 GB free before this is
+enough for now.

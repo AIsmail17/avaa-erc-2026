@@ -233,6 +233,15 @@ class PerceptionNode(Node):
     # ------------------------------------------------------------------ callbacks
 
     def _on_image(self, msg: Image) -> None:
+        # Count ARRIVALS here and detector ticks in _process, because the two can come
+        # apart and the difference is invisible from either one alone. A detector timer
+        # firing at 5 Hz on a stored frame that stopped being replaced looks exactly
+        # like a detector working perfectly -- same rate, same output -- and would
+        # explain a run where the base turned six full revolutions while every frame
+        # read the same digit at the same score of 0.43.
+        self._arrivals = getattr(self, "_arrivals", 0) + 1
+        self._arrival_stamp = (msg.header.stamp.sec
+                               + msg.header.stamp.nanosec * 1e-9)
         try:
             self.latest_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             self.latest_header = msg.header
@@ -375,10 +384,19 @@ class PerceptionNode(Node):
             self._frames_at = now
             return
         if now - since >= 10.0:
+            arrivals = getattr(self, "_arrivals", 0)
             self.get_logger().info(
-                "looking at %.1f frames per simulated second (%d in %.0f s)"
-                % (self._frames / (now - since), self._frames, now - since))
+                "detector ran %.1f times a simulated second (%d in %.0f s); %d images "
+                "ARRIVED in that time, newest stamped %.2f"
+                % (self._frames / (now - since), self._frames, now - since,
+                   arrivals, getattr(self, "_arrival_stamp", float("nan"))))
+            if arrivals == 0:
+                self.get_logger().error(
+                    "no camera images arrived at all in the last %.0f s. The detector "
+                    "is running on a stored frame and every answer it gives is about "
+                    "the past." % (now - since))
             self._frames = 0
+            self._arrivals = 0
             self._frames_at = now
 
     def _on_odom(self, msg: Odometry) -> None:
