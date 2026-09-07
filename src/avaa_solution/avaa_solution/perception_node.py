@@ -123,6 +123,8 @@ class PerceptionNode(Node):
         # believed. Four of five leaves room for one plate clipped by the frame edge
         # while keeping the distinct-digit constraint that makes the reader work.
         self.declare_parameter("min_markers_to_identify", 4)
+        # And how many are enough to keep FOLLOWING a column already identified.
+        self.declare_parameter("min_markers_to_track", 2)
         self.declare_parameter("save_images", True)
         # Only src/ is bind-mounted into the container, so this is the deepest path that
         # still lands inside the git repository on the host. See PERCEPTION.md.
@@ -139,6 +141,8 @@ class PerceptionNode(Node):
         self.book_jump_px = float(self.get_parameter("book_jump_px").value)
         self.min_markers_to_identify = int(
             self.get_parameter("min_markers_to_identify").value)
+        self.min_markers_to_track = int(
+            self.get_parameter("min_markers_to_track").value)
         self.image_dir = str(self.get_parameter("image_dir").value)
         self.save_images = bool(self.get_parameter("save_images").value)
         self.min_save_interval = float(self.get_parameter("min_save_interval_sec").value)
@@ -1082,10 +1086,29 @@ class PerceptionNode(Node):
         # So the identification waits for enough of the shelf to be in the picture. This
         # does not affect close range, where the markers are above the field of view
         # entirely and the book tracker carries the identification in.
-        if len(markers) < self.min_markers_to_identify:
+        # ... but only for the FIRST identification. Naming the column and following it
+        # afterwards are different jobs with different evidence needs, and holding both
+        # to the identification standard cost the next run after the one above.
+        #
+        # Five plates 0.95 m apart span 3.80 m, and the camera sees 87 degrees. All five
+        # fit only beyond about 2.0 m, and only from in front of the MIDDLE column: the
+        # target here was column 0, so as soon as centring turned to face it the far end
+        # of the shelf went past the frame edge. The robot found its marker at 29 s,
+        # turned towards it, dropped to three plates in view, published no bearing for
+        # four seconds, and was sent back to SEARCH from the one position it had spent
+        # the whole run getting to.
+        #
+        # Turning to face the target necessarily loses sight of the far plates. A gate
+        # that fires on that is a gate that fires on success.
+        needed = (self.min_markers_to_identify if self.reported_column is None
+                  else self.min_markers_to_track)
+        if len(markers) < needed:
             self.get_logger().info(
-                "%d marker(s) in view, too few to tell five plates apart; not "
-                "identifying a column from this" % len(markers),
+                "%d marker(s) in view, %s; not naming a column from this"
+                % (len(markers),
+                   "too few to tell five plates apart"
+                   if self.reported_column is None else
+                   "and the column is identified, but that is still too few"),
                 throttle_duration_sec=5.0)
             return None
 
