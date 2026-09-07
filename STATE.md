@@ -1,6 +1,7 @@
 # Team AVAA — project state
 
-**Read this first when resuming.** Written 2026-09-02. Phase 1 deadline **2026-09-15**.
+**Read this first when resuming.** Written 2026-09-02, brought up to date 2026-09-07.
+Phase 1 deadline **2026-09-15**.
 
 Nothing important lives in a chat transcript. Everything is in this folder, in the repo, or
 in the git history — which carries the reasoning, not just the diffs.
@@ -98,10 +99,11 @@ Use `tools/drift.py` (per simulated second, prints the RTF beside the answer) an
 | Annotated images | ✅ written, timestamped |
 | Mission sequencing | ✅ new; one state machine owns the phase order and the trial clock |
 | `solution.launch.py` | ✅ now starts move_group, the grasp and the delivery too |
-| Approach — search, centre | ⚠️ **improved, still not reliable** |
-| Approach — acquire, square | ⚠️ **improved, still not reliable** |
+| Approach — search | ✅ 2026-09-07: finds the marker in 29 s where it used to time out at 150 |
+| Approach — centre | ✅ 2026-09-07: reaches the column and hands over to the drive |
+| Approach — acquire, square | ⚠️ **reached, not yet completed** |
 | Arm kinematics + IK | ✅ exact to 0.7 mm; all four rows reachable |
-| Grasp controller | ⚠️ reaches the pre-grasp to 3 mm; **blocked on the base coast** |
+| Grasp controller | ⚠️ reaches the pre-grasp to 3 mm; **has never closed on a book** |
 | Place in bin | ⚠️ **written, never run end to end** |
 | Video (D2) | ❌ not started |
 | Report (D3) | ❌ not started |
@@ -112,6 +114,77 @@ Use `tools/drift.py` (per simulated second, prints the RTF beside the answer) an
 sim shell
 cd /opt/erc_ws/src/avaa_solution && python3 -m pytest test/ -q
 ```
+
+---
+
+## 2026-09-07 — most of a week's observations were made through a broken sensor
+
+Read this before trusting any conclusion in this file dated earlier than 2026-09-07.
+
+Perception reported "no camera images arrived at all in the last 10 s" partway through a
+run and then narrated a stored frame for the remaining ten minutes. That reads like the
+Gazebo camera dying, and it was diagnosed that way at first. It was not that. A
+subscriber created at that exact moment, on the same topic, with perception's own QoS,
+received 30 frames a simulated second.
+
+From `/proc/net/snmp`, mid-run:
+
+| | |
+|---|---|
+| UDP `RcvbufErrors` | 3,119,527, rising by ~200 a second |
+| `net.core.rmem_max` | 212,992 (the Linux default) |
+| one colour frame | 640x360 BGR8 = 691 KB |
+
+A frame is three times the whole socket receive buffer, so each one fragments across
+hundreds of datagrams into a buffer that cannot hold one, and losing any fragment
+discards the image. Two of the five kept runs from that morning show the stall outright,
+and every run before the fix was losing frames continuously whether or not it stalled.
+
+**So: the book fixes that jumped 3 metres, the bearings that held still while the base
+turned, the depth readings of 4.88 m with the shelf 1.07 m ahead — much of that was a
+starved image stream, not the detectors.** Anything tuned against those numbers is worth
+re-checking. `sim status` now reports the drop rate, and after the fix perception
+receives 306 frames per ten-second window against 96–126 before.
+
+Fixed in `src/erc_bringup/config/cyclonedds.xml` (32 MB receive buffer, defrag limits)
+plus `tools/sim` raising `net.core.rmem_max` when it starts the container. The container
+is privileged and on the host network, so it does this itself and needs no password.
+Perception also rebuilds its subscriptions after a window with no frames.
+
+### The other four faults found that day
+
+Each has a commit with the measurement in its message; `git log` is the record.
+
+**The search looked where the marker cannot be.** The camera sits 1.160 m up with a
+28.1 degree vertical half-angle and the markers are at 2.26 m, so with the head level
+they leave the frame inside 2.06 m — and the approach leaves the head tilted 41 degrees
+*down* to watch the bottom shelf. Every route into SEARCH is a close-range state. One
+run turned on the spot for 150 seconds reporting "2 red book(s) in view" and read a
+marker on 0 of every 50 frames. SEARCH now aims the head at the marker band and backs
+off when it is standing too close, using the rear laser — bridged since the beginning
+and, until then, subscribed to by nothing.
+
+**It timed out centring while sitting correctly centred.** The marker reader decides
+which of five near-identical plates carries the target digit afresh on every frame and
+occasionally picks wrong. The approach was fed 340 px and 14 px alternately and turned
+back and forth: "asked for 33 deg of turn over 84 ticks, base has turned 4 deg". The
+reader is now held to its own previous answer, with the threshold taken from the
+measured column spacing in the frame.
+
+**One depth frame could overturn a fifteen-frame vote.** `_cross_check_row` switched the
+target row on a single measurement that `_watch_jump` had flagged in the same instant as
+15.2 m/s. An override now needs the same kind of majority the vote did, and only runs
+while the markers are in view — it exists to catch a row miscounted from the markers,
+which is a question about the column and needs the column visible to answer.
+
+**The tracker stepped one column left and one shelf up.** Inside 1.6 m the markers leave
+the frame and the book tracker is choosing among identically coloured books with no
+anchor but its own last answer. The approach anchored at `[1.52, 0.99, 1.51]` in
+base_link: 0.99 m across is one column spacing, and 1.51 m up is row 1 where row 4 had
+been identified 15 readings to 15. The target row's height is known from three metres
+out and cannot drift afterwards, so a fix more than 0.20 m from it is on another shelf
+and is no longer offered. Rows are 0.330 m apart, so that tolerance cannot confuse two
+of them.
 
 ---
 
