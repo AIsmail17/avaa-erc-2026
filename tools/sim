@@ -213,6 +213,23 @@ stop_orphans() {
     done
 }
 
+# Which X display should the viewer draw on?
+#
+# $DISPLAY when there is one, because then this was run from a terminal inside the
+# session that wants the window. Otherwise the newest socket in /tmp/.X11-unix -- on
+# the NUC there is no :0 at all: xrdp runs its own Xorg on :10, and the container was
+# created over SSH with DISPLAY=:0 baked in, pointing at a display that does not
+# exist. The socket directory is mounted either way, so only the number was wrong.
+host_display() {
+    if [ -n "${DISPLAY:-}" ]; then
+        echo "$DISPLAY"
+        return
+    fi
+    local sock
+    sock=$(ls -t /tmp/.X11-unix/X* 2>/dev/null | head -1)
+    if [ -n "$sock" ]; then echo ":${sock##*/X}"; else echo ":0"; fi
+}
+
 cmd_gui() {
     # Attach a viewer to a simulation that is already running headless.
     #
@@ -267,13 +284,21 @@ cmd_gui() {
     # Passed explicitly, the same command runs clean. This looked exactly like the WSL
     # virtual GPU dropping, which is a real failure that produces the identical message,
     # and that is why it was worth chasing rather than retrying.
-    docker exec -d \
-        -e DISPLAY=:0 \
-        -e QT_X11_NO_MITSHM=1 \
-        -e XDG_RUNTIME_DIR=/tmp/runtime-root \
-        -e GALLIUM_DRIVER=d3d12 \
-        -e MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
-        -e LD_LIBRARY_PATH=/usr/lib/wsl/lib \
+    # The Mesa settings here are WSL's and only WSL's: d3d12 talks to the
+    # Windows GPU through the virtual adapter, and /usr/lib/wsl/lib is where
+    # libd3d12.so lives. On a real Linux box neither exists, and forcing them
+    # stops Mesa picking the driver it would have chosen correctly for the
+    # Intel graphics through /dev/dri.
+    local gui_env=(-e "DISPLAY=$(host_display)"
+                   -e QT_X11_NO_MITSHM=1
+                   -e XDG_RUNTIME_DIR=/tmp/runtime-root)
+    if is_wsl; then
+        gui_env+=(-e GALLIUM_DRIVER=d3d12
+                  -e MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+                  -e LD_LIBRARY_PATH=/usr/lib/wsl/lib)
+    fi
+    grn "Drawing on display $(host_display)."
+    docker exec -d "${gui_env[@]}" \
         "$CONTAINER" bash -c \
         'mkdir -p /tmp/runtime-root; exec gz sim -g --gui-config /opt/erc_ws/src/avaa_solution/config/gui.config > /tmp/gui.log 2>&1'
 
