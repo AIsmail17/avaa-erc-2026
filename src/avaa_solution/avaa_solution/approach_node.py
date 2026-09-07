@@ -212,6 +212,11 @@ TUCK_TORSO = 0.10
 RIGHT_TUCK = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
 
 
+def _wrap(angle: float) -> float:
+    """An angle difference brought back into [-pi, pi]."""
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
 def turn_for(error_rad: float, period: float, share: float = 0.5,
              fastest: float = 0.45, slowest_period: float = 0.25) -> float:
     """Pick a turn rate from how often the bearing that steers it actually arrives.
@@ -453,8 +458,11 @@ class ApproachNode(Node):
         self.centre_yaw0 = None
         self.scan: Optional[LaserScan] = None
         self.scan_rear: Optional[LaserScan] = None
-        # How far SEARCH has already reversed, so it cannot walk backwards forever.
+        # How far SEARCH has already reversed, so it cannot walk backwards forever,
+        # and the heading that allowance was granted for. Backing away from one
+        # obstacle says nothing about the next direction the search turns to.
         self.search_backed = 0.0
+        self.search_back_yaw = None
         self.yaw_rate = 0.0
         self.odom_yaw = None
         self.state = State.WAITING
@@ -853,6 +861,7 @@ class ApproachNode(Node):
             self.state_since = self._now()
             if state is State.SEARCH:
                 self.search_backed = 0.0
+                self.search_back_yaw = None
             if state is State.CENTRE:
                 # Only on a real transition: these count one visit to the state, and
                 # resetting them on a re-entry that is not a change would hide exactly
@@ -1055,10 +1064,36 @@ class ApproachNode(Node):
             return
 
         readable_from = self._aim_head_at_markers()
-        ahead = self._min_range_ahead()
+
+        # The SAME range the head was aimed with.
+        #
+        # This asked _min_range_ahead, the nearest return anywhere in a 40-degree cone,
+        # while _aim_head_at_markers aims with _range_ahead, the median of a 14-degree
+        # one. Two different questions, and the narrow one is the right one here: what
+        # matters is the distance to whatever the camera is pointed at, not the distance
+        # to the nearest thing off to one side of it.
+        #
+        # Measured on the run that found it. The robot stood at (0.80, -1.21) with the
+        # shelf face 1.95 m dead ahead, comfortably readable at the 11-degree tilt it
+        # had chosen, while the minimum over the wide cone read 1.46 m off the table
+        # behind and beside it. It spent its entire reverse allowance backing away from
+        # a distance it was never at.
+        ahead = self._range_ahead()
 
         if readable_from is not None and ahead is not None and ahead < readable_from:
             behind = self._clear_behind()
+
+            # One allowance per heading. The point of a cap is that reversing along a
+            # line which is not working has to stop, and turning to a new heading makes
+            # it a different line. On that same run the search turned through four
+            # separate obstacles on one allowance and was refusing to reverse from any
+            # of them by the time it came round to face the shelf.
+            if (self.search_back_yaw is not None and self.odom_yaw is not None
+                    and abs(_wrap(self.odom_yaw - self.search_back_yaw)) > 0.6):
+                self.search_backed = 0.0
+                self.search_back_yaw = self.odom_yaw
+            elif self.search_back_yaw is None:
+                self.search_back_yaw = self.odom_yaw
             room = SEARCH_BACK_MAX - self.search_backed
             if (behind is not None and behind > SEARCH_BACK_CLEARANCE and room > 0.0):
                 self.search_backed += SEARCH_BACK_SPEED * TICK_PERIOD
