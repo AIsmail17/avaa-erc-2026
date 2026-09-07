@@ -1378,9 +1378,15 @@ class GraspNode(Node):
                     % (100.0 * step / steps))
                 return None
             if not self._clear(solution):
+                # Name what it hit. "obstructed 12%" has no next step in it, and by
+                # this point the shelf has been taken out of the planning scene -- and
+                # tools/scenecheck.py confirms removal is immediate and complete, a box
+                # placed on the gripper going from INVALID to VALID with no wait -- so
+                # whatever stops the reach is the robot against itself. Which link
+                # against which is the entire question and the service already knows.
                 self.get_logger().warn(
-                    "the reach is obstructed %.0f%% of the way in"
-                    % (100.0 * step / steps))
+                    "the reach is obstructed %.0f%% of the way in, by: %s"
+                    % (100.0 * step / steps, self.moveit.why_invalid()))
                 return None
             waypoints.append(solution)
             seed = solution

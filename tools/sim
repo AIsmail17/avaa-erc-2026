@@ -149,11 +149,20 @@ cmd_start() {
     # process, and the taskbar button does not reliably restore it. Un-minimize
     # it from the Windows side.
     sleep 3
-    unminimize_window
-    echo
-    echo "The title bar reads '[WARN:COPY MODE] Gazebo Sim'. That is a WSLg"
-    echo "message about how the window is delivered to Windows. It is not an"
-    echo "error and it does not mean software rendering."
+    if is_wsl; then
+        unminimize_window
+        echo
+        echo "The title bar reads '[WARN:COPY MODE] Gazebo Sim'. That is a WSLg"
+        echo "message about how the window is delivered to Windows. It is not an"
+        echo "error and it does not mean software rendering."
+    fi
+}
+
+# Is this WSL, or a real Linux machine? Two of the messages below only make sense
+# under WSL, and printing them on the NUC made a healthy start look broken:
+# "powershell.exe not on PATH" is alarming and means nothing there.
+is_wsl() {
+    grep -qi microsoft /proc/version 2>/dev/null
 }
 
 unminimize_window() {
@@ -341,8 +350,16 @@ cmd_shell() {
 }
 
 cmd_status() {
-    echo "== WSL =="
-    echo "  distro : $(uname -r)"
+    # Which machine is this? The header read "WSL" everywhere, which on the NUC is
+    # false and made a native Linux box look like it was running through a
+    # compatibility layer.
+    if is_wsl; then
+        echo "== WSL =="
+        echo "  distro : $(uname -r)"
+    else
+        echo "== Host =="
+        echo "  $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") — $(uname -r)"
+    fi
     echo
     echo "== Docker =="
     if container_running; then
@@ -389,6 +406,19 @@ cmd_status() {
 }
 
 # Is anything actually coming out of this topic? Prints one line either way.
+# Is the colour camera actually producing frames? Returns 0 when it is.
+#
+# The single most expensive failure in this project: Gazebo starts, every controller
+# reports "Configured and activated", gz reports a healthy real-time factor, `sim status`
+# says running -- and the colour camera never publishes a frame. Perception then sees
+# nothing, the approach searches forever, and it looks exactly like a broken robot. It
+# cost large parts of three sessions before it was named.
+camera_streaming() {
+    local n
+    n=$(docker exec "$CONTAINER" /entrypoint.sh bash -c         "source /opt/erc_ws/install/setup.bash && timeout 8 ros2 topic hz          /head_front_camera/head_front_camera/color/image_raw 2>&1          | grep -c 'average rate'" 2>/dev/null)
+    [ "${n:-0}" -gt 0 ]
+}
+
 stream_check() {
     local label="$1" topic="$2" seen
     seen=$(docker exec "$CONTAINER" /entrypoint.sh bash -c \
@@ -419,10 +449,37 @@ cmd_rebuild() {
     ensure_built
 }
 
+# Start, then check, and if it came up blind restart the CONTAINER and try once more.
+#
+# Restarting Gazebo alone does not clear it -- measured, three times in a row, each
+# leaving the camera silent and the real-time factor at 0.10 to 0.16. Restarting the
+# container does, first time, and takes the factor back to 0.43. Whatever accumulates
+# lives in the container rather than in the simulator process.
+cmd_start_verified() {
+    cmd_start "$@"
+    sleep 20
+    if camera_streaming; then
+        return 0
+    fi
+    ylw "The simulation came up blind -- no colour frames. Restarting the container,"
+    ylw "which clears it where restarting Gazebo alone does not."
+    docker restart "$CONTAINER" > /dev/null 2>&1
+    sleep 12
+    cmd_start "$@"
+    sleep 20
+    if camera_streaming; then
+        grn "Recovered: the camera is streaming."
+        return 0
+    fi
+    red "Still blind after a container restart. Something else is wrong -- check"
+    red "'sim log' for controller spawners dying on 'after 3 attempts'."
+    return 1
+}
+
 case "${1:-}" in
-    start)   shift; cmd_start "$@" ;;
+    start)   shift; cmd_start_verified "$@" ;;
     stop)    cmd_stop    ;;
-    restart) shift; cmd_stop; cmd_start "$@" ;;
+    restart) shift; cmd_stop; cmd_start_verified "$@" ;;
     shell)   cmd_shell   ;;
     status)  cmd_status  ;;
     log)     cmd_log     ;;

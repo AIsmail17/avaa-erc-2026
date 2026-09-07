@@ -5,7 +5,7 @@ cd ~/erc/erc_sim_2026
 # 2026-09-04 and produced a "blind simulator" that looked like a product fault.
 # The pattern must not match the checking command itself, which "solution.launch.py"
 # alone does -- pgrep sees its own bash -c argument and always reports a hit.
-if docker exec erc_sim bash -c 'ps -eo args | grep -v grep | grep -q "[r]os2 launch avaa_solution"'; then
+if docker exec erc_sim bash -c 'ps -eo args | grep -v grep | grep -q "[r]os2 launch avaa_solution solution.launch.py"'; then
   echo "a solution launch is already running; refusing to start another"
   exit 2
 fi

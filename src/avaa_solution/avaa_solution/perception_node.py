@@ -119,6 +119,10 @@ class PerceptionNode(Node):
         # and the head tilts; far short of the gap between columns, which
         # is what this is there to refuse.
         self.declare_parameter("book_jump_px", 120.0)
+        # How much of the shelf must be in frame before a column identification is
+        # believed. Four of five leaves room for one plate clipped by the frame edge
+        # while keeping the distinct-digit constraint that makes the reader work.
+        self.declare_parameter("min_markers_to_identify", 4)
         self.declare_parameter("save_images", True)
         # Only src/ is bind-mounted into the container, so this is the deepest path that
         # still lands inside the git repository on the host. See PERCEPTION.md.
@@ -133,6 +137,8 @@ class PerceptionNode(Node):
         self.close_range = float(
             self.get_parameter("book_steering_range_m").value)
         self.book_jump_px = float(self.get_parameter("book_jump_px").value)
+        self.min_markers_to_identify = int(
+            self.get_parameter("min_markers_to_identify").value)
         self.image_dir = str(self.get_parameter("image_dir").value)
         self.save_images = bool(self.get_parameter("save_images").value)
         self.min_save_interval = float(self.get_parameter("min_save_interval_sec").value)
@@ -1022,6 +1028,33 @@ class PerceptionNode(Node):
         # Inside 30 degrees the plate is square enough to read and there is room to
         # turn towards it. SEARCH simply keeps rotating until one is properly in view,
         # which is what it is for.
+        # Do not identify the column from a glimpse of the shelf.
+        #
+        # assign_distinct() is what makes this reader good: it enforces that no two
+        # plates claim the same digit, which is a far stronger constraint than any
+        # single template match. With the whole shelf in view that constraint is
+        # decisive, and measured over a ten second window from 3 m it reads every digit
+        # on every frame --
+        #
+        #     marker 3 identified on 50 of 50 frames: 0 found none, 0 more than one
+        #     digits: 1 x50 (0.80), 2 x50 (0.66), 3 x50 (0.66), 4 x50 (0.98), 5 x50 (0.76)
+        #
+        # -- and with one or two plates in view it has almost nothing to work with, and
+        # the same reader manages 0 of 50. That gap is the whole of the approach's
+        # trouble: SEARCH leaves on the first bearing that arrives, which can come from
+        # a single plate at the edge of the frame, and everything downstream is then
+        # built on an identification that was a guess.
+        #
+        # So the identification waits for enough of the shelf to be in the picture. This
+        # does not affect close range, where the markers are above the field of view
+        # entirely and the book tracker carries the identification in.
+        if len(markers) < self.min_markers_to_identify:
+            self.get_logger().info(
+                "%d marker(s) in view, too few to tell five plates apart; not "
+                "identifying a column from this" % len(markers),
+                throttle_duration_sec=5.0)
+            return None
+
         limit = self.marker_edge_px
         hits = [i for i, m in enumerate(markers)
                 if m.digit == self.target_digit and m.confident
