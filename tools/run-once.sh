@@ -52,9 +52,38 @@ for i in $(seq 1 12); do
 done
 if [ "$ok" -eq 0 ]; then echo "the simulator came up blind; not launching"; exit 1; fi
 
-timeout 800 docker exec erc_sim /entrypoint.sh bash -c \
-  'source /opt/erc_ws/install/setup.bash && ros2 launch avaa_solution solution.launch.py shelf_column_number:=3 book_colour:=red' \
-  > /tmp/run_raw.log 2>&1 || true
+# Long enough for the whole mission, and it kills the run rather than the log.
+#
+# Two faults in "timeout 800 docker exec", both seen in one run on 2026-09-07.
+#
+# 800 seconds of wall clock is not a mission. The mission took 157 simulated seconds to
+# reach the delivery, and at the 0.3 to 0.5 real-time factor this machine manages that is
+# already 300 to 500 seconds before the delivery has driven anywhere -- plus a minute of
+# startup. The run that first completed a grasp and handed over to the delivery was cut
+# off in the middle of it.
+#
+# And killing the docker exec CLIENT does not kill what it started. The ros2 launch went
+# on running inside the container with nowhere to write: the log stopped at 12:34 while
+# the nodes were still going at 12:40, the next run refused to start because a launch was
+# already up, and the mission's own phase topic was the only way left to find out what
+# had happened. So: kill by name inside the container, then wait for it to go.
+LAUNCH_TIMEOUT=${LAUNCH_TIMEOUT:-2400}
+docker exec erc_sim /entrypoint.sh bash -c \
+  'source /opt/erc_ws/install/setup.bash && exec ros2 launch avaa_solution solution.launch.py shelf_column_number:=3 book_colour:=red' \
+  > /tmp/run_raw.log 2>&1 &
+CLIENT=$!
+( sleep "$LAUNCH_TIMEOUT"
+  if kill -0 "$CLIENT" 2>/dev/null; then
+    echo "=== $LAUNCH_TIMEOUT s elapsed; stopping the launch" >> /tmp/run_raw.log
+    docker exec erc_sim bash -c 'pkill -f "ros2 launch avaa_solution solution.launch.py"' \
+      >/dev/null 2>&1
+  fi ) &
+GUARD=$!
+wait "$CLIENT" 2>/dev/null || true
+kill "$GUARD" 2>/dev/null || true
+# Whatever ended the launch, leave nothing of it behind for the next run to trip over.
+docker exec erc_sim bash -c 'pkill -f "ros2 launch avaa_solution solution.launch.py"' \
+  >/dev/null 2>&1 || true
 # Keep it. /tmp is cleared out from under this often enough that two separate
 # investigations lost the log they were reading halfway through, and a run costs
 # thirteen minutes to reproduce.
