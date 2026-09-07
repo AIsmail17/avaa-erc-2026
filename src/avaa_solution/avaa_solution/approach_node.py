@@ -75,6 +75,38 @@ BASE_LINK_Z = 0.186
 HEAD_TILT_MIN = -1.047   # about 60 degrees down
 HEAD_TILT_MAX = 0.349    # about 20 degrees up
 
+# Column markers are mounted level with the shelf tops, this far above the floor.
+#
+# This number decides where the robot may stand while it is still looking for its
+# column, and until now nothing in the approach knew it. Measured against the camera:
+# 640x360 with fx = fy = 337.2, so 87 degrees across and 56 tall -- a half-angle of
+# 28.1 -- and the depth optical frame sits 1.160 m above the floor with the head level.
+# The marker is therefore 1.10 m above the camera, and it is in frame only beyond
+#
+#     rise / tan(tilt + 28.1 deg)
+#
+# which is 2.06 m with the head level and 0.99 m with the head at its upward limit of
+# 20 degrees. The approach parks at 0.65 m and tilts the head 41 degrees DOWN to keep
+# the bottom row in view. From there the marker band is 69 degrees off the camera axis
+# and no amount of turning will ever bring it into frame.
+MARKER_Z = 2.26
+
+# Half the camera's vertical field of view: 360 rows at fy = 337.2, read from its own
+# CameraInfo. Kept here because the aiming below has to know where the edge of the frame
+# is before it has seen a single frame.
+CAMERA_HALF_V = math.radians(28.1)
+
+# Keep the marker this far inside that edge to call it readable. At the very edge the
+# digit is clipped and foreshortened, and the tallies that measured this showed the
+# reader going from every frame to none across a few degrees.
+MARKER_EDGE_MARGIN = math.radians(8.0)
+
+# Reversing during a search: the same speed RETREAT uses, a clearance that leaves room
+# to stop, and a total allowance a little over the 1.0 m the geometry can ever ask for.
+SEARCH_BACK_SPEED = 0.12
+SEARCH_BACK_CLEARANCE = 0.55
+SEARCH_BACK_MAX = 1.6
+
 # Gripper z in base_link for rows 1..4, top shelf first.
 DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
 
@@ -100,6 +132,10 @@ TOPIC_ARM_LEFT = "/arm_left_controller/joint_trajectory"
 TOPIC_ARM_RIGHT = "/arm_right_controller/joint_trajectory"
 TOPIC_TORSO = "/torso_controller/joint_trajectory"
 TOPIC_SCAN = "/scan_front_raw"
+# Each laser covers 269 degrees, so the front one alone leaves a 91-degree blind
+# cone directly behind the base -- exactly the direction anything reversing needs
+# to see. The two together cover the full circle. Measured on both.
+TOPIC_SCAN_REAR = "/scan_rear_raw"
 TOPIC_STATE = "/avaa/approach/state"
 TOPIC_CMD = "/cmd_vel"
 
@@ -416,6 +452,9 @@ class ApproachNode(Node):
         self.centre_idle = 0
         self.centre_yaw0 = None
         self.scan: Optional[LaserScan] = None
+        self.scan_rear: Optional[LaserScan] = None
+        # How far SEARCH has already reversed, so it cannot walk backwards forever.
+        self.search_backed = 0.0
         self.yaw_rate = 0.0
         self.odom_yaw = None
         self.state = State.WAITING
@@ -514,6 +553,8 @@ class ApproachNode(Node):
         self.create_subscription(
             Float32, TOPIC_SHELF_YAW, self._on_shelf_yaw, 10)
         self.create_subscription(LaserScan, TOPIC_SCAN, self._on_scan, SENSOR_QOS)
+        self.create_subscription(
+            LaserScan, TOPIC_SCAN_REAR, self._on_scan_rear, SENSOR_QOS)
         # Odometry is used for ONE thing: the yaw rate, to damp the turns.
         # It is not trusted for position -- the base slides across its wheels
         # without turning them, and during one run held to 17 mm of true error
@@ -618,10 +659,18 @@ class ApproachNode(Node):
     def _on_scan(self, msg: LaserScan) -> None:
         self.scan = msg
 
+    def _on_scan_rear(self, msg: LaserScan) -> None:
+        self.scan_rear = msg
+
     # ------------------------------------------------------------------ geometry
 
-    def _scan_points_base(self) -> List[Tuple[float, float]]:
-        """All scan returns as (x, y) in base_footprint.
+    def _scan_points_base(self, scan: Optional[LaserScan] = None
+                          ) -> List[Tuple[float, float]]:
+        """All returns from one laser as (x, y) in base_footprint.
+
+        Defaults to the front laser, which is what every caller wanted while there was
+        only one. The rear laser is mounted differently again, so it must come through
+        the same transform rather than having its angles read off directly.
 
         The scan frame is NOT aligned with the robot. The front laser is mounted at
         roll -180 deg, yaw -45 deg relative to base_footprint, so scan angle zero points
@@ -630,11 +679,12 @@ class ApproachNode(Node):
         somewhere else entirely -- which is why the shelf-squaring fit reported the face
         2.5 degrees off while the robot was actually sitting 35 degrees away from square.
         """
-        if self.scan is None:
+        scan = self.scan if scan is None else scan
+        if scan is None:
             return []
         try:
             tf = self.tf_buffer.lookup_transform(
-                BASE_FRAME, self.scan.header.frame_id, rclpy.time.Time()
+                BASE_FRAME, scan.header.frame_id, rclpy.time.Time()
             )
         except Exception:  # noqa: BLE001 - transform may not be available yet
             return []
@@ -649,10 +699,10 @@ class ApproachNode(Node):
         r10, r11, r12 = 2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)
 
         points = []
-        for i, r in enumerate(self.scan.ranges):
-            if not math.isfinite(r) or not (self.scan.range_min < r < self.scan.range_max):
+        for i, r in enumerate(scan.ranges):
+            if not math.isfinite(r) or not (scan.range_min < r < scan.range_max):
                 continue
-            angle = self.scan.angle_min + i * self.scan.angle_increment
+            angle = scan.angle_min + i * scan.angle_increment
             lx, ly, lz = r * math.cos(angle), r * math.sin(angle), 0.0
             bx = r00 * lx + r01 * ly + r02 * lz + t.x
             by = r10 * lx + r11 * ly + r12 * lz + t.y
@@ -671,6 +721,21 @@ class ApproachNode(Node):
         """Return hits within +/- half_angle of ahead, as (x, y) in base_footprint."""
         return [(x, y) for x, y in self._scan_points_base()
                 if x > 0.0 and abs(math.atan2(y, x)) <= half_angle]
+
+    def _clear_behind(self, half_angle: float = 0.40) -> Optional[float]:
+        """Nearest thing behind the base, from the rear laser. None means unmeasured.
+
+        None and "nothing is there" are deliberately different answers. Reversing on
+        the strength of a laser that returned nothing is reversing blind, and the
+        caller treats an unmeasured direction as a refusal rather than as clear space.
+        """
+        if self.scan_rear is None:
+            return None
+        points = [(x, y) for x, y in self._scan_points_base(self.scan_rear)
+                  if x < 0.0 and abs(math.atan2(y, -x)) <= half_angle]
+        if not points:
+            return None
+        return float(min(math.hypot(x, y) for x, y in points))
 
     def _range_ahead(self) -> Optional[float]:
         points = self._forward_points(half_angle=0.12)
@@ -786,6 +851,8 @@ class ApproachNode(Node):
             self.get_logger().info(f"{self.state.value} -> {state.value}")
             self.state = state
             self.state_since = self._now()
+            if state is State.SEARCH:
+                self.search_backed = 0.0
             if state is State.CENTRE:
                 # Only on a real transition: these count one visit to the state, and
                 # resetting them on a re-entry that is not a change would hide exactly
@@ -910,6 +977,60 @@ class ApproachNode(Node):
         if elapsed >= self.tuck_time + 2.0:
             self._enter(State.SEARCH)
 
+    def _send_head_tilt(self, desired: float) -> None:
+        """Publish a head tilt, skipping repeats.
+
+        Every JointTrajectory replaces the one in progress and restarts its
+        time_from_start, so a trajectory re-sent every tick never finishes and the head
+        never actually arrives.
+        """
+        if self.head_tilt is not None and abs(desired - self.head_tilt) < 0.05:
+            return
+        self.head_tilt = desired
+        traj = JointTrajectory()
+        traj.joint_names = ["head_1_joint", "head_2_joint"]
+        point = JointTrajectoryPoint()
+        point.positions = [0.0, float(desired)]
+        point.time_from_start = Duration(sec=1, nanosec=0)
+        traj.points = [point]
+        self.pub_head.publish(traj)
+
+    def _aim_head_at_markers(self) -> Optional[float]:
+        """Point the camera at the height the markers live at, and say what that buys.
+
+        Returns the nearest range from which a marker would be comfortably readable at
+        the tilt just chosen, or None while the camera position is still unknown.
+
+        SEARCH used to turn on the spot with the head wherever the rest of the approach
+        had last left it, and the rest of the approach leaves it looking at the floor:
+        closing on the bottom row takes the tilt to 41 degrees down. On the run that
+        found this, the robot turned for 150 seconds about 1.3 m from the shelf, saw the
+        books the whole time -- "2 red book(s) in view", over and over -- read a marker
+        on 0 of every 50 frames, and timed out searching. It was not failing to
+        recognise the marker. It was not looking anywhere the marker could be.
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                BASE_FRAME, CAMERA_FRAME, rclpy.time.Time())
+        except Exception:  # noqa: BLE001 - the transform may not be published yet
+            self._send_head_tilt(HEAD_TILT_MAX)
+            return None
+        rise = MARKER_Z - tf.transform.translation.z
+        if rise <= 0.0:
+            self._send_head_tilt(0.0)
+            return 0.0
+
+        # Centre the marker band on whatever is in front of us. With nothing ranged --
+        # facing an open room part-way through a turn -- aim high: a marker further away
+        # than the aim assumes stays in frame, one nearer than it assumes does not.
+        distance = self._range_ahead()
+        desired = math.atan2(rise, distance if distance and distance > 0.3 else 2.5)
+        desired = max(HEAD_TILT_MIN, min(HEAD_TILT_MAX, desired))
+        self._send_head_tilt(desired)
+
+        top = desired + CAMERA_HALF_V - MARKER_EDGE_MARGIN
+        return rise / math.tan(top) if top > 0.05 else float("inf")
+
     def _do_search(self) -> None:
         """Rotate on the spot until the target column's marker comes into view.
 
@@ -917,6 +1038,15 @@ class ApproachNode(Node):
         the target may be anywhere around it. Rotating in place is the cheapest way to
         cover the full circle without risking a collision, and with the arms stowed the
         base turns cleanly on the spot.
+
+        Turning is not sufficient on its own, though, and for two runs it was all this
+        did. The marker sits 1.10 m above the camera, which puts it out of the top of
+        the frame inside 2.06 m with the head level and inside about 1.0 m even with the
+        head at its 20-degree upward limit. SEARCH is reached from ACQUIRE and from
+        three separate lost-the-book paths, every one of them a close-range state, so
+        the usual case is a robot turning on the spot well inside the distance at which
+        the thing it is looking for could be seen at all. Aim the head, and make room if
+        there is none.
         """
         if self._column_cx_fresh() is not None:
             self._stop()
@@ -924,11 +1054,49 @@ class ApproachNode(Node):
             self._enter(State.CENTRE)
             return
 
+        readable_from = self._aim_head_at_markers()
+        ahead = self._min_range_ahead()
+
+        if readable_from is not None and ahead is not None and ahead < readable_from:
+            behind = self._clear_behind()
+            room = SEARCH_BACK_MAX - self.search_backed
+            if (behind is not None and behind > SEARCH_BACK_CLEARANCE and room > 0.0):
+                self.search_backed += SEARCH_BACK_SPEED * TICK_PERIOD
+                cmd = Twist()
+                cmd.linear.x = -SEARCH_BACK_SPEED
+                # Damp any rotation left over from the turning. There is no friction
+                # across the mecanum rollers, so whatever rate the base has it keeps,
+                # and reversing while still turning curves away from the sightline the
+                # back-off is being spent to open up.
+                cmd.angular.z = self._turn(0.0, 0.0, floor=0.0)
+                self.pub_cmd.publish(cmd)
+                self.get_logger().info(
+                    "cannot read a marker from %.2f m -- the band at %.2f m needs "
+                    "%.2f m -- so backing off (%.2f m so far, %.2f m clear behind)"
+                    % (ahead, MARKER_Z, readable_from, self.search_backed, behind),
+                    throttle_duration_sec=4.0)
+                return
+            if behind is None:
+                why = "the rear laser sees nothing"
+            elif behind <= SEARCH_BACK_CLEARANCE:
+                why = "only %.2f m behind" % behind
+            else:
+                why = "already backed off %.2f m" % self.search_backed
+            self.get_logger().warn(
+                "too close to read a marker (%.2f m, need %.2f m) and cannot reverse: "
+                "%s. Turning anyway, to look for a longer sightline." % (
+                    ahead, readable_from, why),
+                throttle_duration_sec=10.0)
+
         cmd = Twist()
         cmd.angular.z = self.search_rate
         self.pub_cmd.publish(cmd)
         self.get_logger().info(
-            f"searching for marker... ({self._elapsed():.0f}s)",
+            "searching for marker... (%.0fs, head %.0f deg %s, %s)" % (
+                self._elapsed(), abs(math.degrees(self.head_tilt or 0.0)),
+                "up" if (self.head_tilt or 0.0) >= 0 else "down",
+                "nothing ranged ahead" if ahead is None else
+                "%.2f m ahead, readable from %.2f m" % (ahead, readable_from or 0.0)),
             throttle_duration_sec=5.0,
         )
 
@@ -969,23 +1137,15 @@ class ApproachNode(Node):
         desired = -math.atan2(drop, distance)
         desired = max(HEAD_TILT_MIN, min(HEAD_TILT_MAX, desired))
 
-        # Only re-send on a meaningful change. Every JointTrajectory replaces the one in
-        # progress and restarts its time_from_start, so a trajectory re-sent every tick
-        # never finishes and the head never actually arrives.
         if self.head_tilt is not None and abs(desired - self.head_tilt) < 0.05:
             return
-        self.head_tilt = desired
-
-        traj = JointTrajectory()
-        traj.joint_names = ["head_1_joint", "head_2_joint"]
-        point = JointTrajectoryPoint()
-        point.positions = [0.0, float(desired)]
-        point.time_from_start = Duration(sec=1, nanosec=0)
-        traj.points = [point]
-        self.pub_head.publish(traj)
+        self._send_head_tilt(desired)
+        # "+23 deg down" and "-6 deg down" both appeared in the same run's log. The
+        # sign was the direction and the word was a guess at it.
         self.get_logger().info(
-            f"head tilt -> {math.degrees(-desired):+.0f} deg down "
-            f"(row {self.target_row} at {distance:.2f} m)"
+            "head tilt -> %.0f deg %s (row %s at %.2f m)" % (
+                abs(math.degrees(desired)), "up" if desired >= 0 else "down",
+                self.target_row, distance)
         )
 
     def _on_book_point(self, msg: PointStamped) -> None:
