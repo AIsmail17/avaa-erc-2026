@@ -91,6 +91,11 @@ BIN_RIM_BASE_Z = 0.950 - 0.186
 BIN_DEPTH_M = 0.50
 DEPTH_HEIGHT_BIAS = 0.152
 
+# How far a book fix may sit from its identified row's height and still be that
+# book. Rows are 0.330 m apart, so this cannot confuse two of them, and it is wide
+# enough for the depth bias above and for a book standing proud of its neighbours.
+ROW_HEIGHT_TOLERANCE = 0.20
+
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -623,10 +628,19 @@ class PerceptionNode(Node):
                                 else self.base_yaw - self.last_book_yaw)),
                 throttle_duration_sec=5.0)
             return
+        self.pub_row.publish(Int32(data=self.reported_row))
+
+        # Remember this book only if it was accepted as the target.
+        #
+        # The order used to be the other way round, and that let one refused fix poison
+        # the tracker: last_book_cx became the wrong book, every later prediction was
+        # made from it, and the right book -- now far from the expectation -- was itself
+        # rejected as a column hop. The refusal below is the height gate in
+        # _publish_book_point, which knows which shelf the target is on.
+        if not self._publish_book_point(target):
+            return
         self.last_book_cx = float(target.cx)
         self.last_book_yaw = self.base_yaw
-        self.pub_row.publish(Int32(data=self.reported_row))
-        self._publish_book_point(target)
 
         # Steer by the book only when the robot is CLOSE to it.
         #
@@ -667,7 +681,7 @@ class PerceptionNode(Node):
                    key=lambda i: abs(ROW_HEIGHTS_BASE[i] - corrected))
         return best + 1
 
-    def _cross_check_row(self, point) -> None:
+    def _cross_check_row(self, point, markers_in_view: bool = False) -> None:
         """Distrust the marker row when the measured height flatly contradicts it.
 
         The row is counted from the books grouped under a column marker, which needs the
@@ -682,6 +696,19 @@ class PerceptionNode(Node):
         """
         if self.reported_row is None:
             return
+
+        # Only while the column itself is in frame.
+        #
+        # This exists to catch a row miscounted from the markers, and that is a question
+        # about the column -- which needs the column visible to answer. Once the markers
+        # have gone the tracker is choosing among identical books on its own, and the
+        # heights it then measures are evidence about whichever book it picked, not
+        # about whether the row was counted correctly. Twelve of those in a row are
+        # twelve measurements of the same wrong book, and they were enough to overturn a
+        # fifteen-reading identification.
+        if not markers_in_view:
+            return
+
         implied = self._row_from_height(point)
         if implied is None:
             return
@@ -727,7 +754,16 @@ class PerceptionNode(Node):
         self.row_votes.clear()
         self.height_votes.clear()
 
-    def _publish_book_point(self, target: bd.Book) -> None:
+    def _row_height(self):
+        """The identified row's gripper height in base_link, or None."""
+        if self.reported_row is None:
+            return None
+        if not 1 <= self.reported_row <= len(ROW_HEIGHTS_BASE):
+            return None
+        return ROW_HEIGHTS_BASE[self.reported_row - 1]
+
+    def _publish_book_point(self, target: bd.Book,
+                            markers_in_view: bool = False) -> bool:
         """Publish the target book's 3D position in base_link, for the grasp controller.
 
         The RGB and depth streams share intrinsics and dimensions exactly, so the box
@@ -760,14 +796,14 @@ class PerceptionNode(Node):
                 self.get_logger().warn(
                     "cannot place the book in 3D, still waiting on: %s"
                     % ", ".join(missing), throttle_duration_sec=5.0)
-            return
+            return False
         point_optical = dl.locate(target.bbox, self.depth_image, self.intrinsics)
         self._watch_jump(point_optical, target)
         if point_optical is None:
             self.get_logger().warn(
                 "no usable depth over the target book", throttle_duration_sec=5.0
             )
-            return
+            return False
         try:
             tf = self.tf_buffer.lookup_transform(
                 GRASP_FRAME, self.depth_frame, rclpy.time.Time()
@@ -777,7 +813,7 @@ class PerceptionNode(Node):
                 f"no transform {self.depth_frame} -> {GRASP_FRAME}: {exc}",
                 throttle_duration_sec=5.0,
             )
-            return
+            return False
 
         point = dl.transform_point(
             point_optical, tf.transform.rotation, tf.transform.translation
@@ -785,10 +821,39 @@ class PerceptionNode(Node):
         msg = PointStamped()
         msg.header.frame_id = GRASP_FRAME
         msg.header.stamp = self.get_clock().now().to_msg()
+        # Refuse a fix that is not on the shelf the target is on.
+        #
+        # The row is identified early, from three metres out, with the whole column in
+        # frame and fifteen readings agreeing. Once the markers leave the picture the
+        # book tracker is choosing between several identically coloured books with no
+        # anchor but its own last answer, and on one run it chose one a column to the
+        # left and a shelf up: the approach anchored at [1.52, 0.99, 1.51] in base_link
+        # -- 0.99 m across, which is one column spacing of 0.95 m, at row 1's height
+        # when row 4 had been identified 15 readings to 15. Every later measurement then
+        # agreed with the wrong book, so even a twelve-sample majority endorsed it, the
+        # head tilted back up to row 1, and the approach spent its acquire budget
+        # driving sideways at a book it was never sent for.
+        #
+        # A height is the one thing about the target that is known in advance and cannot
+        # drift. Use it.
+        self._cross_check_row(point, markers_in_view)
+        expected_z = self._row_height()
+        if expected_z is not None:
+            off = abs(float(point[2]) - DEPTH_HEIGHT_BIAS - expected_z)
+            if off > ROW_HEIGHT_TOLERANCE:
+                self.get_logger().warn(
+                    "a %s book measures %.2f m up, and row %s is at %.2f m -- %.2f m "
+                    "away, more than the %.2f m allowed. That is a different shelf, so "
+                    "not offering it as the target."
+                    % (self.book_colour, float(point[2]) - DEPTH_HEIGHT_BIAS,
+                       self.reported_row, expected_z, off, ROW_HEIGHT_TOLERANCE),
+                    throttle_duration_sec=5.0)
+                return False
+
         msg.point.x, msg.point.y, msg.point.z = (float(v) for v in point)
         self.pub_book_point.publish(msg)
         self.last_book_range = float(point[0])
-        self._cross_check_row(point)
+        return True
 
     def _publish_bin_point(self, frame) -> None:
         """Publish the collection bin's position in base_link, if it is in view.
@@ -988,7 +1053,10 @@ class PerceptionNode(Node):
 
         target = bd.find_book(columns, column_index, self.book_colour)
         if target is not None:
-            self._publish_book_point(target)
+            # Reached only with the target column identified from a plate in this very
+            # frame, so the column IS in view and the measured height is evidence about
+            # the row rather than about which book the tracker happened to pick.
+            self._publish_book_point(target, markers_in_view=True)
             self._save_book_image(frame, books, target, row)
 
     # ------------------------------------------------------------------ helpers
