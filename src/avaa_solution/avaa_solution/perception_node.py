@@ -189,6 +189,12 @@ class PerceptionNode(Node):
         # a window because a single depth frame is not evidence -- see
         # _cross_check_row.
         self.height_votes = deque(maxlen=12)
+        # Which plate was the target last time, and the heading it was read from.
+        # See _target_column_index: the reader decides afresh on every frame and
+        # is entitled to change its mind, and the steering cannot survive that.
+        self.last_marker_cx = None
+        self.last_marker_yaw = None
+        self.marker_rejects = 0
         self.started_at = None
         self.row_majority = 0.7
 
@@ -481,17 +487,21 @@ class PerceptionNode(Node):
         true -- and over the fifth of a second between two frames even the worst of
         that is a fraction of a pixel.
         """
-        if self.last_book_cx is None:
+        return self._predict_cx(self.last_book_cx, self.last_book_yaw, width)
+
+    def _predict_cx(self, last_cx, last_yaw, width: float):
+        """The same prediction for anything fixed in the world: a book or a plate."""
+        if last_cx is None:
             return None
-        if self.last_book_yaw is None or self.base_yaw is None:
-            return self.last_book_cx
+        if last_yaw is None or self.base_yaw is None:
+            return last_cx
         focal = self.intrinsics.fx if self.intrinsics is not None else 337.2
         centre = width / 2.0
-        turned = math.atan2(math.sin(self.base_yaw - self.last_book_yaw),
-                            math.cos(self.base_yaw - self.last_book_yaw))
-        theta = math.atan2(self.last_book_cx - centre, focal)
+        turned = math.atan2(math.sin(self.base_yaw - last_yaw),
+                            math.cos(self.base_yaw - last_yaw))
+        theta = math.atan2(last_cx - centre, focal)
         moved = theta - turned
-        # Past a right angle the tangent stops meaning anything, and the book is well
+        # Past a right angle the tangent stops meaning anything, and the target is well
         # out of frame long before that.
         if abs(moved) > 1.2:
             return None
@@ -1168,6 +1178,56 @@ class PerceptionNode(Node):
                         if m.digit == self.target_digit and m.confident)),
                     throttle_duration_sec=3.0)
             return None  # absent, too oblique, or read twice -- move for a better view
+
+        chosen = markers[hits[0]]
+
+        # The reader may not change its mind about WHICH plate is the target.
+        #
+        # It decides afresh on every frame, and on a shelf of five near-identical plates
+        # it occasionally hands the target digit to the wrong one. That is survivable for
+        # an identification taken as a vote. It is not survivable for a steering bearing,
+        # which is taken from one frame.
+        #
+        # The run that found this: the base sat still at a heading of -63.8 degrees with
+        # the target plate steady at 291 to 305 px across forty seconds, and the reader
+        # returned index 2 on most frames and index 0 on the rest. The approach was fed
+        # 340 px and 14 px alternately, read them as 2 degrees and 42 degrees of error,
+        # and turned back and forth: "asked for 33 deg of turn over 84 ticks, base has
+        # turned 4 deg". It timed out centring while sitting correctly centred.
+        #
+        # So: a plate more than half a column away from where the last one should have
+        # moved to is a different plate, and this frame has nothing to say. The book
+        # tracker already works exactly this way -- the threshold is the same
+        # self-calibrating half-spacing that assigns books to columns, so it holds at any
+        # range without a tuned constant.
+        width = 2.0 * self.image_centre_px
+        expected = self._predict_cx(self.last_marker_cx, self.last_marker_yaw, width)
+        if expected is not None:
+            limit = column_max_dx(markers)
+            if abs(chosen.cx - expected) > limit:
+                self.get_logger().warn(
+                    "marker %s read at %.0f px, but the plate being followed should be "
+                    "at %.0f px and columns are %.0f px apart; that is a different "
+                    "plate, so not steering by it"
+                    % (self.target_digit, chosen.cx, expected, 2.0 * limit),
+                    throttle_duration_sec=5.0)
+                self.marker_rejects += 1
+                # A tracker that can only ever reject is worse than no tracker. If the
+                # plate it is following has genuinely gone -- occluded, out of frame,
+                # or wrong from the start -- refusing every frame forever would strand
+                # the approach with no bearing at all, so let go and take the reading.
+                if self.marker_rejects >= 15:
+                    self.get_logger().warn(
+                        "nothing has matched the followed plate for %d frames; letting "
+                        "go and taking marker %s at %.0f px as the target"
+                        % (self.marker_rejects, self.target_digit, chosen.cx))
+                    self.marker_rejects = 0
+                else:
+                    return None
+
+        self.marker_rejects = 0
+        self.last_marker_cx = float(chosen.cx)
+        self.last_marker_yaw = self.base_yaw
         return hits[0]
 
     def _publish_detections(self, books: List[bd.Book],
