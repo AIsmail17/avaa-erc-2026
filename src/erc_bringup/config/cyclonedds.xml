@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Receive buffers big enough for this robot's camera.
+
+  Measured on 2026-09-07, mid-run, on the NUC:
+
+      net.core.rmem_max = 212992           (the Linux default, 208 KB)
+      colour image       = 640x360 BGR8    (691 KB per frame, at 30 simulated Hz)
+      UDP RcvbufErrors   = 3,119,527 and rising by about 200 a second
+
+  One image is more than three times the whole socket receive buffer, so it is
+  fragmented into hundreds of datagrams, and a buffer that small overflows
+  continuously. Losing any one fragment discards the entire frame.
+
+  What that looked like from the outside: perception ran happily for 68 simulated
+  seconds and then reported "no camera images arrived at all in the last 10 s" for the
+  rest of the run, while `ros2 topic hz` on the same topic from a freshly created
+  subscriber reported a healthy 30 frames a simulated second. The camera was fine. The
+  reader had stopped being able to reassemble anything. Every answer perception gave
+  after that was about a stored frame, so the robot centred on a book that was no longer
+  where it thought, and the approach flapped between centring and searching until it
+  timed out.
+
+  The socket size CycloneDDS asks for is capped by net.core.rmem_max, so this file is
+  only half the fix. tools/sim raises that limit when it starts the container, which
+  it can do because the container is privileged and on the host network.
+
+  Defrag limits are raised to match: with hundreds of fragments per sample and several
+  samples in flight, the default of four unreliable samples under reassembly is not
+  enough to survive a burst.
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config
+                                https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+    <Internal>
+      <MinimumSocketReceiveBufferSize>32MB</MinimumSocketReceiveBufferSize>
+      <DefragUnreliableMaxSamples>128</DefragUnreliableMaxSamples>
+      <DefragReliableMaxSamples>128</DefragReliableMaxSamples>
+    </Internal>
+  </Domain>
+</CycloneDDS>

@@ -210,9 +210,12 @@ class PerceptionNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self.create_subscription(Image, TOPIC_RGB, self._on_image, SENSOR_QOS)
+        self.sub_rgb = self.create_subscription(
+            Image, TOPIC_RGB, self._on_image, SENSOR_QOS)
+        self.sub_depth = self.create_subscription(
+            Image, TOPIC_DEPTH, self._on_depth, SENSOR_QOS)
+        self.resubscribes = 0
         self.create_subscription(Odometry, "/odom", self._on_odom, 10)
-        self.create_subscription(Image, TOPIC_DEPTH, self._on_depth, SENSOR_QOS)
         self.create_subscription(CameraInfo, TOPIC_DEPTH_INFO, self._on_info, SENSOR_QOS)
         self.pub_book_point = self.create_publisher(
             PointStamped, TOPIC_TARGET_BOOK_POINT, 10)
@@ -409,9 +412,45 @@ class PerceptionNode(Node):
                     "no camera images arrived at all in the last %.0f s. The detector "
                     "is running on a stored frame and every answer it gives is about "
                     "the past." % (now - since))
+                self._resubscribe()
             self._frames = 0
             self._arrivals = 0
             self._frames_at = now
+
+    def _resubscribe(self) -> None:
+        """Throw away the image subscriptions and make new ones.
+
+        A reader can stop delivering while the camera is perfectly healthy. Measured on
+        2026-09-07: this node reported no images for the rest of a run from 68 simulated
+        seconds in, while a subscriber created at that moment, on the same topic with
+        this same QoS, received 30 frames a simulated second. The cause was underneath
+        DDS -- 691 KB frames fragmented into a 208 KB kernel receive buffer, three
+        million dropped datagrams and counting, so no sample could ever be reassembled
+        -- and that is fixed where it belongs, in the buffer sizes.
+
+        This is the other half: whatever the reason, a node whose sensor has gone quiet
+        should try to get it back rather than spend the remaining ten minutes of a run
+        confidently describing a stored picture. Rebuilding the subscription is cheap
+        and it is the one recovery available from inside this process.
+
+        It does not paper over the fault -- the error above still says what happened,
+        and this says it is trying -- so a run where this fires repeatedly is still
+        visibly a broken run.
+        """
+        self.resubscribes += 1
+        try:
+            self.destroy_subscription(self.sub_rgb)
+            self.destroy_subscription(self.sub_depth)
+            self.sub_rgb = self.create_subscription(
+                Image, TOPIC_RGB, self._on_image, SENSOR_QOS)
+            self.sub_depth = self.create_subscription(
+                Image, TOPIC_DEPTH, self._on_depth, SENSOR_QOS)
+            self.get_logger().warn(
+                "rebuilt the camera subscriptions (attempt %d); if frames do not "
+                "resume, the simulator itself has stopped publishing"
+                % self.resubscribes)
+        except Exception as exc:  # noqa: BLE001 - recovery must not kill the node
+            self.get_logger().error("could not rebuild the subscriptions: %s" % exc)
 
     def _on_odom(self, msg: Odometry) -> None:
         q = msg.pose.pose.orientation

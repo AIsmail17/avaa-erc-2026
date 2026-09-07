@@ -57,11 +57,41 @@ ensure_container() {
         sleep 3
     else
         ylw "No existing container. Creating one (this destroys any old build)..."
-        (cd "$REPO" && ./docker/up-wsl.sh >/dev/null 2>&1)
+        (cd "$REPO" && "$(up_script)" >/dev/null 2>&1)
         sleep 4
     fi
     container_running || { red "Could not start the container."; return 1; }
+    tune_buffers
     grn "Container up."
+}
+
+# Make the kernel allow a receive buffer big enough for one camera frame.
+#
+# The colour image is 640x360 BGR8, 691 KB, published at 30 simulated Hz. The Linux
+# default net.core.rmem_max is 212992 bytes -- less than a third of a single frame -- so
+# every frame is fragmented across hundreds of datagrams into a buffer that cannot hold
+# one of them, and losing any fragment discards the whole frame. Measured mid-run on
+# 2026-09-07: UDP RcvbufErrors at 3,119,527 and climbing by about 200 a second.
+#
+# What it cost: perception ran for 68 simulated seconds and then reported "no camera
+# images arrived at all in the last 10 s" for the rest of the run, while a freshly made
+# subscriber on the same topic saw a healthy 30 frames a simulated second. The camera
+# was never the problem.
+#
+# CycloneDDS asks for 32 MB (src/erc_bringup/config/cyclonedds.xml) and the kernel caps
+# it here, so both halves are needed. The container is privileged and on the host
+# network, so it can set this itself and no password is wanted from anyone.
+tune_buffers() {
+    local want=33554432 have
+    have=$(docker exec "$CONTAINER" sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    [ "${have:-0}" -ge "$want" ] && return 0
+    if docker exec "$CONTAINER" sysctl -q -w net.core.rmem_max=$want \
+                                          -w net.core.rmem_default=1048576 >/dev/null 2>&1; then
+        ylw "Raised net.core.rmem_max from $have to $want (camera frames are 691 KB)."
+    else
+        red "Could not raise net.core.rmem_max (it is $have, and one camera frame is"
+        red "691 KB). Expect the image stream to stall part-way through a run."
+    fi
 }
 
 ensure_built() {
@@ -161,6 +191,17 @@ cmd_start() {
 # Is this WSL, or a real Linux machine? Two of the messages below only make sense
 # under WSL, and printing them on the NUC made a healthy start look broken:
 # "powershell.exe not on PATH" is alarming and means nothing there.
+# Which bring-up script this host needs.
+#
+# Both call sites said up-wsl.sh, which demands nvidia-smi and forces Mesa at the d3d12
+# Gallium driver. On the NUC -- native Linux, integrated graphics -- that script exits 1
+# before creating anything, and `sim start` reports only "Could not start the container"
+# with no hint that it tried the wrong one. The container there had been created by hand
+# and nobody had needed this path yet.
+up_script() {
+    if is_wsl; then echo "./docker/up-wsl.sh"; else echo "./docker/up.sh"; fi
+}
+
 is_wsl() {
     grep -qi microsoft /proc/version 2>/dev/null
 }
@@ -425,8 +466,30 @@ cmd_status() {
         stream_check "colour camera" \
             /head_front_camera/head_front_camera/color/image_raw
         stream_check "joint states " /joint_states
+        udp_drops
     else
         red "  gazebo    : not running (run 'sim start')"
+    fi
+}
+
+# Are camera frames being lost in the kernel before any node sees them?
+#
+# A subscription that has stopped receiving looks identical to a camera that has stopped
+# publishing, and the difference is here: RcvbufErrors counts datagrams the kernel threw
+# away because the socket buffer was full. Any sustained rate means frames are being
+# destroyed in transit, and one lost fragment destroys a whole image.
+udp_drops() {
+    local a b rate limit
+    a=$(awk '/^Udp:/{n++; if (n==2) print $6}' /proc/net/snmp)
+    sleep 4
+    b=$(awk '/^Udp:/{n++; if (n==2) print $6}' /proc/net/snmp)
+    rate=$(( (${b:-0} - ${a:-0}) / 4 ))
+    limit=$(docker exec "$CONTAINER" sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    if [ "$rate" -gt 0 ]; then
+        red "  udp frames    : LOSING $rate datagrams a second to a full receive buffer"
+        red "                  (net.core.rmem_max is $limit; one frame is 691 KB)"
+    else
+        grn "  udp frames    : none dropped (rmem_max $limit)"
     fi
 }
 
@@ -469,7 +532,7 @@ cmd_build() {
 
 cmd_rebuild() {
     ylw "Recreating the container. install/ and build/ will be destroyed."
-    (cd "$REPO" && ./docker/up-wsl.sh)
+    (cd "$REPO" && "$(up_script)")
     sleep 4
     ensure_built
 }

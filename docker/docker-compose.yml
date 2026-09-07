@@ -12,6 +12,9 @@ services:
       - DISPLAY=${DISPLAY:-:0}
       - QT_X11_NO_MITSHM=1
       - ROS_DOMAIN_ID=23
+      # Receive buffers sized for a 691 KB camera frame. See the file
+      # itself for the measurement that made it necessary.
+      - CYCLONEDDS_URI=file:///opt/erc_ws/src/erc_bringup/config/cyclonedds.xml
     volumes:
       - ../src:/opt/erc_ws/src:rw
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
