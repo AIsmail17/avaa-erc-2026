@@ -1903,6 +1903,25 @@ class ApproachNode(Node):
                self.centre_ticks, self.centre_idle, math.degrees(turned)),
             throttle_duration_sec=3.0)
 
+    def _lateral_error(self) -> Optional[float]:
+        """Give how far the target sits to the side of the shoulder, in metres.
+
+        The same quantity the strafe below is driven by, pulled out so the forward speed
+        can be held back by it. Metres either way: a pixel error is converted at the
+        range the drive is already using, which is what makes the two comparable.
+        """
+        target = self._target_in_base()
+        if target is not None:
+            return float(target[1]) - SHOULDER_OFFSET_Y
+        column_cx = self._column_cx_fresh()
+        if column_cx is None:
+            return None
+        ahead = self._range_ahead()
+        if ahead is None or ahead <= 0.05:
+            return None
+        return math.tan(self._bearing_rad(
+            column_cx - self.image_width / 2.0)) * ahead - SHOULDER_OFFSET_Y
+
     def _do_approach(self) -> None:
         ahead = self._distance_to_face()
         if ahead is None:
@@ -1940,6 +1959,36 @@ class ApproachNode(Node):
 
         cmd = Twist()
         cmd.linear.x = min(self.max_fwd, max(0.05, 0.5 * remaining))
+
+        # Do not arrive before the sideways error has been taken out.
+        #
+        # Forward speed and lateral speed were set independently, and they are not
+        # independent: the robot drives in at up to 0.22 m/s while correcting sideways at
+        # no more than 0.10, so any lateral error more than about half the distance
+        # remaining cannot be finished in time. It arrives square, at the right range,
+        # in front of the wrong column.
+        #
+        # Measured on the run that found it, against Gazebo. Target was column 5's red
+        # book at world y = -1.988; the robot was at (1.562, -0.496), so 1.34 m to go
+        # forward and 1.49 m to go sideways. It closed the 1.34 and never closed the
+        # 1.49, and anchored instead on the red book 1.43 m away -- a different column's.
+        # The lateral error in the log grew the whole way in, +72 px, +200, +207, while
+        # the strafe sat pinned at its 0.100 limit.
+        #
+        # So the forward speed is capped at the rate that arrives no sooner than the
+        # sideways correction can: cross the remaining gap no faster than
+        # max_lateral/|error| of the forward distance per second. Far out this changes
+        # nothing, because the remaining distance is large and the error small.
+        lateral = self._lateral_error()
+        if lateral is not None and abs(lateral) > self.centre_tol_m:
+            allowed = self.max_lateral * remaining / abs(lateral)
+            if allowed < cmd.linear.x:
+                self.get_logger().info(
+                    "holding forward speed to %.2f m/s (from %.2f): %.2f m still to "
+                    "correct sideways with %.2f m of approach left"
+                    % (max(0.0, allowed), cmd.linear.x, abs(lateral), remaining),
+                    throttle_duration_sec=4.0)
+                cmd.linear.x = max(0.0, allowed)
 
         # Hold square to the shelf all the way in.
         #
