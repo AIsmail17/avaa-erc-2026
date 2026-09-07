@@ -57,6 +57,7 @@ anything, because most non-obvious decisions have a measurement behind them.
 | `PERCEPTION.md` | Colour and marker detection, measured accuracy, 3D localisation |
 | `MANIPULATION.md` | Gripper curve, reach envelope, arm kinematics, tuck pose |
 | `ORGANISER_QUESTIONS.md` | Six items. The committee's answer was that teams solve these themselves; kept as the record, and item 1 is corrected in place |
+| `WATCHING.md` | Running a simulation you can SEE, on the NUC through remote desktop |
 | `STATE.md` | This file |
 
 ---
