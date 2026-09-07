@@ -101,10 +101,10 @@ Use `tools/drift.py` (per simulated second, prints the RTF beside the answer) an
 | `solution.launch.py` | ✅ now starts move_group, the grasp and the delivery too |
 | Approach — search | ✅ 2026-09-07: finds the marker in 29 s where it used to time out at 150 |
 | Approach — centre | ✅ 2026-09-07: reaches the column and hands over to the drive |
-| Approach — acquire, square | ⚠️ **reached, not yet completed** |
+| Approach — acquire, square | ⚠️ **completed on 2026-09-07; squared to +0.2 deg, 6 mm off the book** |
 | Arm kinematics + IK | ✅ exact to 0.7 mm; all four rows reachable |
-| Grasp controller | ⚠️ reaches the pre-grasp to 3 mm; **has never closed on a book** |
-| Place in bin | ⚠️ **written, never run end to end** |
+| Grasp controller | ✅ **2026-09-07: reached in, servoed to 1 mm, clamped, lifted, withdrew** |
+| Place in bin | ⚠️ **written, never run with a book in the gripper** |
 | Video (D2) | ❌ not started |
 | Report (D3) | ❌ not started |
 
@@ -114,6 +114,49 @@ Use `tools/drift.py` (per simulated second, prints the RTF beside the answer) an
 sim shell
 cd /opt/erc_ws/src/avaa_solution && python3 -m pytest test/ -q
 ```
+
+---
+
+## The first complete grasp, 2026-09-07
+
+Kept at `~/erc/runs/FIRST-GRASP-20260907-1143.log`.
+
+```
+target red book is on row 2 (15 of 15 readings agree)
+shelf removed from the planning scene; the reach in is checked waypoint by waypoint
+reaching along 9 waypoints to [0.783, 0.07, 1.016], stopping 35 mm short
+at the staging point; the book moved 36 mm while I reached, closing the last 83 mm
+servo is on the book (-1 mm depth, -0 mm sideways, -24 mm height) after 4.8 s; clamping
+clamping -> lifting -> withdrawing -> stowing
+```
+
+The reach was not obstructed. "the reach is obstructed 12 per cent of the way in", which
+had blocked every grasp for days, did not appear -- the cause had already been found and
+fixed (the line was being drawn from `pre_target` rather than from the point the chosen
+posture actually reaches) and this is the first run that got far enough to prove it.
+
+The run was stopped at `stowing` to deploy the next fix, so the handover to delivery is
+still unobserved. **Do not stop a run that is going well.** Two runs were cut short that
+afternoon at the exact moment they were succeeding, and each one cost thirteen minutes
+to reproduce.
+
+### What was blocking it
+
+`MAX_AREA` in the book detector was 3000 square pixels, and every measurement it was
+calibrated from was taken from across the room -- "6-8 px wide, 14-26 px tall" is a book
+three to five metres away. At grasping range the target measures 4616 with an aspect of
+4.20:
+
+```
+red    (252, 264)   35 x 147   area 4616   aspect 4.20   AREA ABOVE 3000
+green  (472,  72)   50 x 145   area 6436   aspect 2.90   AREA ABOVE 3000
+```
+
+So the detector went blind at exactly the range the arm works at. Perception reported "no
+red book in view at close range" with the book in the middle of the frame, and the
+approach held at 0.95 m refusing to drive in on the LiDAR alone -- correctly, by its own
+rule. Aspect, not area, is what separates a book from the bin: 1.75-4.33 against the
+bin's 0.49.
 
 ---
 
