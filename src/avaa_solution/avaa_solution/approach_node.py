@@ -505,6 +505,9 @@ class ApproachNode(Node):
         # NOT in odom: see sighting_gate for what odom does to a stored target here.
         self.target_base = None
         self.target_base_at = None
+        # The heading the anchor was measured at, so it can be carried round with
+        # the base. See _anchor_now.
+        self.target_base_yaw = None
         # How far two consecutive sightings of the same book may sit apart in
         # base_link, over and above the base's own travel between them. Perception
         # measures the book to 15-35 mm, so this is a little over twice its own error.
@@ -853,6 +856,7 @@ class ApproachNode(Node):
             # Start the anchor again: if it had been right we would not be retreating.
             self.target_base = None
             self.target_base_at = None
+            self.target_base_yaw = None
             self.anchor_candidates.clear()
             self.anchor_disagree.clear()
         if state is not self.state:
@@ -1271,6 +1275,7 @@ class ApproachNode(Node):
                 return False
             self.target_base = settled
             self.target_base_at = now
+            self.target_base_yaw = self.odom_yaw
             self.anchor_candidates.clear()
             self.get_logger().info(
                 "target fixed at [%.2f, %.2f, %.2f] in base_link from %d agreeing "
@@ -1279,7 +1284,9 @@ class ApproachNode(Node):
             return True
 
         gap = now - self.target_base_at
-        step = float(np.linalg.norm(point[:2] - self.target_base[:2]))
+        # Against the anchor as it stands NOW, not as it was measured. See _anchor_now.
+        held = self._anchor_now()
+        step = float(np.linalg.norm(point[:2] - held[:2]))
         budget = sighting_gate(self.sighting_allowance, self.sighting_speed, gap)
         if step > budget:
             self.anchor_rejects += 1
@@ -1297,6 +1304,7 @@ class ApproachNode(Node):
                     % (len(self.anchor_disagree), step))
                 self.target_base = replacement
                 self.target_base_at = now
+                self.target_base_yaw = self.odom_yaw
                 self.anchor_disagree.clear()
                 return True
             self.get_logger().warn(
@@ -1312,6 +1320,7 @@ class ApproachNode(Node):
         self.anchor_disagree.clear()
         self.target_base = point
         self.target_base_at = now
+        self.target_base_yaw = self.odom_yaw
         return True
 
     def _agreeing(self, sightings):
@@ -1325,6 +1334,39 @@ class ApproachNode(Node):
             return None
         return centre
 
+    def _anchor_now(self):
+        """Give the anchor in the base frame as it stands now, not as it was measured.
+
+        base_link turns with the robot, so a point held in it goes stale the moment the
+        base rotates -- and the approach rotates deliberately, all the way in, to hold
+        square against the shelf. Squaring at about 1.5 degrees a second for eight
+        seconds is 12 degrees, and at the 2.6 m this was measured at that is 0.54 m of
+        apparent sideways movement in a book that has not moved at all.
+
+        What that did: the outlier gate compared each new sighting against an anchor
+        frozen at the heading it was taken from, called the difference a jump, and threw
+        the sighting away. "ignoring a sighting 0.59 m from the last accepted, 571 mm
+        allowed" -- rejected by 19 mm, over and over, while the lateral error the drive
+        was steering by sat at exactly -0.943 m through eight seconds of strafing that
+        should have removed it.
+
+        Only the rotation is applied. Odometry on this base cannot be trusted for
+        position -- it counts wheel turns the mecanum rollers slide through, and has
+        reported 813 mm of travel that never happened -- but tools/turncheck.py measured
+        its YAW against Gazebo over commanded turns and it is good to a few per cent,
+        which over the fraction of a second between sightings is a fraction of a degree.
+        Translation stays covered by the gate's speed-and-gap budget, which is what that
+        budget was for.
+        """
+        if self.target_base is None:
+            return None
+        if self.target_base_yaw is None or self.odom_yaw is None:
+            return self.target_base
+        turned = _wrap(self.odom_yaw - self.target_base_yaw)
+        cos_t, sin_t = math.cos(-turned), math.sin(-turned)
+        x, y, z = (float(v) for v in self.target_base)
+        return np.array([cos_t * x - sin_t * y, sin_t * x + cos_t * y, z])
+
     def _target_in_base(self):
         """Give the believed target as (x, y, z) in base_footprint, or None.
 
@@ -1337,7 +1379,7 @@ class ApproachNode(Node):
             return None
         if (self._now() - self.target_base_at) > self.sighting_stale:
             return None
-        return self.target_base
+        return self._anchor_now()
 
     def _distance_to_face(self) -> Optional[float]:
         """Distance to the shelf face, preferring the book over the LiDAR.
@@ -1644,6 +1686,7 @@ class ApproachNode(Node):
                 self.nofix_since = None
                 self.target_base = None
                 self.target_base_at = None
+                self.target_base_yaw = None
                 self.anchor_candidates.clear()
                 self.anchor_disagree.clear()
                 self.anchor_rejects = 0
