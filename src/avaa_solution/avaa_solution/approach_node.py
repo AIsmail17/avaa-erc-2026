@@ -463,6 +463,9 @@ class ApproachNode(Node):
         # obstacle says nothing about the next direction the search turns to.
         self.search_backed = 0.0
         self.search_back_yaw = None
+        # Whether a back-off is in progress, so that turning does not abandon it
+        # half done and so that it finishes with real margin. See _do_search.
+        self.search_backing = False
         self.yaw_rate = 0.0
         self.odom_yaw = None
         self.state = State.WAITING
@@ -866,6 +869,7 @@ class ApproachNode(Node):
             if state is State.SEARCH:
                 self.search_backed = 0.0
                 self.search_back_yaw = None
+                self.search_backing = False
             if state is State.CENTRE:
                 # Only on a real transition: these count one visit to the state, and
                 # resetting them on a re-entry that is not a change would hide exactly
@@ -1084,22 +1088,42 @@ class ApproachNode(Node):
         # a distance it was never at.
         ahead = self._range_ahead()
 
-        if readable_from is not None and ahead is not None and ahead < readable_from:
+        # Once started, finish it, and finish it with margin.
+        #
+        # Two faults, both from this morning's version, and they compounded. The
+        # allowance was reset whenever the base had turned 35 degrees since it was
+        # granted -- but a SEARCH turns continuously, so a back-off that needed a metre
+        # had its progress wiped every few seconds. Watched in the run that failed:
+        # 0.40 m, 0.44 m, then 0.01 m, and the range ahead went 1.18 m to 1.17 m across
+        # the whole 150-second search.
+        #
+        # And there was no hysteresis. The trigger and the release were the same
+        # threshold, so at the boundary -- "cannot read a marker from 1.18 m, the band
+        # needs 1.18 m" -- it stopped reversing the instant it was nominally far enough
+        # and gained nothing. The robot spent the search 1.2 m from the shelf, where only
+        # one to three of the five plates fit in the frame and the identification needs
+        # four, and timed out.
+        #
+        # So a back-off, once begun, runs until there is real room or the allowance is
+        # spent, and the per-heading reset applies only between back-offs.
+        want = readable_from
+        if want is not None and self.search_backing:
+            want = readable_from * 1.25 + 0.05
+
+        if want is not None and ahead is not None and ahead < want:
             behind = self._clear_behind()
 
-            # One allowance per heading. The point of a cap is that reversing along a
-            # line which is not working has to stop, and turning to a new heading makes
-            # it a different line. On that same run the search turned through four
-            # separate obstacles on one allowance and was refusing to reverse from any
-            # of them by the time it came round to face the shelf.
-            if (self.search_back_yaw is not None and self.odom_yaw is not None
-                    and abs(_wrap(self.odom_yaw - self.search_back_yaw)) > 0.6):
-                self.search_backed = 0.0
-                self.search_back_yaw = self.odom_yaw
-            elif self.search_back_yaw is None:
-                self.search_back_yaw = self.odom_yaw
+            # One allowance per heading -- but only when starting a new one. The point of
+            # a cap is that reversing along a line which is not working has to stop, and
+            # turning to a new heading makes it a different line.
+            if not self.search_backing:
+                if (self.search_back_yaw is None or self.odom_yaw is None
+                        or abs(_wrap(self.odom_yaw - self.search_back_yaw)) > 0.6):
+                    self.search_backed = 0.0
+                    self.search_back_yaw = self.odom_yaw
             room = SEARCH_BACK_MAX - self.search_backed
             if (behind is not None and behind > SEARCH_BACK_CLEARANCE and room > 0.0):
+                self.search_backing = True
                 self.search_backed += SEARCH_BACK_SPEED * TICK_PERIOD
                 cmd = Twist()
                 cmd.linear.x = -SEARCH_BACK_SPEED
@@ -1121,11 +1145,14 @@ class ApproachNode(Node):
                 why = "only %.2f m behind" % behind
             else:
                 why = "already backed off %.2f m" % self.search_backed
+            self.search_backing = False
             self.get_logger().warn(
                 "too close to read a marker (%.2f m, need %.2f m) and cannot reverse: "
                 "%s. Turning anyway, to look for a longer sightline." % (
                     ahead, readable_from, why),
                 throttle_duration_sec=10.0)
+        else:
+            self.search_backing = False
 
         cmd = Twist()
         cmd.angular.z = self.search_rate
