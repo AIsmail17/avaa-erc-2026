@@ -81,6 +81,11 @@ def wrap(angle):
 class Driver(Node):
     def __init__(self):
         super().__init__("drive_to")
+        # Follow /clock. Without this the node clock is wall clock, and every
+        # timeout in this file would be measured against the wrong thing -- see
+        # the budget in main().
+        self.set_parameters([rclpy.parameter.Parameter(
+            "use_sim_time", rclpy.Parameter.Type.BOOL, True)])
         self.yaw_rate = 0.0
         self.create_subscription(Odometry, "/odom", self._odom, 10)
         self.cmd = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -103,9 +108,14 @@ class Driver(Node):
         self.cmd.publish(message)
 
     def hold(self, seconds):
-        """Publish a zero twist, which is not the same as publishing nothing."""
-        end = time.time() + seconds
-        while time.time() < end:
+        """Publish a zero twist for a number of SIMULATED seconds.
+
+        Not wall clock. This exists to let the base settle, and settling happens on the
+        simulator's clock: at the 0.25 real-time factor measured on 2026-09-07 a 1.5 s
+        wall hold is 0.4 s of robot time, which is not a settle.
+        """
+        end = self.get_clock().now().nanoseconds * 1e-9 + seconds
+        while self.get_clock().now().nanoseconds * 1e-9 < end:
             self.cmd.publish(Twist())
             rclpy.spin_once(self, timeout_sec=0.02)
 
@@ -177,10 +187,26 @@ def main():
     while truth.value is None:
         rclpy.spin_once(node, timeout_sec=0.1)
 
-    deadline = time.time() + 240
+    # A budget in SIMULATED seconds, not wall clock.
+    #
+    # This was "time.time() + 240", and a wall-clock budget means nothing here: the
+    # real-time factor on this project has been measured between 0.013 and 0.60, so 240
+    # seconds of wall clock buys anything from three simulated seconds to two and a half
+    # minutes of them. On 2026-09-07, at a factor of 0.25, it bought 60 -- and the drive
+    # covered 1.6 m of a 1.8 m approach and printed "GAVE UP" 0.13 m short of the goal.
+    # The grasp bench then ran its grasp from 0.78 m rather than the 0.65 m it had asked
+    # for, found no arm posture with a clear reach into row 3, and failed for a reason
+    # that had nothing to do with grasping.
+    #
+    # 180 simulated seconds is generous: the base does 0.22 m/s, which crosses the arena
+    # several times over.
+    budget = 180.0
+    while node.get_clock().now().nanoseconds == 0 and rclpy.ok():
+        rclpy.spin_once(node, timeout_sec=0.1)   # wait for the first /clock
+    started = node.get_clock().now().nanoseconds * 1e-9
     arrived = False
     reported = 0.0
-    while time.time() < deadline:
+    while (node.get_clock().now().nanoseconds * 1e-9 - started) < budget:
         rclpy.spin_once(node, timeout_sec=0.02)
         x, y, yaw = truth.value
         dx, dy = goal_x - x, goal_y - y
