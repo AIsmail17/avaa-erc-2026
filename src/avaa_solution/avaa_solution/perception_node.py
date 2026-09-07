@@ -181,6 +181,10 @@ class PerceptionNode(Node):
         self.reported_row: Optional[int] = None
         # Confident row readings, voted on before anything is latched. See _publish_row.
         self.row_votes = deque(maxlen=15)
+        # Heights measured from depth, for second-guessing the marker row. It takes
+        # a window because a single depth frame is not evidence -- see
+        # _cross_check_row.
+        self.height_votes = deque(maxlen=12)
         self.started_at = None
         self.row_majority = 0.7
 
@@ -626,19 +630,49 @@ class PerceptionNode(Node):
         if self.reported_row is None:
             return
         implied = self._row_from_height(point)
-        if implied is None or implied == self.reported_row:
+        if implied is None:
+            return
+        self.height_votes.append(implied)
+        if implied == self.reported_row:
             return
         if abs(implied - self.reported_row) < 2:
             self.get_logger().info(
                 f"row {self.reported_row} from the markers, {implied} from the measured "
                 f"height; keeping {self.reported_row}", throttle_duration_sec=10.0)
             return
+
+        # One frame is not evidence, and acting on one cost a run.
+        #
+        # The marker row is a vote of fifteen readings needing a 70% majority. This was
+        # overturning it on a single depth sample, and the depth samples it was reading
+        # are demonstrably not that good: on the run that found this, the fix moved
+        # 3033 mm in 0.20 s -- 15.2 m/s, from a base doing 0.22 -- and _watch_jump logged
+        # it as a jump on the very frame the row flipped from 1 to 4. The head then
+        # tilted three shelves down to a row the book was not on, the book left the
+        # frame, and the approach spent the rest of its budget looking for it.
+        #
+        # An override of a fifteen-frame vote should be at least as well supported as
+        # the vote. Same shape, same standard.
+        if len(self.height_votes) < self.height_votes.maxlen:
+            return
+        tally = Counter(self.height_votes)
+        winner, count = tally.most_common(1)[0]
+        if winner == self.reported_row or abs(winner - self.reported_row) < 2:
+            return
+        if count < 0.7 * self.height_votes.maxlen:
+            self.get_logger().warn(
+                f"the measured height disagrees with row {self.reported_row} but does "
+                f"not agree with itself either: {dict(tally)}. Keeping the marker row.",
+                throttle_duration_sec=10.0)
+            return
         self.get_logger().warn(
-            f"row {self.reported_row} from the markers but the book measures at row "
-            f"{implied}, {abs(implied - self.reported_row)} rows away. The markers are "
-            f"wrong; switching to {implied}")
-        self.reported_row = implied
+            f"row {self.reported_row} from the markers, but {count} of "
+            f"{len(self.height_votes)} measured heights put the book on row {winner}, "
+            f"{abs(winner - self.reported_row)} rows away. The markers are wrong; "
+            f"switching to {winner}")
+        self.reported_row = winner
         self.row_votes.clear()
+        self.height_votes.clear()
 
     def _publish_book_point(self, target: bd.Book) -> None:
         """Publish the target book's 3D position in base_link, for the grasp controller.
