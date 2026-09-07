@@ -130,6 +130,9 @@ class PerceptionNode(Node):
         self.declare_parameter("min_markers_to_identify", 4)
         # And how many are enough to keep FOLLOWING a column already identified.
         self.declare_parameter("min_markers_to_track", 2)
+        # How long a marker fix stays worth predicting from. Two seconds is about
+        # ten detector frames and 0.7 rad of search rotation.
+        self.declare_parameter("marker_track_max_age_sec", 2.0)
         self.declare_parameter("save_images", True)
         # Only src/ is bind-mounted into the container, so this is the deepest path that
         # still lands inside the git repository on the host. See PERCEPTION.md.
@@ -148,6 +151,8 @@ class PerceptionNode(Node):
             self.get_parameter("min_markers_to_identify").value)
         self.min_markers_to_track = int(
             self.get_parameter("min_markers_to_track").value)
+        self.marker_track_max_age = float(
+            self.get_parameter("marker_track_max_age_sec").value)
         self.image_dir = str(self.get_parameter("image_dir").value)
         self.save_images = bool(self.get_parameter("save_images").value)
         self.min_save_interval = float(self.get_parameter("min_save_interval_sec").value)
@@ -199,6 +204,7 @@ class PerceptionNode(Node):
         # is entitled to change its mind, and the steering cannot survive that.
         self.last_marker_cx = None
         self.last_marker_yaw = None
+        self.last_marker_at = None
         self.marker_rejects = 0
         self.started_at = None
         self.row_majority = 0.7
@@ -1270,6 +1276,29 @@ class PerceptionNode(Node):
         # range without a tuned constant.
         width = 2.0 * self.image_centre_px
         expected = self._predict_cx(self.last_marker_cx, self.last_marker_yaw, width)
+
+        # The prediction is only worth anything over a short gap.
+        #
+        # It extrapolates from the base's own rotation, and SEARCH turns at 0.35 rad/s
+        # while reading a plate only now and then, so the gap between one accepted
+        # reading and the next can be twenty seconds of turning. Over that long the
+        # odometry error -- measured by tools/turncheck.py at 0.407 rad/s reported
+        # against 0.356 true -- compounds into hundreds of pixels, and the prediction
+        # lands outside the picture entirely: it asked for the followed plate at 24 px
+        # and then at MINUS 62 px, and rejected perfectly good readings at 263 and 76 px
+        # against them. One of those rejected frames had all five plates in view reading
+        # [3, 4, 5, 1, 2], which is the most reliable sighting this robot ever gets.
+        #
+        # So the gate only applies while the fix is fresh, and never when the prediction
+        # has left the frame -- either of those means the followed plate is gone, and the
+        # right response is to take the reading and start following it instead.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        stale = (self.last_marker_at is None
+                 or (now - self.last_marker_at) > self.marker_track_max_age)
+        off_frame = expected is not None and not (0.0 <= expected <= width)
+        if stale or off_frame:
+            expected = None
+
         if expected is not None:
             limit = column_max_dx(markers)
             if abs(chosen.cx - expected) > limit:
@@ -1295,6 +1324,7 @@ class PerceptionNode(Node):
 
         self.marker_rejects = 0
         self.last_marker_cx = float(chosen.cx)
+        self.last_marker_at = now
         self.last_marker_yaw = self.base_yaw
         return hits[0]
 
