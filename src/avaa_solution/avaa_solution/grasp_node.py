@@ -1883,6 +1883,7 @@ class GraspNode(Node):
             self.get_logger().info(
                 "servo is on the book (%s) after %.1f s; clamping"
                 % (self._miss(target), self._now() - self.servo_since))
+            self._report_jaws()
             self._send_gripper(GRIPPER_CLAMP)
             self.clamp_at = self.get_clock().now()
             self._enter(State.CLAMP)
@@ -2037,6 +2038,64 @@ class GraspNode(Node):
                 "the jaws will not stay open; refusing to clamp on air")
             self._enter(State.FAILED)
         return False
+
+    def _report_jaws(self) -> None:
+        """Say where the PADS are, not where the grasping frame is.
+
+        Everything this controller measures itself against is the grasping frame, and
+        the pads are not there: they sit 29.7 mm behind it, which is why grasp_depth_m
+        is 0.11 rather than the 0.03 that would put the frame at the book face.
+
+        That gap is unverified in flight. On 2026-09-07 the servo reported "+1 mm depth,
+        +0 mm sideways, +1 mm height", clamped, lifted, withdrew, and handed a delivery
+        that then failed -- and Gazebo had the target book still on the shelf at
+        x = 2.8999990, untouched, while the finger joints read 0.0010 and 0.0014. The
+        span model in MANIPULATION.md makes that a 28.8 mm gap around a 30.0 mm book:
+        the jaws did not merely fail to grip it, they closed somewhere it was not.
+
+        Every number in that sentence came from somewhere other than this node. This
+        prints the one thing that would have settled it in the log, at the moment it
+        matters: the midpoint of the two fingertips, against the target the servo just
+        declared itself on, and against the measured face of the book.
+        """
+        tips = []
+        for frame in ("gripper_left_fingertip_left_link",
+                      "gripper_left_fingertip_right_link"):
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    "base_link", frame, rclpy.time.Time())
+            except Exception:  # noqa: BLE001 - a diagnostic must not stop a grasp
+                self.get_logger().warn(
+                    "cannot read %s, so nothing is known about where the pads are"
+                    % frame)
+                return
+            t = tf.transform.translation
+            tips.append(np.array([t.x, t.y, t.z]))
+
+        middle = 0.5 * (tips[0] + tips[1])
+        span = float(np.linalg.norm(tips[0] - tips[1]))
+        target = np.asarray(self.grasp_target, dtype=float)
+        frame_now = self._gripper_now()
+
+        self.get_logger().info(
+            "pads at [%.3f, %.3f, %.3f] in base_link, %.1f mm apart; target "
+            "[%.3f, %.3f, %.3f]; pads are %+.0f mm in depth, %+.0f sideways, "
+            "%+.0f in height from it"
+            % (middle[0], middle[1], middle[2], span * 1000,
+               target[0], target[1], target[2],
+               (middle[0] - target[0]) * 1000, (middle[1] - target[1]) * 1000,
+               (middle[2] - target[2]) * 1000))
+        if self.face_x is not None:
+            self.get_logger().info(
+                # A book is 160 mm deep, so anything outside 0 to 160 is a miss.
+                "the book face was measured at x=%.3f, so the pads are %+.0f mm into "
+                "a book 160 mm deep"
+                % (self.face_x, (middle[0] - self.face_x) * 1000))
+        if frame_now is not None:
+            self.get_logger().info(
+                "the grasping frame is at [%.3f, %.3f, %.3f], so the pads sit %.0f mm "
+                "behind it" % (frame_now[0], frame_now[1], frame_now[2],
+                               (frame_now[0] - middle[0]) * 1000))
 
     def _do_clamp(self) -> None:
         waited = (self.get_clock().now() - self.clamp_at).nanoseconds / 1e9
