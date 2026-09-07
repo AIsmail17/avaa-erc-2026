@@ -46,7 +46,29 @@ DRAW_BGR = {
 # upright face. Measured: 6-8 px wide, 14-26 px tall, aspect 1.75-4.33, fill 0.78-0.83.
 # The bin measured 136x66 (area 6763) and start-zone patches measured aspect 0.54/0.56.
 MIN_AREA = 30
-MAX_AREA = 3000
+
+# The upper cap was 3000, and every one of the measurements above was taken from across
+# the room. A book 14-26 px tall is three to five metres away; the gates were calibrated
+# at the range the robot searches from and never re-checked at the range it works at.
+#
+# Measured 2026-09-07, with the robot parked in front of its column at grasping range
+# and the target plainly in the middle of the frame:
+#
+#     red    (252, 264)   35 x 147   area 4616   aspect 4.20   AREA ABOVE 3000
+#     green  (472,  72)   50 x 145   area 6436   aspect 2.90   AREA ABOVE 3000
+#
+# So the detector went blind at exactly the distance the arm reaches from. Perception
+# reported "no red book in view at close range" every few seconds, the approach held at
+# 0.95 m refusing to close on the LiDAR alone -- correctly, by its own rule -- and no
+# grasp was ever attempted. That had been happening in every run that got this far.
+#
+# Area was never the thing separating a book from the bin anyway. Aspect is: a book
+# presents an upright face and measures 1.75 to 4.33 tall over wide, while the bin at
+# 136 x 66 is 0.49, and the two are a factor of three apart with nothing in between. The
+# cap now sits where nothing real can reach it -- a book at half a metre is about 10000
+# square pixels -- and the shape gates below do the work they always did.
+MAX_AREA = 25000
+
 MIN_ASPECT = 1.2
 MIN_FILL = 0.55
 
