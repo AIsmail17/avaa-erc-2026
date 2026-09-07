@@ -133,6 +133,10 @@ class PerceptionNode(Node):
         # How long a marker fix stays worth predicting from. Two seconds is about
         # ten detector frames and 0.7 rad of search rotation.
         self.declare_parameter("marker_track_max_age_sec", 2.0)
+        # And the same for the book, which is tracked through the last metre where
+        # no marker is in frame to re-seed it.
+        self.declare_parameter("book_track_max_age_sec", 2.0)
+        self.declare_parameter("book_reject_limit", 15)
         self.declare_parameter("save_images", True)
         # Only src/ is bind-mounted into the container, so this is the deepest path that
         # still lands inside the git repository on the host. See PERCEPTION.md.
@@ -153,6 +157,10 @@ class PerceptionNode(Node):
             self.get_parameter("min_markers_to_track").value)
         self.marker_track_max_age = float(
             self.get_parameter("marker_track_max_age_sec").value)
+        self.book_track_max_age = float(
+            self.get_parameter("book_track_max_age_sec").value)
+        self.book_reject_limit = int(
+            self.get_parameter("book_reject_limit").value)
         self.image_dir = str(self.get_parameter("image_dir").value)
         self.save_images = bool(self.get_parameter("save_images").value)
         self.min_save_interval = float(self.get_parameter("min_save_interval_sec").value)
@@ -206,6 +214,10 @@ class PerceptionNode(Node):
         self.last_marker_yaw = None
         self.last_marker_at = None
         self.marker_rejects = 0
+        # The same two bounds for the book tracker: when its fix was taken, and
+        # how many frames running it has refused. See _track_book_without_marker.
+        self.last_book_at = None
+        self.book_rejects = 0
         self.started_at = None
         self.row_majority = 0.7
 
@@ -601,6 +613,41 @@ class PerceptionNode(Node):
             return
         target = min(candidates, key=lambda b: abs(b.cx - expected))
         jump = abs(target.cx - expected)
+        # The prediction is only worth anything over a short gap, and only while it
+        # keeps matching something.
+        #
+        # This is the same fault the marker tracker had, in the same shape. The
+        # prediction extrapolates from the base's own rotation, and once the gap runs to
+        # tens of degrees the odometry error compounds into hundreds of pixels. Watched
+        # in a run that had reached the acquire checkpoint 0.000 m off the book: "the red
+        # book is 200 px from where turning 24 deg should have put it; that is another
+        # column, so holding the old fix", over and over, while the approach beside it
+        # reported "no metric fix on the book to drive to" until it timed out. It was in
+        # exactly the right place and could not see that it was.
+        #
+        # A stale fix is not evidence about this frame, and a tracker that only ever
+        # refuses is worse than no tracker at all.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        stale = (self.last_book_at is not None
+                 and (now - self.last_book_at) > self.book_track_max_age)
+        if stale:
+            self.get_logger().info(
+                "the last %s book fix is %.1f s old, too old to say where it should be "
+                "now; taking this frame's instead"
+                % (self.book_colour, now - self.last_book_at),
+                throttle_duration_sec=5.0)
+            jump = 0.0
+
+        if jump > self.book_jump_px:
+            self.book_rejects += 1
+            if self.book_rejects >= self.book_reject_limit:
+                self.get_logger().warn(
+                    "nothing has matched the followed %s book for %d frames; letting go "
+                    "and taking the one at %.0f px as the target"
+                    % (self.book_colour, self.book_rejects, target.cx))
+                self.book_rejects = 0
+                jump = 0.0
+
         if jump > self.book_jump_px:
             # Do not follow it, and do not remember it.
             #
@@ -634,6 +681,7 @@ class PerceptionNode(Node):
                                 else self.base_yaw - self.last_book_yaw)),
                 throttle_duration_sec=5.0)
             return
+        self.book_rejects = 0
         self.pub_row.publish(Int32(data=self.reported_row))
 
         # Remember this book only if it was accepted as the target.
@@ -647,6 +695,7 @@ class PerceptionNode(Node):
             return
         self.last_book_cx = float(target.cx)
         self.last_book_yaw = self.base_yaw
+        self.last_book_at = self.get_clock().now().nanoseconds * 1e-9
 
         # Steer by the book only when the robot is CLOSE to it.
         #
