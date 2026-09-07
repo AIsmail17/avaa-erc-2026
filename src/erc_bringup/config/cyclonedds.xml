@@ -35,7 +35,7 @@
                                 https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
   <Domain id="any">
     <Internal>
-      <MinimumSocketReceiveBufferSize>32MB</MinimumSocketReceiveBufferSize>
+      <SocketReceiveBufferSize min="32MB" />
       <DefragUnreliableMaxSamples>128</DefragUnreliableMaxSamples>
       <DefragReliableMaxSamples>128</DefragReliableMaxSamples>
     </Internal>
