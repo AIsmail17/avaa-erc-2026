@@ -1,0 +1,265 @@
+# Watching a run on the NUC, in a Gazebo window
+
+Step by step, for the machine at **192.168.1.26** (`ahmedo@nucserver`), through remote
+desktop. Everything here was run and checked on 2026-09-07; where a number appears it was
+measured on that machine, not guessed.
+
+Every command goes in a terminal **inside your remote desktop session**, not over SSH.
+That matters for exactly one reason, explained under [Why the remote desktop
+session](#why-the-remote-desktop-session).
+
+---
+
+## The short version
+
+Four commands, two terminals.
+
+```bash
+cd ~/erc/erc_sim_2026 && git pull && xhost +SI:localuser:root
+```
+
+```bash
+./tools/sim restart --fast --headless
+```
+
+```bash
+./tools/sim gui
+```
+
+Then, in a **second** terminal, leaving the viewer open:
+
+```bash
+cd ~/erc/erc_sim_2026 && ./tools/run-once.sh
+```
+
+The rest of this file is what each of those does, what you should see, and what to do
+when one of them does not do it.
+
+---
+
+## 1. Get the latest code and let the container draw on your screen
+
+```bash
+cd ~/erc/erc_sim_2026 && git pull && xhost +SI:localuser:root
+```
+
+`xhost` is the part people miss. Your desktop's X server only accepts connections from
+programs running as **you**, and the simulator runs as **root inside Docker**, so without
+this the Gazebo window simply never appears and nothing says why. Checked on the NUC:
+
+```
+$ xhost
+access control enabled, only authorized clients can connect
+SI:localuser:ahmedo
+```
+
+`+SI:localuser:root` adds root on this machine and nothing else. (You will also see
+`xhost +local:docker` in `docker/up-wsl.sh`; that is the broader version of the same
+thing. Either works.)
+
+**It does not survive a logout.** Run it once per desktop session. To undo it:
+
+```bash
+xhost -SI:localuser:root
+```
+
+## 2. Start the simulator with no window
+
+```bash
+./tools/sim restart --fast --headless
+```
+
+Takes about a minute. It should end with:
+
+```
+Gazebo is running.
+  colour camera : streaming
+  joint states  : streaming
+  udp frames    : none dropped (rmem_max 33554432)
+```
+
+**Starting headless and attaching a window afterwards is deliberate, not a workaround.**
+In Gazebo the GUI and the physics server are one process, and the GUI is the fragile
+half: when it fails to get an OpenGL context it aborts, and the abort takes the server
+down with it — every controller spawner dies on "Could not successfully call service
+/controller_manager/load_controller" and the run is gone before the robot moves. Counted
+over one evening, that happened on roughly **a third** of GUI starts. Started separately,
+the viewer is disposable: if it dies the simulation carries on at full speed and you just
+run `sim gui` again.
+
+The three lines about sensors are not decoration. A simulator that comes up "running" but
+blind looks exactly like broken perception and has cost days. `sim restart` now checks
+this itself and restarts if the camera never streams.
+
+`--fast` turns off the depth point cloud, which costs about a full CPU core and which
+nothing currently uses. Leave it off for watching; turn it back on for a scored run only
+if manipulation ever needs the cloud.
+
+## 3. Open the window
+
+```bash
+./tools/sim gui
+```
+
+You should see:
+
+```
+Attaching a viewer (attempt 1 of 3)...
+Drawing on display :10.
+Viewer running (the simulation is untouched if it crashes).
+```
+
+**Check that it says `:10`.** There is no display `:0` on this machine — xrdp runs its own
+X server on `:10`, and `:1024` and `:1025` are xrdp's internals. If it says `:0` you are
+running over SSH rather than in the desktop session, and the window will go nowhere.
+
+### What it costs
+
+Measured on the NUC with the same simulation running before and after attaching:
+
+| | real-time factor |
+|---|---|
+| headless | 0.248 |
+| with the viewer attached | 0.122 |
+
+**The window roughly halves the simulation speed**, because the NUC renders it on
+integrated graphics. A run that takes ten minutes headless takes twenty with the window
+open. That is fine for watching and wrong for collecting results — close the viewer when
+you are gathering numbers.
+
+To close it without touching the simulation:
+
+```bash
+docker exec erc_sim pkill -f 'gz sim -g'
+```
+
+## 4. Run the robot
+
+In a **second terminal**, leaving the viewer open:
+
+```bash
+cd ~/erc/erc_sim_2026 && ./tools/run-once.sh
+```
+
+It restarts the simulator first — so if you want to keep the viewer you already have,
+skip `run-once.sh` and launch the mission directly:
+
+```bash
+docker exec -it erc_sim /entrypoint.sh bash -c \
+  'source /opt/erc_ws/install/setup.bash && \
+   ros2 launch avaa_solution solution.launch.py shelf_column_number:=3 book_colour:=red'
+```
+
+`shelf_column_number` and `book_colour` are the task: which marker digit to look for and
+which colour book to fetch.
+
+---
+
+## What you should see, and roughly when
+
+Times are **simulated** seconds, from the mission clock. Multiply by 1/RTF for wall clock
+— at 0.12 with the window open, 157 simulated seconds is about twenty minutes.
+
+| Sim time | What happens |
+|---|---|
+| 0–30 s | Both arms fold to the driving posture. Nothing else moves. |
+| 30–50 s | The base turns on the spot, head tilted up, hunting for its column marker. It may reverse a metre or so first — the markers are at 2.26 m and cannot be read from close in. |
+| ~50 s | Turns to face its column, then drives in, slowing and sliding sideways to line up. |
+| ~50 s | `phase approach -> grasp`. The robot is squared to the shelf about 0.65 m out. |
+| 50–160 s | The torso rises, the left arm unfolds, reaches into the shelf, closes, withdraws. |
+| ~157 s | `phase grasp -> deliver`. The arm folds in with the book and the base goes looking for the red bin. |
+
+**As of 2026-09-07 the run does not finish.** The approach and the reach both work — the
+gripper arrives within a millimetre of the book — but the jaws close on air and the book
+stays on the shelf, so the delivery drives off empty and fails. `STATE.md` has the
+current detail. Everything up to and including the reach is worth watching; the delivery
+is not, yet.
+
+---
+
+## When something does not work
+
+**The window never appears.** Almost always `xhost` (step 1) or the wrong display. Check
+which display it chose, and look at what the viewer said:
+
+```bash
+docker exec erc_sim tail -30 /tmp/gui.log
+```
+
+`drisw`, `swrast` or "Failed to create OpenGL context" mean the GPU path failed. The
+simulation is untouched; use the browser view below.
+
+**The window appears and then dies.** `sim gui` retries three times by itself. If all
+three fail, the simulation is still running — nothing is lost.
+
+**Nothing happens after the arms fold.** Check the simulator is not blind:
+
+```bash
+./tools/sim status
+```
+
+If `colour camera` says SILENT, restart: `./tools/sim restart --fast --headless`.
+
+**Everything is very slow.** Check what else the NUC is doing:
+
+```bash
+uptime
+ps -eo pcpu,args --sort=-pcpu | head -5
+```
+
+It has four cores and Gazebo wants most of one. A Minecraft server on this machine on
+2026-09-07 took 218% CPU and dropped the real-time factor from 0.42 to 0.15.
+
+---
+
+## A view that needs no GPU at all
+
+If the Gazebo window will not stay up, this serves the robot's own camera feeds and the
+detector's annotations to a browser, rendered by the server through EGL — the half that
+does not have the OpenGL problem:
+
+```bash
+./tools/in-sim liveview.py
+```
+
+Then open **http://localhost:8080** in a browser on the NUC. It is not a 3D view of the
+arena, but it shows what the robot can actually see, which is usually the question.
+
+---
+
+## Recording the competition video
+
+The rules for D2 are specific, and this ordering is what they ask for: **launch
+`simulation.launch.py` first, then `solution.launch.py`**, unedited, no cuts, not sped
+up, team name on screen before the trial starts, and a timer running.
+
+So for the video, do not use `sim restart` or `run-once.sh` — they wrap those launches
+and the wrapping will not be visible. Run them raw, with the window, in two terminals:
+
+```bash
+docker exec -it erc_sim /entrypoint.sh bash -c \
+  'source /opt/erc_ws/install/setup.bash && ros2 launch erc_bringup simulation.launch.py'
+```
+
+```bash
+docker exec -it erc_sim /entrypoint.sh bash -c \
+  'source /opt/erc_ws/install/setup.bash && \
+   ros2 launch avaa_solution solution.launch.py shelf_column_number:=3 book_colour:=red'
+```
+
+Two things to plan for. The GUI-at-startup failure above is the reason the first command
+sometimes produces a simulator with no controllers — if that happens, stop and start
+again before beginning the recording, and check `sim status` shows both sensors
+streaming. And the video has a five-minute limit against a mission that takes 157
+simulated seconds: at the RTF the NUC manages with a window open you will not fit, so the
+recording needs the machine quiet and nothing else competing for its cores.
+
+---
+
+## Why the remote desktop session
+
+Over SSH there is no `DISPLAY`, so `sim gui` has nothing to draw on and falls back to
+guessing. Inside the desktop session `DISPLAY` is `:10`, which is the X server xrdp
+actually runs, and `sim gui` picks it up. This was worth a commit of its own: the
+container was created over SSH, compose baked in `DISPLAY=:0` from its default, and the
+viewer spent a session drawing on a display that has never existed on this machine.
