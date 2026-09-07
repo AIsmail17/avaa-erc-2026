@@ -50,6 +50,10 @@ workspace_built() {
 
 ensure_container() {
     if container_running; then
+        # Also here, not only on the branch that starts one. A container that was
+        # already up skipped this entirely, so the tuning only ever happened on the
+        # first start after a reboot.
+        tune_buffers
         return 0
     fi
     ylw "Container not running - starting it..."
