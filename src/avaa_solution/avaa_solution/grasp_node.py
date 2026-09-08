@@ -495,6 +495,24 @@ class GraspNode(Node):
         # A solve that jumps further than this in any joint is an elbow flip, not a
         # correction. Rejected, and retried with a shorter Cartesian step.
         self.declare_parameter("servo_max_joint_step", 0.25)
+
+        # How far the servo may move the TORSO while closing on the book.
+        #
+        # This was 0.004, which is a pin rather than a limit, and it forbade the servo
+        # the one joint that could have finished the job. Measured on 2026-09-08, row 4:
+        # the servo gave up "-3 mm depth, -8 mm sideways, -44 mm height after 40 s" with
+        # ZERO IK solves rejected, and the same day the arm was measured holding every
+        # row to within 6 mm in open air. It was not a tracking failure and not a reach
+        # limit -- the arm simply had no way to raise the gripper 44 mm from where it
+        # was, and 44 mm of torso is 1.3 seconds of a joint that was sitting at 0.000
+        # with its whole 350 mm of travel unused above it.
+        #
+        # 60 mm is deliberately less than a row spacing of 330, so this can help the
+        # last few centimetres and cannot wander to a different shelf. The solver is
+        # seeded from the current joints and returns the nearest solution, so the torso
+        # moves only when the arm cannot do it alone; and servo_max_joint_step still
+        # bounds every individual step.
+        self.declare_parameter("servo_torso_slack_m", 0.06)
         # Consecutive in-tolerance ticks before clamping. Three at 5 Hz is 0.6 s, long
         # enough that a single good frame cannot trigger a grasp on its own.
         self.declare_parameter("servo_hold_ticks", 3)
@@ -568,6 +586,8 @@ class GraspNode(Node):
         self.servo_command = float(self.get_parameter("servo_command_sec").value)
         self.servo_max_joint = float(self.get_parameter("servo_max_joint_step").value)
         self.servo_hold_ticks = int(self.get_parameter("servo_hold_ticks").value)
+        self.servo_torso_slack = float(
+            self.get_parameter("servo_torso_slack_m").value)
         self.servo_timeout = float(self.get_parameter("servo_timeout_sec").value)
         self.servo_track = bool(self.get_parameter("servo_track_while_closing").value)
         self.servo_release_span = float(
@@ -1994,7 +2014,7 @@ class GraspNode(Node):
                 candidate = self.chain.ik(
                     goal, seed=joints, approach=GRASP_APPROACH, closing=GRASP_CLOSING,
                     orientation_tolerance=tolerance,
-                    pin={"torso_lift_joint": (joints[0], 0.004)})
+                    pin={"torso_lift_joint": (joints[0], self.servo_torso_slack)})
                 if candidate is None:
                     continue
                 if max(abs(a - b)
@@ -2006,6 +2026,13 @@ class GraspNode(Node):
                     self.get_logger().info(
                         "the wrist had to give %.0f degrees to close the last %.0f mm"
                         % (math.degrees(tolerance - 0.26), distance * 1000),
+                        throttle_duration_sec=5.0)
+                lift = solution[0] - joints[0]
+                if abs(lift) > 0.002:
+                    self.get_logger().info(
+                        "the torso is taking %+.0f mm of this correction, now at "
+                        "%.3f of its 0.350 travel"
+                        % (lift * 1000, solution[0]),
                         throttle_duration_sec=5.0)
                 break
 
