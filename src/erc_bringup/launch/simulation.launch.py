@@ -291,7 +291,12 @@ def generate_launch_description():
             name="gz::sim::systems::DetachableJoint">
       <parent_link>book_base_link</parent_link>
       <child_model>tiago_pro</child_model>
-      <child_link>gripper_left_grasping_link</child_link>
+      <!-- A link that SURVIVES the URDF to SDF conversion.
+           gripper_left_grasping_link and gripper_left_base_link are both massless
+           frames and Gazebo collapses them: gz model -m tiago_pro -l lists only the
+           finger chain. Naming one of those made the plugin load, subscribe, and
+           silently weld nothing. The fingertip is where a book would be held anyway. -->
+      <child_link>gripper_left_fingertip_left_link</child_link>
       <attach_topic>/grasp_fix/{book_name}/attach</attach_topic>
       <detach_topic>/grasp_fix/{book_name}/detach</detach_topic>
       <output_topic>/grasp_fix/{book_name}/state</output_topic>
