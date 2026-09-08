@@ -109,6 +109,56 @@ interface on the gripper joints — should change this number.
 That is the mechanism confirmed from both directions. Neither engine has yet carried a
 book: under bullet the finger stalls too early to close on the book at all.
 
+### 1e. The measurement that settles it: contact yes, grip no
+
+`tools/canitgrip.py` takes the closing motion out of the question. Shut the jaws, leave
+them shut, and only then put the book between the pads.
+
+    finger at +0.0016                       (the joint is at its lower limit)
+    pad centres 36.2 mm apart               (the book is 30.0 mm thick)
+
+    fingertip_left_link       2730 contact lines naming the book
+    fingertip_right_link      1845
+    inner_finger_left_link    1242
+    inner_finger_right_link      0
+
+    stop holding it: the book moved 64 mm down in five seconds
+    NOT HELD
+
+So the pads **do** reach the book -- 5817 contacts across three of them, from the pads'
+own sensors -- and the book still falls straight out. The gripper is at the end of its
+travel while barely brushing a 30 mm book. There is nothing left to squeeze with.
+
+That explains every earlier result at once:
+
+  - the effort sweep changed nothing, because the joint is stopped by its *position*
+    limit, not by a force ceiling;
+  - the physics engine changed nothing about holding, for the same reason;
+  - and §1's span table said a 30 mm book fits inside a 28 mm closed span, which sounded
+    like ample clamp. That table measured the fingertip LINK ORIGINS. The pads sit 19 mm
+    off their origins (`tools/stlbox.py`, `tools/jawcentre.py`), and measured properly
+    (`tools/padspan.py`) the pad centres go from 91.1 mm open to **35.5 mm shut** -- they
+    never close past the book at all.
+
+### 1f. What was wrong with the bench, twice
+
+Both worth recording, because both produced clean-looking numbers that meant nothing.
+
+**Placement.** `jawtest.py` put the book at the midpoint of the fingertip link origins,
+then at `gripper_left_grasping_link`. Neither is between the pads; the first is 19 mm out
+and, because the pads ride a four-bar, the middle of the gap MOVES as the jaws close, so
+the open middle is not the shut middle.
+
+**Free fall.** The book is held in mid-air by nothing but repeated `set_pose`. The close
+step placed it once and then span five seconds while the jaws shut -- five unattended
+seconds is five seconds of falling, and the book was metres away before the pads arrived.
+Every "the pads felt nothing at all" came from that. `canitgrip.py` re-places every 0.3 s
+without a gap, and gets contact immediately.
+
+The instrument was checked before any of this was believed: `tools/sensorcheck.sh` drives
+the book deliberately onto a pad and the same sensor produces 323347 lines, so silence
+from it means silence, not a broken subscription.
+
 ### 1d. There is a force ceiling, and it is the thing to tune
 
 `tools/graspforce.py` scales the left gripper's effort limits in the URDF; the bench then
