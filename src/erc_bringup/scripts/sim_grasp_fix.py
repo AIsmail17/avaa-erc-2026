@@ -117,8 +117,16 @@ class GraspFix(Node):
         #
         # The books do not all exist yet either, so their topics do not all exist yet,
         # which is why this rescans rather than reusing a list.
-        self.sweeping_until = None
-        self.create_timer(0.5, self._sweep)
+        # A BOUNDED number of sweeps, not a timer that keeps going.
+        #
+        # Every gz call here is a subprocess, and this node has one thread. Sweeping
+        # twenty books every half second means twenty process spawns of about half a
+        # second each -- ten seconds of work asked for every half second -- and the
+        # executor never gets back to the gripper subscription that is the entire point
+        # of the node. Three sweeps, spaced, is enough: the books all spawn within a
+        # second or two of each other.
+        self.sweeps_left = 3
+        self.create_timer(4.0, self._sweep)
         self._release_everything()
         self.get_logger().info(
             "simulation grasp fix up: a close within %.0f mm of a book will attach it"
@@ -150,15 +158,16 @@ class GraspFix(Node):
             % released)
 
     def _sweep(self):
-        """Release anything newly welded, for the first half minute only."""
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if self.sweeping_until is None:
-            self.sweeping_until = now + 30.0
-        if now > self.sweeping_until or self.held is not None:
+        """Release anything newly welded. Runs a few times, then stops for good."""
+        if self.sweeps_left <= 0 or self.held is not None:
             return
-        for name in self._book_names():
+        self.sweeps_left -= 1
+        names = self._book_names()
+        for name in names:
             gz("topic", "-t", "/grasp_fix/%s/detach" % name,
                "-m", "gz.msgs.Empty", "-p", "unused: true")
+        self.get_logger().info(
+            "sweep released %d books; %d sweep(s) left" % (len(names), self.sweeps_left))
 
     def _book_names(self):
         """Every book the simulator has a detach topic for."""
@@ -253,6 +262,11 @@ class GraspFix(Node):
         except (IndexError, TypeError):
             return
 
+        self.get_logger().info(
+            "gripper commanded to %.4f (closing below %.3f, opening above %.3f), "
+            "currently holding %s"
+            % (asked, CLOSING_BELOW, OPENING_ABOVE, self.held or "nothing"),
+            throttle_duration_sec=2.0)
         if asked <= CLOSING_BELOW and self.held is None:
             self._try_attach()
         elif asked >= OPENING_ABOVE and self.held is not None:
@@ -271,6 +285,11 @@ class GraspFix(Node):
             if best_gap is None or gap < best_gap:
                 best, best_gap = name, gap
         if best is None:
+            # Silence here cost a run: the jaws closed, this returned without a word,
+            # and the log showed a grasp failing with no sign the fix had been asked.
+            self.get_logger().warn(
+                "jaws closed and this knows of no books at all, so nothing can be "
+                "attached. %d pose(s) last read from the simulator." % len(self.books))
             return
         if best_gap > self.reach:
             self.get_logger().info(
