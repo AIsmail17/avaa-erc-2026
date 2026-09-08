@@ -75,6 +75,9 @@ def generate_launch_description():
     with open(urdf_path, 'r') as f:
         robot_description = f.read()
 
+    grasp_fix_wanted = (
+        os.environ.get('ERC_GRASP_FIX', '').lower() in ('1', 'true', 'yes'))
+
     # ── The book layout, decided here because two things need it ──
     #
     # It used to be chosen inside the spawn loop further down. The detachable joints
@@ -107,8 +110,19 @@ def generate_launch_description():
     # gripper_left_grasping_link and gripper_left_base_link do not survive the URDF to
     # SDF conversion: they are massless frames and Gazebo collapses them, so
     # gz model -m tiago_pro -l lists only the finger chain.
+    # Off unless asked for.
+    #
+    # The joints went in while the approach was completing in 53 to 62 seconds three runs
+    # running, and after they went in the search failed four times over. The base was
+    # measured free -- commanded 0.35 rad/s it turned 78 degrees -- so they are probably
+    # not the cause, but "probably" is not good enough to leave sitting under every run.
+    # A known-good baseline is worth more than an unproven feature on top of one.
+    #
+    #     ros2 launch erc_bringup simulation.launch.py grasp_fix:=true
+    #
+    # Turn it on to work on the grasp, leave it off to trust the approach numbers.
     joints = []
-    for _, _, _, book_name in book_layout:
+    for _, _, _, book_name in book_layout if grasp_fix_wanted else []:
         joints.append(f"""  <gazebo>
     <plugin filename="gz-sim-detachable-joint-system"
             name="gz::sim::systems::DetachableJoint">
@@ -307,11 +321,11 @@ def generate_launch_description():
     # book between the pads has nothing to push back against.
     #
     # After the books at 5 s, because it reads their poses.
-    grasp_fix = TimerAction(period=12.0, actions=[
+    grasp_fix = TimerAction(period=12.0, actions=([
         Node(package='erc_bringup', executable='sim_grasp_fix.py',
              parameters=[{'use_sim_time': True}],
              output='screen'),
-    ])
+    ] if grasp_fix_wanted else []))
 
     # ── Book colour substitution ──
     book_sdf_path = os.path.join(arena_dir, 'models', 'book', 'sdf', 'erc_book.sdf')
