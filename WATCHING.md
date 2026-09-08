@@ -179,6 +179,27 @@ is not, yet.
 
 ## When something does not work
 
+**"Container not running" — but it is.** The first thing to suspect is this terminal
+rather than the container:
+
+```bash
+docker ps
+```
+
+If that says *permission denied*, the shell is not in the `docker` group even though the
+account is. Adding a user to a group changes `/etc/group` at once and changes nothing
+about sessions already logged in, so an ssh login made afterwards works while the desktop
+session started that morning does not — same machine, same user, different answer.
+
+```bash
+newgrp docker
+```
+
+fixes the terminal you type it in. Logging out of the desktop session and back in fixes
+all of them. `sim` now says which of the two it is instead of reporting the container
+missing and offering to rebuild it, which is what it used to do — and rebuilding destroys
+the workspace build for a problem that was never the container.
+
 **The window never appears.** Almost always `xhost` (step 1) or the wrong display. Check
 which display it chose, and look at what the viewer said:
 
