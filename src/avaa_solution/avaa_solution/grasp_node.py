@@ -213,6 +213,12 @@ ARM_MAX_REACH = 1.088
 # numbers here can never be made to agree; one can.
 REACH_STEPS = 8
 SHELF_DEPTH = 0.30
+
+# The book, shelved spine-out: 250 mm tall, 160 mm deep into the shelf, 30 mm
+# thick. The jaws close across the 30.
+BOOK_HEIGHT = 0.25
+BOOK_DEPTH = 0.16
+BOOK_THICKNESS = 0.030
 SHELF_WIDTH = 4.8
 
 
@@ -572,6 +578,8 @@ class GraspNode(Node):
             self.get_parameter("servo_stuck_limit").value)
         self.servo_good = 0
         self.servo_best = None
+        # Consecutive ticks with the pads around the book, counted like servo_good.
+        self.pads_good = 0
         self.servo_rejected = 0
 
         self.chain = ArmChain.from_urdf()
@@ -1843,6 +1851,8 @@ class GraspNode(Node):
         self.servo_since = self._now()
         self.servo_good = 0
         self.servo_best = None
+        # Consecutive ticks with the pads around the book, counted like servo_good.
+        self.pads_good = 0
         self.servo_rejected = 0
         self.servo_stuck = 0
         self._enter(State.SERVO)
@@ -1876,6 +1886,27 @@ class GraspNode(Node):
             self.servo_good += 1
         else:
             self.servo_good = 0
+
+        on_book = self._pads_on_the_book(target)
+        if self.servo_good < self.servo_hold_ticks and on_book is not None:
+            ok, into, off_y, off_z = on_book
+            if ok:
+                self.pads_good += 1
+            else:
+                self.pads_good = 0
+            if self.pads_good >= self.servo_hold_ticks:
+                if not self._jaws_ready():
+                    return
+                self.get_logger().info(
+                    "the grasping frame is %s of its target, but the PADS are on the "
+                    "book: %.0f mm into it, %.0f mm off centre sideways, %.0f mm off "
+                    "in height. Clamping on that."
+                    % (self._miss(target), into * 1000, off_y * 1000, off_z * 1000))
+                self._report_jaws()
+                self._send_gripper(GRIPPER_CLAMP)
+                self.clamp_at = self.get_clock().now()
+                self._enter(State.CLAMP)
+                return
 
         if self.servo_good >= self.servo_hold_ticks:
             if not self._jaws_ready():
@@ -2071,6 +2102,57 @@ class GraspNode(Node):
                          % (index + 1, centre, centre + 0.02))
         self.get_logger().info(
             "shelf boards as modelled: %s" % "; ".join(lines))
+
+    def _pads_now(self):
+        """Give the midpoint of the two fingertips in base_link, or None."""
+        tips = []
+        for frame in ("gripper_left_fingertip_left_link",
+                      "gripper_left_fingertip_right_link"):
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    "base_link", frame, rclpy.time.Time())
+            except Exception:  # noqa: BLE001 - the transform may not be up yet
+                return None
+            t = tf.transform.translation
+            tips.append(np.array([t.x, t.y, t.z]))
+        return 0.5 * (tips[0] + tips[1])
+
+    def _pads_on_the_book(self, target):
+        """Say whether the PADS straddle the book, whatever the frame is doing.
+
+        The servo judged arrival by the grasping frame against a derived target, and the
+        pads are not the grasping frame -- they are 30 mm behind it, measured in flight
+        on 2026-09-08 and matching the 29.7 mm this file has always assumed.
+
+        That distinction cost a grasp. The servo gave up with "-27 mm depth, -9 mm
+        sideways, -44 mm height", refusing to clamp on air, and the pads at that instant
+        were at [0.657, 0.134, 0.641] against a book whose face was measured at x=0.605
+        and whose row put it at z=0.731. That is 53 mm into a 160 mm book, 9 mm off
+        centre with the jaws 65 mm apart around a 30 mm spine, and 35 mm clear of the
+        shelf board below. The jaws were around the book. Nothing was on air.
+
+        So this asks the question the task actually asks. All three have to hold, and
+        each is tight enough that a miss cannot pass:
+
+          depth     the pads are between 30 and 130 mm into the book, so both jaws are
+                    past the face and neither is out the back
+          height    within 90 mm of the book centre, against a book 250 mm tall
+          sideways  within 12 mm of the target, against a 30 mm spine inside jaws that
+                    open to 65 -- 17 mm of clearance a side, so 12 cannot be a miss
+
+        The frame-versus-target test stays as the fast path. This is the second answer
+        to the same question, asked of the part that does the gripping.
+        """
+        pads = self._pads_now()
+        if pads is None or self.face_x is None:
+            return None
+        centre_z = float(target[2]) + self.below_centre
+        into = float(pads[0]) - self.face_x
+        off_y = abs(float(pads[1]) - float(target[1]))
+        off_z = abs(float(pads[2]) - centre_z)
+        ok = (0.030 <= into <= 0.130 and off_y <= 0.012
+              and off_z <= 0.090)
+        return (ok, into, off_y, off_z)
 
     def _report_jaws(self) -> None:
         """Say where the PADS are, not where the grasping frame is.
