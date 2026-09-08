@@ -97,6 +97,7 @@ class GraspFix(Node):
 
         self.held = None
         self.books = {}
+        self.robot_pose = None
         self.buf = Buffer()
         self.listener = TransformListener(self.buf, self)
         self.create_subscription(
@@ -111,39 +112,75 @@ class GraspFix(Node):
     # ---------------------------------------------------------------- ground truth
     def _refresh_books(self):
         """Read every book pose from the simulator. They do not move until grasped."""
-        if self.held is not None:
-            return
         raw = gz("topic", "-e", "-t", "/world/%s/dynamic_pose/info" % self.world, "-n", "1")
         if not raw:
             return
-        found = {}
-        name = None
+        poses, name, fields = {}, None, {}
         for line in raw.splitlines():
             line = line.strip()
             if line.startswith('name: "'):
-                name = line.split('"')[1]
-            elif name and name.startswith("book_") and line.startswith("x:"):
-                found.setdefault(name, [None, None, None])[0] = float(line.split()[1])
-            elif name and name.startswith("book_") and line.startswith("y:"):
-                found.setdefault(name, [None, None, None])[1] = float(line.split()[1])
-            elif name and name.startswith("book_") and line.startswith("z:"):
-                found.setdefault(name, [None, None, None])[2] = float(line.split()[1])
-                name = None
-        complete = {k: v for k, v in found.items() if None not in v}
-        if complete:
-            self.books = complete
+                if name and len(fields) >= 3:
+                    poses[name] = dict(fields)
+                name, fields = line.split('"')[1], {}
+            elif name and ":" in line:
+                key, _, value = line.partition(":")
+                key = key.strip()
+                if key in ("x", "y", "z", "w") and key not in fields:
+                    try:
+                        fields[key] = float(value)
+                    except ValueError:
+                        pass
+        if name and len(fields) >= 3:
+            poses[name] = dict(fields)
+
+        books = {k: (v["x"], v["y"], v["z"]) for k, v in poses.items()
+                 if k.startswith("book_") and {"x", "y", "z"} <= set(v)}
+        if books:
+            self.books = books
+        robot = poses.get("tiago_pro")
+        if robot and {"x", "y", "z"} <= set(robot):
+            # Yaw only; the quaternion's x and y are shared with the position keys in
+            # this flat parse, so take the heading from the base_link TF instead when
+            # it matters. Position is what the distance check needs.
+            self.robot_pose = (robot["x"], robot["y"], robot["z"], self._base_yaw())
+
+    def _base_yaw(self):
+        """The base heading, from TF, which is exact for orientation even when odom
+        position has drifted: odom rotation is not what slides."""
+        try:
+            tf = self.buf.lookup_transform("odom", "base_link", rclpy.time.Time())
+        except Exception:  # noqa: BLE001
+            return 0.0
+        q = tf.transform.rotation
+        return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                          1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
     def _grasp_link_world(self):
-        """Where the grasping link is, in world coordinates."""
+        """Where the grasping link is, in world coordinates.
+
+        Composed from the robot's TRUE pose and the gripper's pose in base_link, not
+        read out of odom. odom would have been the obvious choice and is the wrong one:
+        this base slides across its wheels without turning them, and during one run that
+        held to 17 mm of true error odom had accumulated 813 mm of travel that never
+        happened. A distance check built on that would drift out of usefulness over
+        exactly the minutes a run takes.
+
+        Using ground truth is fine here and nowhere else. This node exists only because
+        the robot is simulated.
+        """
         try:
-            tf = self.buf.lookup_transform("odom", GRASP_LINK, rclpy.time.Time())
+            tf = self.buf.lookup_transform("base_link", GRASP_LINK, rclpy.time.Time())
         except Exception:  # noqa: BLE001
             return None
-        # odom starts coincident with world on this robot and the base is never
-        # teleported during a run, so odom IS world here. Stated rather than assumed
-        # because it is the one thing in this file that would silently rot.
+        base = self.robot_pose
+        if base is None:
+            return None
+        bx, by, bz, yaw = base
         t = tf.transform.translation
-        return (t.x, t.y, t.z)
+        # Planar rotation is enough: this base does not pitch or roll.
+        return (bx + t.x * math.cos(yaw) - t.y * math.sin(yaw),
+                by + t.x * math.sin(yaw) + t.y * math.cos(yaw),
+                bz + t.z)
 
     # ---------------------------------------------------------------- the trigger
     def _on_gripper(self, msg: JointTrajectory):
