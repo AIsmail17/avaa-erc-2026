@@ -205,7 +205,14 @@ cmd_start() {
     done
 
     ylw "Launching Gazebo..."
-    docker exec -d "$CONTAINER" /entrypoint.sh bash -c \
+    # ERC_GRASP_FIX has to be handed across explicitly: docker exec starts a fresh
+    # environment and inherits nothing from the calling shell, so setting it before
+    # ./tools/sim looked like it worked and quietly did nothing -- the run came up
+    # with zero detachable joints and that read as the flag being off on purpose.
+    if [ "${ERC_GRASP_FIX:-}" = "1" ]; then
+        ylw "Simulation grasp fix ENABLED (ERC_GRASP_FIX=1)."
+    fi
+    docker exec -d -e "ERC_GRASP_FIX=${ERC_GRASP_FIX:-0}" "$CONTAINER" /entrypoint.sh bash -c \
         "source $WS/install/setup.bash && exec $LAUNCH $launch_args > /tmp/sim.log 2>&1"
     for _ in $(seq 1 40); do
         sleep 1
