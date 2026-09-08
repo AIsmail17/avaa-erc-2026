@@ -133,6 +133,9 @@ class PerceptionNode(Node):
         # How long a marker fix stays worth predicting from. Two seconds is about
         # ten detector frames and 0.7 rad of search rotation.
         self.declare_parameter("marker_track_max_age_sec", 2.0)
+        # Wrong-shelf fixes in a row before the tracker lets go of the book it is
+        # following. At 5 Hz this is about three seconds.
+        self.declare_parameter("height_rejects_limit", 15)
         # And the same for the book, which is tracked through the last metre where
         # no marker is in frame to re-seed it.
         self.declare_parameter("book_track_max_age_sec", 2.0)
@@ -157,6 +160,8 @@ class PerceptionNode(Node):
             self.get_parameter("min_markers_to_track").value)
         self.marker_track_max_age = float(
             self.get_parameter("marker_track_max_age_sec").value)
+        self.height_rejects_limit = int(
+            self.get_parameter("height_rejects_limit").value)
         self.book_track_max_age = float(
             self.get_parameter("book_track_max_age_sec").value)
         self.book_reject_limit = int(
@@ -214,6 +219,9 @@ class PerceptionNode(Node):
         self.last_marker_yaw = None
         self.last_marker_at = None
         self.marker_rejects = 0
+        # Consecutive fixes refused for being on the wrong shelf. See
+        # _publish_book_point: refusing is right, refusing forever is not.
+        self.height_rejects = 0
         # The same two bounds for the book tracker: when its fix was taken, and
         # how many frames running it has refused. See _track_book_without_marker.
         self.last_book_at = None
@@ -896,6 +904,7 @@ class PerceptionNode(Node):
         if expected_z is not None:
             off = abs(float(point[2]) - DEPTH_HEIGHT_BIAS - expected_z)
             if off > ROW_HEIGHT_TOLERANCE:
+                self.height_rejects += 1
                 self.get_logger().warn(
                     "a %s book measures %.2f m up, and row %s is at %.2f m -- %.2f m "
                     "away, more than the %.2f m allowed. That is a different shelf, so "
@@ -903,7 +912,34 @@ class PerceptionNode(Node):
                     % (self.book_colour, float(point[2]) - DEPTH_HEIGHT_BIAS,
                        self.reported_row, expected_z, off, ROW_HEIGHT_TOLERANCE),
                     throttle_duration_sec=5.0)
+
+                # Refusing is right. Refusing forever is not.
+                #
+                # This gate stops a fix on the wrong shelf reaching the approach, and it
+                # does that correctly -- but on 2026-09-08 it then refused every frame
+                # for the rest of a run while the approach printed "no metric fix on the
+                # book to drive to" and neither said anything the other could act on.
+                #
+                # Ground truth on that run: marker 3 was column 3 and the row was read
+                # as 2, both correct, and the robot was parked at y = -1.268 where
+                # column 4 yellow book sits at y = -1.071 and column 3 at -0.019. The
+                # tracker was following the neighbour, one column across and one row up.
+                # The right book was 39 degrees off the nose and still inside a 43.5
+                # degree half-frame, so it was there to be found.
+                #
+                # The tracker only ever follows its own last answer, so while that
+                # answer is the wrong book nothing can dislodge it. Letting go of it is
+                # the one recovery available from here.
+                if self.height_rejects >= self.height_rejects_limit:
+                    self.get_logger().warn(
+                        "%d fixes in a row have been on the wrong shelf, so the book "
+                        "being followed is not the target. Letting go of it and looking "
+                        "again." % self.height_rejects)
+                    self.height_rejects = 0
+                    self.last_book_cx = None
+                    self.last_book_yaw = None
                 return False
+        self.height_rejects = 0
 
         msg.point.x, msg.point.y, msg.point.z = (float(v) for v in point)
         self.pub_book_point.publish(msg)
