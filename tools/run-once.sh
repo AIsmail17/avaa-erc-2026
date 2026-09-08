@@ -1,6 +1,21 @@
 set -u
 cd ~/erc/erc_sim_2026
 
+# The task, which the organisers randomise and which was hardcoded to "3 red" here.
+#
+#     tools/run-once.sh                # marker 3, red book
+#     tools/run-once.sh 3 yellow       # marker 3, yellow book
+#
+# Worth having as an argument for two reasons. The report needs five trials and they
+# should not all be the same task. And the layout is randomised per launch, so a fixed
+# colour lands wherever it lands: on 2026-09-08 red was on the bottom shelf in four of
+# the five columns and yellow was on the top two in four of them, which is the
+# difference between exercising the whole pipeline and exercising the one reach that
+# does not plan yet.
+COLUMN="${1:-3}"
+COLOUR="${2:-red}"
+echo "=== task: marker $COLUMN, $COLOUR book"
+
 # One run at a time. Two overlapping runs tore down each other's simulator on
 # 2026-09-04 and produced a "blind simulator" that looked like a product fault.
 # The pattern must not match the checking command itself, which "solution.launch.py"
@@ -69,7 +84,8 @@ if [ "$ok" -eq 0 ]; then echo "the simulator came up blind; not launching"; exit
 # had happened. So: kill by name inside the container, then wait for it to go.
 LAUNCH_TIMEOUT=${LAUNCH_TIMEOUT:-2400}
 docker exec erc_sim /entrypoint.sh bash -c \
-  'source /opt/erc_ws/install/setup.bash && exec ros2 launch avaa_solution solution.launch.py shelf_column_number:=3 book_colour:=red' \
+  "source /opt/erc_ws/install/setup.bash && exec ros2 launch avaa_solution \
+   solution.launch.py shelf_column_number:=$COLUMN book_colour:=$COLOUR" \
   > /tmp/run_raw.log 2>&1 &
 CLIENT=$!
 ( sleep "$LAUNCH_TIMEOUT"
@@ -88,7 +104,7 @@ docker exec erc_sim bash -c 'pkill -f "ros2 launch avaa_solution solution.launch
 # investigations lost the log they were reading halfway through, and a run costs
 # thirteen minutes to reproduce.
 mkdir -p ~/erc/runs
-cp /tmp/run_raw.log ~/erc/runs/"run-$(date +%Y%m%d-%H%M%S).log"
+cp /tmp/run_raw.log ~/erc/runs/"run-$(date +%Y%m%d-%H%M%S)-$COLUMN-$COLOUR.log"
 ls -t ~/erc/runs/*.log | tail -n +21 | xargs -r rm -f
 echo "=== done, kept at ~/erc/runs/"
 grep -E 'avaa_grasp|avaa_mission|avaa_approach' /tmp/run_raw.log | grep -v throttle | tail -30
