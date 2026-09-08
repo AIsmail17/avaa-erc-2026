@@ -75,6 +75,56 @@ def generate_launch_description():
     with open(urdf_path, 'r') as f:
         robot_description = f.read()
 
+    # ── The book layout, decided here because two things need it ──
+    #
+    # It used to be chosen inside the spawn loop further down. The detachable joints
+    # below have to name each book, and they go into the robot description, which is
+    # built here -- so the names have to exist by now.
+    book_layout = []
+    for col in range(NUM_COLUMNS):
+        colours_this_column = list(BOOK_COLOURS.keys())
+        random.shuffle(colours_this_column)
+        for i, row in enumerate(ACTIVE_ROWS):
+            colour_name = colours_this_column[i]
+            book_layout.append((col, row, colour_name,
+                                f'book_col_{col + 1}_row_{row + 1}_{colour_name}'))
+
+    # ── Detachable joints, one per book ──
+    #
+    # SIMULATION SCAFFOLDING. See scripts/sim_grasp_fix.py for why a simulated grasp
+    # needs help at all, and MANIPULATION.md for the measurement: this gripper is
+    # position-commanded through a passive four-bar of mimic joints, so a book between
+    # the pads has nothing to push back against and the jaws close straight through it.
+    #
+    # On the ROBOT, not on the book. The first attempt put the plugin on each book with
+    # the robot as the child, and the plugin loaded, advertised its topics, subscribed,
+    # received the attach message -- verified by echoing the topic -- and welded nothing.
+    # Every documented use of DetachableJoint has the carrier as the parent and the
+    # payload as the child, a vehicle and its cargo, and a free rigid body is not a
+    # sensible parent for a large articulated robot.
+    #
+    # The child link is book_base_link, and the parent is a fingertip because
+    # gripper_left_grasping_link and gripper_left_base_link do not survive the URDF to
+    # SDF conversion: they are massless frames and Gazebo collapses them, so
+    # gz model -m tiago_pro -l lists only the finger chain.
+    joints = []
+    for _, _, _, book_name in book_layout:
+        joints.append(f"""  <gazebo>
+    <plugin filename="gz-sim-detachable-joint-system"
+            name="gz::sim::systems::DetachableJoint">
+      <parent_link>gripper_left_fingertip_left_link</parent_link>
+      <child_model>{book_name}</child_model>
+      <child_link>book_base_link</child_link>
+      <attach_topic>/grasp_fix/{book_name}/attach</attach_topic>
+      <detach_topic>/grasp_fix/{book_name}/detach</detach_topic>
+      <output_topic>/grasp_fix/{book_name}/state</output_topic>
+      <suppress_child_warning>true</suppress_child_warning>
+    </plugin>
+  </gazebo>
+""")
+    robot_description = robot_description.replace(
+        '</robot>', ''.join(joints) + '</robot>', 1)
+
     # ── Gazebo Harmonic ──
     # GUI when headless:=false (default), server-only when headless:=true.
     # Headless mode: unset DISPLAY to force ogre2 onto the surfaceless EGL path
@@ -268,77 +318,35 @@ def generate_launch_description():
     with open(book_sdf_path, 'r') as f:
         book_sdf_template = f.read()
 
-    # A detachable joint per book, so a grasp can be made to hold.
-    #
-    # This is simulation scaffolding, not part of the solution, and it is here rather
-    # than in avaa_solution for that reason: Phase 2 drops it by not launching the node
-    # that drives it, and nothing in the solution changes.
-    #
-    # It exists because this gripper cannot hold anything. gripper_left_finger_joint is
-    # position-commanded and every link that touches a book is a mimic joint following
-    # it through a passive four-bar, so a book between the pads has nothing to push
-    # back against -- measured on 2026-09-08, the jaws closing to 28.7 mm around a book
-    # 30.0 mm thick while the book never moved. MANIPULATION.md has the detail and the
-    # references; it is a documented Gazebo limitation with two known remedies, and
-    # this is the one that fits the time.
-    #
-    # One temp file PER BOOK rather than per colour, because the attach and detach
-    # topics have to name one book. Sharing a file per colour would have one attach
-    # message pick up all four books of that colour.
-    def with_detachable_joint(sdf, book_name):
-        plugin = f"""
-    <plugin filename="gz-sim-detachable-joint-system"
-            name="gz::sim::systems::DetachableJoint">
-      <parent_link>book_base_link</parent_link>
-      <child_model>tiago_pro</child_model>
-      <!-- A link that SURVIVES the URDF to SDF conversion.
-           gripper_left_grasping_link and gripper_left_base_link are both massless
-           frames and Gazebo collapses them: gz model -m tiago_pro -l lists only the
-           finger chain. Naming one of those made the plugin load, subscribe, and
-           silently weld nothing. The fingertip is where a book would be held anyway. -->
-      <child_link>gripper_left_fingertip_left_link</child_link>
-      <attach_topic>/grasp_fix/{book_name}/attach</attach_topic>
-      <detach_topic>/grasp_fix/{book_name}/detach</detach_topic>
-      <output_topic>/grasp_fix/{book_name}/state</output_topic>
-      <suppress_child_warning>false</suppress_child_warning>
-    </plugin>
-  </model>"""
-        return sdf.replace('</model>', plugin, 1)
-
-    def book_sdf_for(colour_name, book_name):
-        sdf = book_sdf_template.replace(
-            'BOOK_COLOUR_PLACEHOLDER', BOOK_COLOURS[colour_name])
-        sdf = with_detachable_joint(sdf, book_name)
-        tmp_path = f'/tmp/erc_{book_name}.sdf'
+    # One substituted temp file per colour. The detachable joints moved to the robot
+    # description above, so the books no longer need to be told apart here.
+    tmp_book_paths = {}
+    for colour_name, rgba in BOOK_COLOURS.items():
+        coloured_sdf = book_sdf_template.replace('BOOK_COLOUR_PLACEHOLDER', rgba)
+        tmp_path = f'/tmp/erc_book_{colour_name}.sdf'
         with open(tmp_path, 'w') as f:
-            f.write(sdf)
-        return tmp_path
+            f.write(coloured_sdf)
+        tmp_book_paths[colour_name] = tmp_path
 
     # ── Spawn books ──
     book_spawn_nodes = []
-    for col in range(NUM_COLUMNS):
-        colours_this_column = list(BOOK_COLOURS.keys())
-        random.shuffle(colours_this_column)
+    for col, row, colour_name, book_name in book_layout:
+        tmp_path = tmp_book_paths[colour_name]
 
-        for i, row in enumerate(ACTIVE_ROWS):
-            colour_name = colours_this_column[i]
-            book_name = f'book_col_{col + 1}_row_{row + 1}_{colour_name}'
-            tmp_path = book_sdf_for(colour_name, book_name)
+        y = SHELF_Y + COLUMN_Y_OFFSETS[col] + random.uniform(-COLUMN_JITTER_RANGE, COLUMN_JITTER_RANGE)
+        z = SHELF_Z + ROW_FLOOR_Z_OFFSETS[row]
+        x = SHELF_X - 0.1
 
-            y = SHELF_Y + COLUMN_Y_OFFSETS[col] + random.uniform(-COLUMN_JITTER_RANGE, COLUMN_JITTER_RANGE)
-            z = SHELF_Z + ROW_FLOOR_Z_OFFSETS[row]
-            x = SHELF_X - 0.1
-
-            book_spawn_nodes.append(
-                Node(package='ros_gz_sim', executable='create',
-                    arguments=[
-                        '-file', tmp_path,
-                        '-name', book_name,
-                        '-x', str(x), '-y', str(y), '-z', str(z),
-                        '-R', '0', '-P', str(ROTATE_90_DEGREES_RAD), '-Y', '0',
-                    ],
-                    output='screen')
-            )
+        book_spawn_nodes.append(
+            Node(package='ros_gz_sim', executable='create',
+                arguments=[
+                    '-file', tmp_path,
+                    '-name', book_name,
+                    '-x', str(x), '-y', str(y), '-z', str(z),
+                    '-R', '0', '-P', str(ROTATE_90_DEGREES_RAD), '-Y', '0',
+                ],
+                output='screen')
+        )
 
     spawn_books = TimerAction(period=5.0, actions=book_spawn_nodes)
 
