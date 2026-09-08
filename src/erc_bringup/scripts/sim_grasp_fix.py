@@ -55,7 +55,18 @@ from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory
 
 WORLD = "erc_world"
-GRIPPER_TOPIC = "/gripper_left_controller/joint_trajectory"
+# BOTH topics, and that distinction cost most of a day.
+#
+# gripper_command_clamp listens on the public topic and republishes to the raw one, and
+# it is entirely reasonable to assume the solution talks to the public one. It does not:
+# grasp_node publishes straight to _raw, bypassing the clamp. So this node sat with a
+# healthy subscription on a topic the solution never used, and across four whole runs it
+# never saw a single gripper command -- while a hand-published message on the same topic
+# reached it instantly, which is what finally gave it away.
+#
+# Listening to both costs nothing and does not care which one anything uses.
+GRIPPER_TOPICS = ("/gripper_left_controller/joint_trajectory",
+                  "/gripper_left_controller_raw/joint_trajectory")
 FINGER = "gripper_left_finger_joint"
 GRASP_LINK = "gripper_left_grasping_link"
 
@@ -92,8 +103,8 @@ class GraspFix(Node):
 
         self.buf = Buffer()
         self.listener = TransformListener(self.buf, self)
-        self.create_subscription(
-            JointTrajectory, GRIPPER_TOPIC, self._on_gripper, 10)
+        for topic in GRIPPER_TOPICS:
+            self.create_subscription(JointTrajectory, topic, self._on_gripper, 10)
         self.pub_state = self.create_publisher(String, "/grasp_fix/holding", 10)
 
         # Every call to gz is a subprocess, and a subprocess in a callback stops the node
