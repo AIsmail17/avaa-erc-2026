@@ -300,7 +300,7 @@ def generate_launch_description():
       <attach_topic>/grasp_fix/{book_name}/attach</attach_topic>
       <detach_topic>/grasp_fix/{book_name}/detach</detach_topic>
       <output_topic>/grasp_fix/{book_name}/state</output_topic>
-      <suppress_child_warning>true</suppress_child_warning>
+      <suppress_child_warning>false</suppress_child_warning>
     </plugin>
   </model>"""
         return sdf.replace('</model>', plugin, 1)
