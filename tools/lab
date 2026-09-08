@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# The grasp bench: the robot, one book, and nothing else.
+#
+#     tools/lab up [dart|bullet]     bring the bench up (default dart)
+#     tools/lab down                 stop it
+#     tools/lab status               is it running, and how fast
+#     tools/lab log [n]              tail the bench log
+#     tools/lab run <script> [args]  run a tools/ script against the bench
+#
+# A full arena run costs thirteen minutes and spends eleven of them on an approach that
+# is already understood. This brings up a world with no shelf, no markers, no walls, no
+# bin, one book instead of twenty and no cameras, so the same grasp can be tried in
+# under a minute -- and tried again immediately after an edit.
+#
+# The world is named erc_world, like the arena, so every script in tools/ addresses it
+# unchanged.
+set -u
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONTAINER=erc_sim
+LOG=/tmp/lab.log
+
+die() { echo "$*" >&2; exit 1; }
+
+docker exec "$CONTAINER" true 2>/dev/null || die "the $CONTAINER container is not running"
+
+launched() {
+    docker exec "$CONTAINER" bash -c \
+        'ps -eo args | grep -v grep | grep -q "[g]rasp_lab.launch.py"'
+}
+
+rtf() {
+    docker exec "$CONTAINER" /entrypoint.sh bash -c \
+        'timeout 12 gz topic -t /stats -e -n 1 2>/dev/null | grep real_time_factor' \
+        2>/dev/null | head -1 | awk '{print $2}'
+}
+
+cmd="${1:-status}"
+shift || true
+
+case "$cmd" in
+up)
+    engine="${1:-dart}"
+    case "$engine" in
+        dart|bullet|bullet-featherstone) ;;
+        *) die "engine must be dart or bullet, not $engine" ;;
+    esac
+
+    # Anything already talking to a world will fight this one for the same topics.
+    docker exec "$CONTAINER" bash -c '
+        pkill -f "grasp_lab.launch.py";
+        pkill -f "simulation.launch.py";
+        pkill -f "solution.launch.py";
+        pkill -f "moveit.launch.py";
+        pkill -f "[s]im_grasp_fix";
+        pkill -f "gz sim";
+        sleep 3; true' 2>/dev/null
+
+    echo "=== bringing the bench up on $engine physics"
+    docker exec -d \
+        -e "ERC_PHYSICS=$engine" \
+        -e "ERC_LAB_X=${ERC_LAB_X:-0.75}" \
+        -e "ERC_LAB_Y=${ERC_LAB_Y:-0.0}" \
+        -e "ERC_LAB_Z=${ERC_LAB_Z:-1.00}" \
+        -e "ERC_LAB_COLOUR=${ERC_LAB_COLOUR:-yellow}" \
+        -e "ERC_GRASP_FIX=${ERC_GRASP_FIX:-0}" \
+        "$CONTAINER" /entrypoint.sh bash -c \
+        "source /opt/erc_ws/install/setup.bash && \
+         ros2 launch erc_bringup grasp_lab.launch.py headless:=${HEADLESS:-true} \
+         > $LOG 2>&1"
+
+    # The controllers are spawned on an eight second timer and the slowest of them is
+    # what decides when the bench is usable, so wait for the broadcaster rather than
+    # guessing at a sleep.
+    echo -n "waiting for the controllers"
+    for i in $(seq 1 40); do
+        if docker exec "$CONTAINER" bash -c \
+            "grep -q 'Configured and activated joint_state_broadcaster' $LOG 2>/dev/null"; then
+            echo " up after ${i}x3 s"
+            break
+        fi
+        if docker exec "$CONTAINER" bash -c \
+            "grep -qi 'Could not.*controller_manager\|Failed to load' $LOG 2>/dev/null"; then
+            echo
+            echo "!!! the controllers failed to come up. On bullet-featherstone this is"
+            echo "!!! the known gz_ros2_control issue #440. Last lines:"
+            docker exec "$CONTAINER" bash -c "tail -15 $LOG"
+            exit 1
+        fi
+        echo -n "."
+        sleep 3
+    done
+
+    echo "real-time factor $(rtf)"
+    docker exec "$CONTAINER" bash -c "grep -c 'does not support .*mimic' $LOG 2>/dev/null" \
+        | { read -r n; echo "mimic constraints refused by the physics engine: $n"; }
+    ;;
+
+down)
+    docker exec "$CONTAINER" bash -c '
+        pkill -f "grasp_lab.launch.py"; pkill -f "[s]im_grasp_fix"; pkill -f "gz sim";
+        sleep 2; true' 2>/dev/null
+    echo "bench down"
+    ;;
+
+status)
+    if launched; then
+        echo "bench running, real-time factor $(rtf)"
+        docker exec "$CONTAINER" /entrypoint.sh bash -c \
+            'source /opt/erc_ws/install/setup.bash && timeout 10 ros2 control list_controllers 2>/dev/null' \
+            | sed 's/^/  /'
+    else
+        echo "bench not running"
+    fi
+    ;;
+
+log)
+    docker exec "$CONTAINER" bash -c "tail -${1:-40} $LOG"
+    ;;
+
+run)
+    [ $# -ge 1 ] || die "usage: tools/lab run <script> [args]"
+    exec "$REPO/tools/in-sim" "$@"
+    ;;
+
+*)
+    sed -n '2,12p' "$0"
+    exit 1
+    ;;
+esac
