@@ -27,6 +27,33 @@ It decides using Gazebo ground truth, which is legitimate for a simulator aid an
 be meaningless on hardware -- which is the point. The real gripper closes on the real
 book and none of this is wanted.
 
+WHERE THIS STANDS (2026-09-08)
+------------------------------
+The plumbing is in and verified: every book carries a DetachableJoint, sixty topics are
+advertised, the attach topic has the plugin as a subscriber, and this node runs and finds
+the books. The weld itself does not take. Attaching a live book and then raising the torso
+270 mm moves the book 3 mm, which is settling, not carrying.
+
+Ruled out on the way, so it does not have to be re-checked:
+
+  - the plugin loads and subscribes (gz topic -i shows it on the attach topic);
+  - the generated SDF is well formed and one file per book, so an attach cannot pick up
+    the wrong one;
+  - the child link exists in the SIMULATED model. gripper_left_grasping_link and
+    gripper_left_base_link do not: they are massless frames and Gazebo collapses them,
+    so gz model -m tiago_pro -l lists only the finger chain. Naming one of those made
+    the plugin load, subscribe, and silently weld nothing;
+  - the torso really moves, and the book name really exists in the current launch. The
+    layout is re-randomised every launch, and two of the early tests fired at a book
+    from the previous one.
+
+The next thing to try is inverting the direction. The plugin currently lives on the book,
+which makes a free rigid body the parent and a large articulated robot the child. Every
+documented use has the carrier as the parent -- a vehicle carrying a payload -- and gz-sim
+may simply decline to re-parent an articulation. That means putting the plugin on the
+robot instead, with parent_link the fingertip and child_model the book, which needs
+gazebo tags injected into robot_description rather than into the book SDF.
+
 The tolerance is deliberately tight. This is meant to make a good grasp hold, not to
 rescue a bad one: a run that would have missed the book should still fail, or the trial
 numbers stop meaning anything.
