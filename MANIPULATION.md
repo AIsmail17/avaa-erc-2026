@@ -107,8 +107,27 @@ that puts a ceiling back — a real mimic constraint under bullet, or an effort 
 interface on the gripper joints — should change this number.
 
 That is the mechanism confirmed from both directions. Neither engine has yet carried a
-book: bullet stalls too early to close on it, and the bullet bench is not yet stable
-enough to iterate on (§1c).
+book: under bullet the finger stalls too early to close on the book at all.
+
+### 1d. There is a force ceiling, and it is the thing to tune
+
+`tools/graspforce.py` scales the left gripper's effort limits in the URDF; the bench then
+picks them up with no rebuild. Scaled by 0.001 — 0.01 N on the driven prismatic instead of
+10 N — the finger commanded to 0.000 **stalled at 0.0634**, and the pads moved 2 mm in the
+whole close.
+
+So dartsim *does* honour the joint effort limit when it applies `JointVelocityCmd`. The
+ceiling exists. At the stock 10 N it is simply far above what a 30 mm book can resist, so
+the jaws win. That reframes the problem again, and in a much more tractable direction:
+not "position control cannot grasp", but "this gripper is allowed a hundred times the
+force it needs".
+
+Still open, and the next thing to measure: whether the pads ever generate a *contact* at
+all. The closed span has come out at 27.4 mm and at 31.0 mm on different runs against the
+same 30.0 mm book, which is the kind of spread that suggests the fingers are sometimes
+missing it entirely rather than squeezing it. `tools/padcontact.sh` reads the fingertips'
+own contact sensors — they publish per link, not to a single `/contacts` topic, which is
+why an earlier attempt to watch `/contacts` saw nothing and proved nothing.
 
 ### 1c. bullet-featherstone is not a free swap
 
@@ -119,8 +138,18 @@ Worth knowing before reaching for it:
     here** — all seven activate in 12 s. The one time it looked like it did, the cause was
     a stale `controller_manager` from the previous bench that had not finished dying;
     `tools/lab` now waits for the processes to go rather than sleeping and hoping.
-  - The world alone runs indefinitely. With the robot in it, `gz sim` has died on its own
-    a few minutes in, twice, with nothing in the launch log. Not yet characterised.
+  - **It does not die on its own.** This section first recorded that `gz sim` kept
+    dying a few minutes in under bullet, with nothing in the log, and treated it as a
+    stability problem with the engine. It is not. The *dartsim* bench died the same way,
+    and the cause is the workstation: `erc_sim` had `RestartCount=0`, `ExitCode=0`, no
+    OOM, and a `StartedAt` a few minutes old — the container had been restarted from
+    scratch because **WSL shuts itself down when no command is running**, taking Docker
+    and the bench with it. The same idle shutdown wiped `/tmp` between commands and
+    killed a `nohup setsid` probe.
+
+    The practical consequence, on the workstation only: bring-up and test must go in
+    **one** invocation. Every bench measurement above came from a command that did
+    `lab up` and `jawtest` together; every "it died" came from splitting them.
   - `/world/erc_world/dynamic_pose/info` only carries models that are MOVING. Under
     dartsim everything jitters enough to keep publishing; a settled bullet world can go
     silent on that topic, and several tools here read it — including `sim_grasp_fix`.

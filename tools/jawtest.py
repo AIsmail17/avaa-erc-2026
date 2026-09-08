@@ -34,6 +34,11 @@ from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+try:
+    from ros_gz_interfaces.msg import Contacts
+except ImportError:            # the bridge is optional; the test still works without it
+    Contacts = None
+
 WORLD = "erc_world"
 FINGER = "gripper_left_finger_joint"
 TORSO = "torso_lift_joint"
@@ -118,6 +123,25 @@ def main():
         JointState, "/joint_states",
         lambda m: state.update(dict(zip(m.name, m.position))), 10)
     grip = node.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
+
+    # Whether the pads ever TOUCH the book is a different question from whether they end
+    # up around it, and the two have been confounded all week. A closed span of 27.4 mm
+    # around a 30 mm book has two readings: the fingers contacted it and squeezed past,
+    # or they never contacted it at all and the collision geometry is not where it looks.
+    touches = {"finger_book": 0, "any_book": 0, "total": 0}
+
+    def on_contacts(msg):
+        for c in msg.contacts:
+            a, b = c.collision1.name, c.collision2.name
+            touches["total"] += 1
+            pair = a + " " + b
+            if "book" in pair:
+                touches["any_book"] += 1
+                if "finger" in pair or "gripper" in pair:
+                    touches["finger_book"] += 1
+
+    if Contacts is not None:
+        node.create_subscription(Contacts, "/contacts", on_contacts, 10)
     torso = node.create_publisher(JointTrajectory, TORSO_TOPIC, 10)
     buf = Buffer()
     listener = TransformListener(buf, node)
@@ -238,6 +262,14 @@ def main():
     left, right = tips()
     closed_span = math.dist(left, right)
     print("   pads now %.1f mm apart" % (closed_span * 1000))
+    if Contacts is None:
+        print("   (no ros_gz_interfaces, so contacts were not watched)")
+    else:
+        print("   contacts while closing: %d in all, %d involving the book, "
+              "%d between a finger and the book"
+              % (touches["total"], touches["any_book"], touches["finger_book"]))
+        if touches["total"] and not touches["finger_book"]:
+            print("   the fingers never touched it -- they closed through empty space")
 
     print("\n4. letting go -- nothing is holding the book now but the gripper")
     spin(4.0)
