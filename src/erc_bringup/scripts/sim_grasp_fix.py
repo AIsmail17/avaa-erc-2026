@@ -105,6 +105,20 @@ class GraspFix(Node):
         self.pub_state = self.create_publisher(String, "/grasp_fix/holding", 10)
         self.create_timer(5.0, self._refresh_books)
         self.create_timer(1.0, self._report)
+
+        # Keep releasing for the first half minute, not just once.
+        #
+        # DetachableJoint attaches as soon as it finds its child, and the books spawn
+        # over several seconds. A single release at startup leaves every book that
+        # spawns afterwards welded, and even the ones released leave a window: twenty
+        # fixed joints between a shelf of books and one fingertip, all to be satisfied
+        # at once, is a large disturbance to hand a physics solver during the seconds
+        # when the robot is trying to stand still and tuck its arms.
+        #
+        # The books do not all exist yet either, so their topics do not all exist yet,
+        # which is why this rescans rather than reusing a list.
+        self.sweeping_until = None
+        self.create_timer(0.5, self._sweep)
         self._release_everything()
         self.get_logger().info(
             "simulation grasp fix up: a close within %.0f mm of a book will attach it"
@@ -134,6 +148,17 @@ class GraspFix(Node):
         self.get_logger().info(
             "released %d books that the detachable joints had welded on at spawn"
             % released)
+
+    def _sweep(self):
+        """Release anything newly welded, for the first half minute only."""
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self.sweeping_until is None:
+            self.sweeping_until = now + 30.0
+        if now > self.sweeping_until or self.held is not None:
+            return
+        for name in self._book_names():
+            gz("topic", "-t", "/grasp_fix/%s/detach" % name,
+               "-m", "gz.msgs.Empty", "-p", "unused: true")
 
     def _book_names(self):
         """Every book the simulator has a detach topic for."""

@@ -321,7 +321,8 @@ def generate_launch_description():
     # book between the pads has nothing to push back against.
     #
     # After the books at 5 s, because it reads their poses.
-    grasp_fix = TimerAction(period=12.0, actions=([
+    # Before the books at 5 s, so it is already sweeping when they arrive welded.
+    grasp_fix = TimerAction(period=3.0, actions=([
         Node(package='erc_bringup', executable='sim_grasp_fix.py',
              parameters=[{'use_sim_time': True}],
              output='screen'),
