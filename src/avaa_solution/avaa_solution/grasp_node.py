@@ -1910,6 +1910,16 @@ class GraspNode(Node):
                 "was %.0f mm (%d solves rejected). Not clamping on air."
                 % (self._miss(target), self.servo_timeout,
                    (self.servo_best or 0.0) * 1000, self.servo_rejected))
+            # The pads, on the way out.
+            #
+            # This report was only reached from the clamp, and the clamp is exactly what
+            # a failing servo never gets to -- so the one run that most needs it was the
+            # one run that could not produce it. A row-4 servo gave up 40 mm BELOW its
+            # target with zero IK solves rejected, and an arm measured holding all four
+            # rows to within 6 mm in open air does not miss by 40 unless something is
+            # against it. Where the pads finished says what.
+            self._report_jaws()
+            self._report_boards()
             self._enter(State.FAILED)
             return
 
@@ -2038,6 +2048,29 @@ class GraspNode(Node):
                 "the jaws will not stay open; refusing to clamp on air")
             self._enter(State.FAILED)
         return False
+
+    def _report_boards(self) -> None:
+        """Say where the shelf boards are, next to where the arm stopped.
+
+        The grasp takes the shelf out of the planning scene before the final reach, on
+        purpose -- the boards are the only thing making the opening an opening, and with
+        them in place no straight line into the shelf plans at all. The cost is that
+        nothing checks the last 200 mm against the shelf it is reaching into, and a
+        fingertip resting on a board looks from the inside exactly like an arm that
+        will not track.
+
+        So print the geometry the controller already knows, at the moment it gives up,
+        and let the two numbers be compared instead of inferred.
+        """
+        if self.face_x is None:
+            return
+        lines = []
+        for index, height in enumerate(self.row_heights):
+            centre = height - BOARD_DROP
+            lines.append("row %d board at z=%.3f (top %.3f)"
+                         % (index + 1, centre, centre + 0.02))
+        self.get_logger().info(
+            "shelf boards as modelled: %s" % "; ".join(lines))
 
     def _report_jaws(self) -> None:
         """Say where the PADS are, not where the grasping frame is.
