@@ -2103,6 +2103,18 @@ class GraspNode(Node):
         self.get_logger().info(
             "shelf boards as modelled: %s" % "; ".join(lines))
 
+    def _finger_span(self):
+        """Give the gap between the pads in metres, from the finger joint, or None.
+
+        The span model is measured, not derived: MANIPULATION.md records the joint
+        against the true gap, and a commanded 0.000 settles at 0.0026 with the pads
+        30.4 mm apart.
+        """
+        finger = self.joints.get("gripper_left_finger_joint")
+        if finger is None:
+            return None
+        return 0.0271 + (finger + 0.001) * 0.8146
+
     def _pads_now(self):
         """Give the midpoint of the two fingertips in base_link, or None."""
         tips = []
@@ -2239,6 +2251,36 @@ class GraspNode(Node):
 
         if waited < self.gripper_time + 1.0:
             return
+
+        # Did the jaws stop on something, or meet each other?
+        #
+        # The gripper is force limited, so a book between the pads stops them at the
+        # book. With nothing there they run to the commanded close. That is the whole
+        # test, and it needs no sensor this robot does not have.
+        #
+        # Measured on 2026-09-08, on a grasp that reported success and went on to a
+        # delivery: both finger joints settled at 0.0010, a span of 28.7 mm, and Gazebo
+        # had every book still on its shelf. A 30.0 mm book cannot be inside 28.7 mm of
+        # jaw. The run then spent four more minutes carrying nothing to the bin and
+        # placing it, and nothing anywhere said the grasp had failed.
+        #
+        # Reporting a miss is worth more than continuing past one: the mission can try
+        # again, and a run that says it failed is worth more in a log than a run that
+        # says nothing.
+        span = self._finger_span()
+        if span is not None and span < BOOK_THICKNESS - 0.002:
+            self.get_logger().error(
+                "the jaws closed to %.1f mm and the book is %.1f mm thick, so they "
+                "closed on nothing. Not carrying an empty gripper to the bin."
+                % (span * 1000, BOOK_THICKNESS * 1000))
+            self._report_jaws()
+            self._enter(State.FAILED)
+            return
+        if span is not None:
+            self.get_logger().info(
+                "the jaws stopped at %.1f mm on a %.1f mm book, so there is something "
+                "between them" % (span * 1000, BOOK_THICKNESS * 1000))
+
         lifted = self.grasp_target + np.array([0.0, 0.0, self.lift])
         self._enter(State.LIFT)
         path = self._straight_path(
