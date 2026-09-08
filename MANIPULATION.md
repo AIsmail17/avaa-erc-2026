@@ -5,7 +5,17 @@ Everything here is measured against the running simulation. Feeds report section
 
 ---
 
-## 1. The gripper works, despite the startup error ✅
+## 1. ❌ The startup error is the whole problem — this section had it backwards
+
+**Corrected 2026-09-08.** This section used to be headed "The gripper works, despite the
+startup error ✅" and concluded the error was harmless. That was wrong, it stood for
+several days, and it is why the grasp was hunted everywhere except where the fault was.
+
+The measurements below are real. The conclusion drawn from them was not: they are
+fingertip separations in FREE AIR, and a linkage that moves correctly with nothing
+between the pads tells you nothing about whether it can hold something. Measured on the
+bench (`tools/lab`, `tools/jawtest.py`) with a book actually between the jaws, the
+closing jaws pass straight through it — see §1b.
 
 `erc_bringup` logs this at every startup, in red:
 
@@ -17,9 +27,44 @@ support mimic constraints, so no constraint will be created.
 
 The gripper is a linkage: one actuated joint (`gripper_left_finger_joint`) with the rest
 of the finger joints declared as mimics. DART does not implement mimic constraints, so the
-warning is real — and it looked like it might make grasping impossible.
+warning is real — and it makes grasping impossible.
 
-**It does not.** Measured fingertip separation (TF distance between
+The linkage is therefore not simulated at all: no constraint exists. What keeps the
+fingers together is `gz_ros2_control`, which notices the mimic parameters in the
+`<ros2_control>` block — the mimic joints declare no command or state interface, only
+these:
+
+```xml
+<joint name="gripper_left_inner_finger_left_joint">
+  <param name="mimic">gripper_left_finger_joint</param>
+  <param name="multiplier">-8.28</param>
+</joint>
+```
+
+and, every update, servos each one towards where the leader says it should be
+(`gz_system.cpp`, "set values of all mimic joints with respect to mimicked joint"):
+
+```cpp
+double position_error = position_mimic_joint - position_mimicked_joint * multiplier;
+double velocity_sp    = -1.0 * position_error * update_rate;
+// ... written to sim::components::JointVelocityCmd
+```
+
+So the fingers are **not** teleported, and an earlier note here that said they were is
+wrong. They are velocity-servoed, through exactly the same `JointVelocityCmd` path a real
+position-commanded joint takes.
+
+That is the actual fault, and it is a narrower one. `JointVelocityCmd` asks the engine to
+*make the joint move at this velocity*, and the engine will spend whatever force that
+takes. A book between the pads does not stop the joint; it just raises the price, and
+nobody is checking the price. The gain makes it worse — `update_rate` is the full
+controller rate, so a millimetre of tracking error asks for a very large velocity.
+
+The consequence for grasping is the same either way: nothing in the finger chain
+generates a bounded contact force, which is also why the fingers visibly pass through each
+other.
+
+Measured fingertip separation (TF distance between
 `gripper_left_fingertip_left_link` and `gripper_left_fingertip_right_link`):
 
 | `gripper_left_finger_joint` | Fingertip span |
@@ -30,9 +75,55 @@ warning is real — and it looked like it might make grasping impossible.
 
 Close to linear: `span ≈ 0.028 + 0.82 × joint`.
 
-**A book is 30 mm thick and the closed span is 28 mm**, so the gripper closes past the book
-and can clamp it. Open at 0.040 gives 60.5 mm — twice the book thickness, ample clearance
-for approaching.
+**A book is 30 mm thick and the closed span is 28 mm.** This was read as "the gripper
+closes past the book and can clamp it". It is the opposite: closing past the book is the
+fault. A jaw that can reach 28 mm around a 30 mm object has gone through 2 mm of it.
+
+Open at 0.040 gives 60.5 mm — twice the book thickness, and that part is still useful:
+there is ample clearance for approaching.
+
+### 1b. The bench measurement, on the two engines
+
+`tools/lab up <engine>` then `tools/in-sim jawtest.py`. The test needs no planning, no
+approach and no camera: open the jaws, teleport the book to the midpoint between the
+fingertips, close, stop holding it, and see whether it falls.
+
+| | dartsim (default) | bullet-featherstone |
+|---|---|---|
+| mimic constraints refused at startup | 1 (per gripper) | **0** |
+| jaws open | 73.3 mm | 75.9 mm |
+| finger commanded to 0.000, reached | **−0.0004** | **0.0535** |
+| jaws around a 30.0 mm book closed to | **27.4 mm** | 70.8 mm |
+| book, once released | fell to the floor | not carried |
+| real-time factor, same world | 0.25 | **0.67–1.00** |
+
+Under dartsim the finger reaches its commanded position as if the book were not there.
+Under bullet-featherstone it **stalls at 0.0535** — it hits the book and cannot continue,
+which is a contact force, which is the thing that has never existed in this simulation.
+
+Note what that implies about the remedy. The problem is not that the fingers are
+positioned by fiat; it is that they are velocity-servoed with no force ceiling. Anything
+that puts a ceiling back — a real mimic constraint under bullet, or an effort command
+interface on the gripper joints — should change this number.
+
+That is the mechanism confirmed from both directions. Neither engine has yet carried a
+book: bullet stalls too early to close on it, and the bullet bench is not yet stable
+enough to iterate on (§1c).
+
+### 1c. bullet-featherstone is not a free swap
+
+Worth knowing before reaching for it:
+
+  - `gz_ros2_control` [issue #440](https://github.com/ros-controls/gz_ros2_control/issues/440)
+    reports controllers failing to activate under bullet-featherstone. **Not reproduced
+    here** — all seven activate in 12 s. The one time it looked like it did, the cause was
+    a stale `controller_manager` from the previous bench that had not finished dying;
+    `tools/lab` now waits for the processes to go rather than sleeping and hoping.
+  - The world alone runs indefinitely. With the robot in it, `gz sim` has died on its own
+    a few minutes in, twice, with nothing in the launch log. Not yet characterised.
+  - `/world/erc_world/dynamic_pose/info` only carries models that are MOVING. Under
+    dartsim everything jitters enough to keep publishing; a settled bullet world can go
+    silent on that topic, and several tools here read it — including `sim_grasp_fix`.
 
 Working values for the grasp:
 
@@ -368,9 +459,11 @@ Gazebo, and it is well documented.
     gripper_left_inner_finger_*  revolute,  mimic of the above x -8.28, effort=0.1
 
 Only the prismatic joint is actuated. Every link that actually touches the book is a
-**mimic** joint following it through a passive four-bar, and mimic joints are enforced as
-constraints rather than driven through contact. So a book between the pads has nothing to
-push back against: the driven joint goes where it is told and the linkage follows.
+**mimic** joint following it through a passive four-bar. Under dartsim those mimics are
+not enforced by the physics at all — the engine refuses to create the constraints and says
+so at every startup (§1) — so the fingers are moved by `gz_ros2_control` writing their
+positions. A book between the pads has nothing to push back against: the driven joint goes
+where it is told and the linkage follows.
 
 `gz_ros2_control` turns a position command into a velocity command --
 `target_vel = -position_proportional_gain * error`, see the comment in
@@ -389,10 +482,17 @@ remedies in general use are
      fixed joint between them and stop closing. In Gazebo Harmonic the mechanism is the
      `DetachableJoint` system; in Gazebo Classic it was `gazebo_grasp_plugin`.
 
+  3. **switch to bullet-featherstone**, which is the only Gazebo Harmonic engine that
+     implements mimic constraints — measured in §1b, and the only one of the three that
+     addresses the cause rather than working around it.
+
 References:
   - https://answers.ros.org/question/352107/  (object slips from gripper in Gazebo)
   - https://github.com/JenniferBuehler/gazebo-pkgs/issues/9  (grasp fix, why it exists)
   - http://docs.ros.org/en/indigo/api/gazebo_grasp_plugin/html/classgazebo_1_1GazeboGraspFix.html
+  - https://github.com/ros-controls/gz_ros2_control/issues/340  (the same mimic error)
+  - https://github.com/gazebosim/gz-physics/pull/517  (mimic constraints, bullet-featherstone only)
+  - https://github.com/ros-controls/gz_ros2_control/issues/440  (controllers under bullet-featherstone)
 
 ### What this means for the measurements already taken
 

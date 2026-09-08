@@ -37,6 +37,23 @@ rtf() {
 cmd="${1:-status}"
 shift || true
 
+teardown() {
+    docker exec "$CONTAINER" bash -c '
+        for p in grasp_lab.launch.py simulation.launch.py solution.launch.py \
+                 moveit.launch.py sim_grasp_fix "gz sim" controller_manager spawner; do
+            pkill -f "$p" 2>/dev/null
+        done
+        true' 2>/dev/null
+    for i in $(seq 1 20); do
+        left=$(docker exec "$CONTAINER" bash -c \
+            'ps -eo args | grep -v grep | grep -c "gz sim"' 2>/dev/null || echo 0)
+        [ "${left:-0}" = "0" ] && return 0
+        [ "$i" = "10" ] && docker exec "$CONTAINER" bash -c 'pkill -9 -f "gz sim"' 2>/dev/null
+        sleep 1
+    done
+    echo "warning: something is still running in the container" >&2
+}
+
 case "$cmd" in
 up)
     engine="${1:-dart}"
@@ -45,15 +62,18 @@ up)
         *) die "engine must be dart or bullet, not $engine" ;;
     esac
 
-    # Anything already talking to a world will fight this one for the same topics.
-    docker exec "$CONTAINER" bash -c '
-        pkill -f "grasp_lab.launch.py";
-        pkill -f "simulation.launch.py";
-        pkill -f "solution.launch.py";
-        pkill -f "moveit.launch.py";
-        pkill -f "[s]im_grasp_fix";
-        pkill -f "gz sim";
-        sleep 3; true' 2>/dev/null
+    # Anything already talking to a world will fight this one for the same topics, and
+    # a HALF-dead one is worse than a live one. Bringing the bench up three seconds after
+    # a pkill once produced this, which reads as a physics engine fault and is not:
+    #
+    #     [WARN]  Controller already loaded, skipping load_controller
+    #     [ERROR] Could not configure controller with name 'arm_left_controller'
+    #             because no controller with this name exists
+    #
+    # The spawners had found the OUTGOING controller_manager, loaded into it, and then
+    # asked the incoming one to configure what it had never loaded. So: kill, then wait
+    # until the processes are actually gone, rather than sleeping and hoping.
+    teardown
 
     echo "=== bringing the bench up on $engine physics"
     docker exec -d \
@@ -74,7 +94,7 @@ up)
     echo -n "waiting for the controllers"
     for i in $(seq 1 40); do
         if docker exec "$CONTAINER" bash -c \
-            "grep -q 'Configured and activated joint_state_broadcaster' $LOG 2>/dev/null"; then
+            "grep -q 'Configured and activated' $LOG 2>/dev/null"; then
             echo " up after ${i}x3 s"
             break
         fi
@@ -96,9 +116,7 @@ up)
     ;;
 
 down)
-    docker exec "$CONTAINER" bash -c '
-        pkill -f "grasp_lab.launch.py"; pkill -f "[s]im_grasp_fix"; pkill -f "gz sim";
-        sleep 2; true' 2>/dev/null
+    teardown
     echo "bench down"
     ;;
 
