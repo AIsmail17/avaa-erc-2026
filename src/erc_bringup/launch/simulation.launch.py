@@ -251,14 +251,46 @@ def generate_launch_description():
     with open(book_sdf_path, 'r') as f:
         book_sdf_template = f.read()
 
-    # One substituted temp file per colour (identical books share SDF)
-    tmp_book_paths = {}
-    for colour_name, rgba in BOOK_COLOURS.items():
-        coloured_sdf = book_sdf_template.replace('BOOK_COLOUR_PLACEHOLDER', rgba)
-        tmp_path = f'/tmp/erc_book_{colour_name}.sdf'
+    # A detachable joint per book, so a grasp can be made to hold.
+    #
+    # This is simulation scaffolding, not part of the solution, and it is here rather
+    # than in avaa_solution for that reason: Phase 2 drops it by not launching the node
+    # that drives it, and nothing in the solution changes.
+    #
+    # It exists because this gripper cannot hold anything. gripper_left_finger_joint is
+    # position-commanded and every link that touches a book is a mimic joint following
+    # it through a passive four-bar, so a book between the pads has nothing to push
+    # back against -- measured on 2026-09-08, the jaws closing to 28.7 mm around a book
+    # 30.0 mm thick while the book never moved. MANIPULATION.md has the detail and the
+    # references; it is a documented Gazebo limitation with two known remedies, and
+    # this is the one that fits the time.
+    #
+    # One temp file PER BOOK rather than per colour, because the attach and detach
+    # topics have to name one book. Sharing a file per colour would have one attach
+    # message pick up all four books of that colour.
+    def with_detachable_joint(sdf, book_name):
+        plugin = f"""
+    <plugin filename="gz-sim-detachable-joint-system"
+            name="gz::sim::systems::DetachableJoint">
+      <parent_link>book_base_link</parent_link>
+      <child_model>tiago_pro</child_model>
+      <child_link>gripper_left_grasping_link</child_link>
+      <attach_topic>/grasp_fix/{book_name}/attach</attach_topic>
+      <detach_topic>/grasp_fix/{book_name}/detach</detach_topic>
+      <output_topic>/grasp_fix/{book_name}/state</output_topic>
+      <suppress_child_warning>true</suppress_child_warning>
+    </plugin>
+  </model>"""
+        return sdf.replace('</model>', plugin, 1)
+
+    def book_sdf_for(colour_name, book_name):
+        sdf = book_sdf_template.replace(
+            'BOOK_COLOUR_PLACEHOLDER', BOOK_COLOURS[colour_name])
+        sdf = with_detachable_joint(sdf, book_name)
+        tmp_path = f'/tmp/erc_{book_name}.sdf'
         with open(tmp_path, 'w') as f:
-            f.write(coloured_sdf)
-        tmp_book_paths[colour_name] = tmp_path
+            f.write(sdf)
+        return tmp_path
 
     # ── Spawn books ──
     book_spawn_nodes = []
@@ -268,8 +300,8 @@ def generate_launch_description():
 
         for i, row in enumerate(ACTIVE_ROWS):
             colour_name = colours_this_column[i]
-            tmp_path = tmp_book_paths[colour_name]
             book_name = f'book_col_{col + 1}_row_{row + 1}_{colour_name}'
+            tmp_path = book_sdf_for(colour_name, book_name)
 
             y = SHELF_Y + COLUMN_Y_OFFSETS[col] + random.uniform(-COLUMN_JITTER_RANGE, COLUMN_JITTER_RANGE)
             z = SHELF_Z + ROW_FLOOR_Z_OFFSETS[row]
@@ -353,5 +385,6 @@ def generate_launch_description():
                                           '/head_front_camera/depth/points)'),
         gazebo_gui, gazebo_headless,
         rsp, bridge, head_camera_bridge, contact_bridge, spawn_tiago_pro, controllers, gripper_clamp,
+        grasp_fix,
         spawn_books, spawn_number_markers, *depth_cloud_actions,
     ])
