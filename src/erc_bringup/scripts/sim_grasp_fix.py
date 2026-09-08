@@ -148,41 +148,48 @@ class GraspFix(Node):
         raw = gz("topic", "-e", "-t", "/world/%s/dynamic_pose/info" % self.world, "-n", "1")
         if not raw:
             return
-        poses, name, fields = {}, None, {}
+        # Position and orientation apart, because they share the key names x, y and z.
+        #
+        # A flat parse that took the first x, y, z after a name got the position right
+        # and threw the orientation away, so the base heading had to come from odom --
+        # and odom's frame is only world-aligned if the robot spawned at yaw zero. It
+        # does not. The composed gripper position was out by roughly the arm's own
+        # extension: the nearest book to it measured 667 mm away while the jaws were
+        # closed around one.
+        poses, name, section, fields = {}, None, None, {}
         for line in raw.splitlines():
             line = line.strip()
             if line.startswith('name: "'):
-                if name and len(fields) >= 3:
+                if name and "px" in fields:
                     poses[name] = dict(fields)
-                name, fields = line.split('"')[1], {}
-            elif name and ":" in line:
+                name, section, fields = line.split('"')[1], None, {}
+            elif line.startswith("position"):
+                section = "p"
+            elif line.startswith("orientation"):
+                section = "q"
+            elif name and section and ":" in line:
                 key, _, value = line.partition(":")
                 key = key.strip()
-                if key in ("x", "y", "z") and key not in fields:
-                    try:
-                        fields[key] = float(value)
-                    except ValueError:
-                        pass
-        if name and len(fields) >= 3:
+                if key in ("x", "y", "z", "w"):
+                    tag = section + key
+                    if tag not in fields:
+                        try:
+                            fields[tag] = float(value)
+                        except ValueError:
+                            pass
+        if name and "px" in fields:
             poses[name] = dict(fields)
 
-        books = {k: (v["x"], v["y"], v["z"]) for k, v in poses.items()
-                 if k.startswith("book_") and {"x", "y", "z"} <= set(v)}
+        books = {k: (v["px"], v["py"], v["pz"]) for k, v in poses.items()
+                 if k.startswith("book_") and {"px", "py", "pz"} <= set(v)}
         if books:
             self.books = books
         robot = poses.get("tiago_pro")
-        if robot and {"x", "y", "z"} <= set(robot):
-            self.robot_pose = (robot["x"], robot["y"], robot["z"])
-
-    def _base_yaw(self):
-        """The base heading. odom rotation is trustworthy; odom position is not."""
-        try:
-            tf = self.buf.lookup_transform("odom", "base_link", rclpy.time.Time())
-        except Exception:  # noqa: BLE001
-            return None
-        q = tf.transform.rotation
-        return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                          1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        if robot and {"px", "py", "pz", "qx", "qy", "qz", "qw"} <= set(robot):
+            yaw = math.atan2(
+                2.0 * (robot["qw"] * robot["qz"] + robot["qx"] * robot["qy"]),
+                1.0 - 2.0 * (robot["qy"] ** 2 + robot["qz"] ** 2))
+            self.robot_pose = (robot["px"], robot["py"], robot["pz"], yaw)
 
     def _grasp_link_world(self):
         """Where the grasping link is, in world coordinates, and the base heading.
@@ -196,13 +203,13 @@ class GraspFix(Node):
             tf = self.buf.lookup_transform("base_link", GRASP_LINK, rclpy.time.Time())
         except Exception:  # noqa: BLE001
             return None, None
-        base, yaw = self.robot_pose, self._base_yaw()
-        if base is None or yaw is None:
+        if self.robot_pose is None:
             return None, None
+        bx, by, bz, yaw = self.robot_pose
         t = tf.transform.translation
-        return (base[0] + t.x * math.cos(yaw) - t.y * math.sin(yaw),
-                base[1] + t.x * math.sin(yaw) + t.y * math.cos(yaw),
-                base[2] + t.z), yaw
+        return (bx + t.x * math.cos(yaw) - t.y * math.sin(yaw),
+                by + t.x * math.sin(yaw) + t.y * math.cos(yaw),
+                bz + t.z), yaw
 
     # ------------------------------------------------------------------ the trigger
     def _on_gripper(self, msg: JointTrajectory):
