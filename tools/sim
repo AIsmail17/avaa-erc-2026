@@ -24,6 +24,45 @@ red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw()  { printf '\033[33m%s\033[0m\n' "$*"; }
 
+# Can we talk to Docker at all?
+#
+# Every check in this file asks Docker a question and sends the errors to /dev/null, so
+# "permission denied on /var/run/docker.sock" comes back looking exactly like "the
+# container is not running". On 2026-09-08 that sent `sim restart` down the path of
+# creating a container -- destroying the build -- while the real container had been up
+# for seventeen hours, and the only thing wrong was the shell.
+#
+# The usual cause is a session older than the docker group. Adding a user to a group
+# changes /etc/group immediately and changes nothing about sessions already logged in,
+# so an ssh login made afterwards works while the desktop session started that morning
+# does not, on the same machine, as the same user.
+docker_reachable() {
+    docker version >/dev/null 2>&1
+}
+
+require_docker() {
+    docker_reachable && return 0
+    red "Cannot talk to Docker."
+    echo
+    if docker version 2>&1 | grep -qi "permission denied"; then
+        if id -nG | tr " " "\n" | grep -qx docker; then
+            echo "  This shell is in the docker group and still cannot reach the socket."
+            echo "  Check the daemon is up:  systemctl status docker"
+        else
+            echo "  This shell is not in the docker group, though the account may well be:"
+            printf "      account is in: %s\n" "$(groups "$USER" 2>/dev/null | cut -d: -f2-)"
+            printf "      this shell has: %s\n" "$(id -nG)"
+            echo
+            echo "  A session started before the group was granted never picks it up."
+            echo "  For this terminal only:   newgrp docker"
+            echo "  For good:                 log out of the desktop session and back in"
+        fi
+    else
+        echo "  Is the daemon running?  systemctl status docker"
+    fi
+    return 1
+}
+
 container_running() {
     [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]
 }
@@ -49,6 +88,7 @@ workspace_built() {
 }
 
 ensure_container() {
+    require_docker || return 1
     if container_running; then
         # Also here, not only on the branch that starts one. A container that was
         # already up skipped this entirely, so the tuning only ever happened on the
@@ -420,6 +460,7 @@ cmd_shell() {
 }
 
 cmd_status() {
+    require_docker || return 1
     # Which machine is this? The header read "WSL" everywhere, which on the NUC is
     # false and made a native Linux box look like it was running through a
     # compatibility layer.
