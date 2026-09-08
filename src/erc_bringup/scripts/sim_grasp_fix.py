@@ -59,8 +59,10 @@ rescue a bad one: a run that would have missed the book should still fail, or th
 numbers stop meaning anything.
 """
 import math
+import queue
 import subprocess
 import sys
+import threading
 
 import rclpy
 from rclpy.node import Node
@@ -98,6 +100,7 @@ class GraspFix(Node):
         self.held = None
         self.books = {}
         self.robot_pose = None
+        self.attach_asked = False
         self.buf = Buffer()
         self.listener = TransformListener(self.buf, self)
         self.create_subscription(
@@ -125,9 +128,19 @@ class GraspFix(Node):
         # executor never gets back to the gripper subscription that is the entire point
         # of the node. Three sweeps, spaced, is enough: the books all spawn within a
         # second or two of each other.
-        self.sweeps_left = 3
-        self.create_timer(4.0, self._sweep)
-        self._release_everything()
+        # Every call to gz is a subprocess, and a subprocess in a callback stops the
+        # node dead. Measured: a sweep timer set to 4 seconds fired 25 and 31 seconds
+        # apart, and the gripper subscription -- the entire point of this node -- was
+        # never serviced at all across a whole run. The grasp clamped, the grip check
+        # failed it honestly, and nothing here had so much as seen a gripper command.
+        #
+        # So the executor now does nothing but read messages and put work on a queue.
+        # One worker thread owns every conversation with the simulator.
+        self.work = queue.Queue()
+        self.worker = threading.Thread(target=self._serve, daemon=True)
+        self.worker.start()
+        for _ in range(3):
+            self.work.put(("sweep", None))
         self.get_logger().info(
             "simulation grasp fix up: a close within %.0f mm of a book will attach it"
             % (self.reach * 1000))
@@ -157,17 +170,27 @@ class GraspFix(Node):
             "released %d books that the detachable joints had welded on at spawn"
             % released)
 
-    def _sweep(self):
-        """Release anything newly welded. Runs a few times, then stops for good."""
-        if self.sweeps_left <= 0 or self.held is not None:
-            return
-        self.sweeps_left -= 1
-        names = self._book_names()
-        for name in names:
-            gz("topic", "-t", "/grasp_fix/%s/detach" % name,
-               "-m", "gz.msgs.Empty", "-p", "unused: true")
-        self.get_logger().info(
-            "sweep released %d books; %d sweep(s) left" % (len(names), self.sweeps_left))
+    def _serve(self):
+        """The only thread that ever runs a gz command."""
+        while True:
+            job, payload = self.work.get()
+            try:
+                if job == "sweep":
+                    names = self._book_names()
+                    for name in names:
+                        gz("topic", "-t", "/grasp_fix/%s/detach" % name,
+                           "-m", "gz.msgs.Empty", "-p", "unused: true")
+                    self.get_logger().info("sweep released %d books" % len(names))
+                elif job == "poses":
+                    self._read_poses()
+                elif job == "attach":
+                    self._do_attach()
+                elif job == "detach":
+                    gz("topic", "-t", "/grasp_fix/%s/detach" % payload,
+                       "-m", "gz.msgs.Empty", "-p", "unused: true")
+                    self.get_logger().info("released %s" % payload)
+            except Exception as exc:  # noqa: BLE001 - a worker must not die quietly
+                self.get_logger().error("grasp fix worker: %s" % exc)
 
     def _book_names(self):
         """Every book the simulator has a detach topic for."""
@@ -181,7 +204,12 @@ class GraspFix(Node):
 
     # ---------------------------------------------------------------- ground truth
     def _refresh_books(self):
-        """Read every book pose from the simulator. They do not move until grasped."""
+        """Ask the worker for fresh poses. Never blocks."""
+        if self.work.qsize() < 3:
+            self.work.put(("poses", None))
+
+    def _read_poses(self):
+        """Read every book pose from the simulator. Worker thread only."""
         raw = gz("topic", "-e", "-t", "/world/%s/dynamic_pose/info" % self.world, "-n", "1")
         if not raw:
             return
@@ -267,18 +295,25 @@ class GraspFix(Node):
             "currently holding %s"
             % (asked, CLOSING_BELOW, OPENING_ABOVE, self.held or "nothing"),
             throttle_duration_sec=2.0)
-        if asked <= CLOSING_BELOW and self.held is None:
-            self._try_attach()
+        if asked <= CLOSING_BELOW and self.held is None and not self.attach_asked:
+            self.attach_asked = True
+            self.work.put(("attach", None))
         elif asked >= OPENING_ABOVE and self.held is not None:
-            self._detach()
+            name, self.held = self.held, None
+            self.attach_asked = False
+            self.books = {}
+            self.work.put(("detach", name))
 
-    def _try_attach(self):
+    def _do_attach(self):
         here = self._grasp_link_world()
         if here is None:
             self.get_logger().warn("no transform to %s, so nothing to attach" % GRASP_LINK)
+            self.attach_asked = False
             return
         if not self.books:
-            self._refresh_books()
+            # Already on the worker thread, so read directly rather than queueing a
+            # job behind ourselves and then finding the books still empty.
+            self._read_poses()
         best, best_gap = None, None
         for name, (x, y, z) in self.books.items():
             gap = math.dist(here, (x, y, z))
@@ -290,6 +325,7 @@ class GraspFix(Node):
             self.get_logger().warn(
                 "jaws closed and this knows of no books at all, so nothing can be "
                 "attached. %d pose(s) last read from the simulator." % len(self.books))
+            self.attach_asked = False
             return
         if best_gap > self.reach:
             self.get_logger().info(
@@ -302,13 +338,6 @@ class GraspFix(Node):
         self.held = best
         self.get_logger().info(
             "attached %s, %.0f mm from the grasping link" % (best, best_gap * 1000))
-
-    def _detach(self):
-        gz("topic", "-t", "/grasp_fix/%s/detach" % self.held,
-           "-m", "gz.msgs.Empty", "-p", "unused: true")
-        self.get_logger().info("released %s" % self.held)
-        self.held = None
-        self.books = {}
 
     def _report(self):
         self.pub_state.publish(String(data=self.held or ""))
