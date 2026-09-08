@@ -100,11 +100,10 @@ Use `tools/drift.py` (per simulated second, prints the RTF beside the answer) an
 | Annotated images | ✅ written, timestamped |
 | Mission sequencing | ✅ new; one state machine owns the phase order and the trial clock |
 | `solution.launch.py` | ✅ now starts move_group, the grasp and the delivery too |
-| Approach — search | ✅ 2026-09-07: finds the marker in 29 s where it used to time out at 150 |
-| Approach — centre | ✅ 2026-09-07: reaches the column and hands over to the drive |
-| Approach — acquire, square | ⚠️ **completed on 2026-09-07; squared to +0.2 deg, 6 mm off the book** |
-| Arm kinematics + IK | ✅ exact to 0.7 mm; all four rows reachable |
-| Grasp controller | ✅ **2026-09-07: reached in, servoed to 1 mm, clamped, lifted, withdrew** |
+| Approach — end to end | ✅ 2026-09-08: **three consecutive clean runs, 53.4 / 56.3 / 61.9 s** to hand-over |
+| Arm kinematics + IK | ✅ exact to 0.7 mm; holds all four rows to within 6 mm in open air |
+| Grasp — reach and servo | ✅ reaches into the shelf, clamps, lifts, hands over to delivery |
+| Grasp — actually holding it | ❌ **the jaws close on air**; see below |
 | Place in bin | ⚠️ **written, never run with a book in the gripper** |
 | Video (D2) | ❌ not started |
 | Report (D3) | ❌ not started |
@@ -158,6 +157,46 @@ red book in view at close range" with the book in the middle of the frame, and t
 approach held at 0.95 m refusing to drive in on the LiDAR alone -- correctly, by its own
 rule. Aspect, not area, is what separates a book from the bin: 1.75-4.33 against the
 bin's 0.49.
+
+---
+
+## 2026-09-08 — the approach is done; the grasp closes on nothing
+
+**The approach now works.** Three consecutive runs handed over to the grasp in 53.4,
+56.3 and 61.9 simulated seconds, on rows 4, 3 and 4. A week ago it timed out searching.
+What fixed it, in order: aiming the head where the markers actually are, holding the
+marker reader to its previous answer, refusing book fixes that are on the wrong shelf,
+capping forward speed by the sideways error still to be corrected, and letting a back-off
+finish instead of resetting every 35 degrees of turn. Each has a commit with its
+measurement.
+
+**The grasp reaches, clamps, lifts and withdraws — around nothing.** After a clamp that
+reported success and a delivery that carried an empty gripper to the bin:
+
+    both finger joints        0.0010  ->  span 28.7 mm
+    the book                          30.0 mm thick
+    every book in Gazebo      still on its shelf at x = 2.900
+
+A 30 mm book cannot be inside 28.7 mm of jaw. The clamp now checks that span before
+lifting and fails the grasp if the jaws met each other, so this cannot be reported as a
+success again.
+
+### What is known about the miss
+
+The servo judges arrival by the grasping frame, and the pads are 30 mm behind it —
+confirmed in flight, matching the 29.7 mm this project has always assumed. The frame
+consistently stops about 45 mm short in depth and 45 mm low in height, with **zero IK
+solves rejected**, and the arm was measured the same day holding every row to within 6 mm
+in open air. So it is not the arm.
+
+The pads-on-the-book check reported the pads 65 mm into a 160 mm book when they were not
+in it at all. That number is measured from **perception's estimate of the book face**,
+which `PERCEPTION.md` records as reading the front face about 35 mm nearer than the
+centre — so a check built on it can be self-consistent and still wrong.
+
+**The next measurement is the pad midpoint against Gazebo ground truth at the moment of
+clamping**, not against anything perception produced. That single number says whether the
+face estimate is wrong or the arm is stopping short, and those have different fixes.
 
 ---
 
