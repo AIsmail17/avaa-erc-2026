@@ -105,9 +105,45 @@ class GraspFix(Node):
         self.pub_state = self.create_publisher(String, "/grasp_fix/holding", 10)
         self.create_timer(5.0, self._refresh_books)
         self.create_timer(1.0, self._report)
+        self._release_everything()
         self.get_logger().info(
             "simulation grasp fix up: a close within %.0f mm of a book will attach it"
             % (self.reach * 1000))
+
+    def _release_everything(self):
+        """Detach every book, because DetachableJoint starts ATTACHED.
+
+        This is not defensive tidying. The plugin welds itself the moment it finds its
+        child model, so all twenty books weld to the fingertip the instant they spawn --
+        and twenty fixed joints to books bolted on a shelf pin the robot where it stands.
+
+        That is exactly what happened on 2026-09-08. The base stopped moving: a drive
+        commanded to a book reported "at [-0.58, 1.06] yaw -96 deg, 1.71 m to go" three
+        times running without shifting a centimetre, and two runs before that failed in
+        the search having seen 0 markers across 123 tallies, because the robot had never
+        turned. It looked like a perception regression and it was a parking brake.
+
+        So: release everything at startup, and hold nothing until a grasp asks for it.
+        """
+        released = 0
+        for name in self._book_names():
+            gz("topic", "-t", "/grasp_fix/%s/detach" % name,
+               "-m", "gz.msgs.Empty", "-p", "unused: true")
+            released += 1
+        self.held = None
+        self.get_logger().info(
+            "released %d books that the detachable joints had welded on at spawn"
+            % released)
+
+    def _book_names(self):
+        """Every book the simulator has a detach topic for."""
+        raw = gz("topic", "-l")
+        names = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("/grasp_fix/") and line.endswith("/detach"):
+                names.append(line[len("/grasp_fix/"):-len("/detach")])
+        return names
 
     # ---------------------------------------------------------------- ground truth
     def _refresh_books(self):
