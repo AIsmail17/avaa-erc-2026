@@ -54,8 +54,30 @@ def main():
     arm=n.create_publisher(JointTrajectory,"/arm_left_controller/joint_trajectory",10)
     torso=n.create_publisher(JointTrajectory,"/torso_controller/joint_trajectory",10)
     grip=n.create_publisher(JointTrajectory,"/gripper_left_controller/joint_trajectory",10)
-    t=time.time()
-    while time.time()-t<8: rclpy.spin_once(n,timeout_sec=0.1)
+    # Every wait here is in SIMULATED seconds, and that is the whole difference
+    # between this tool working and this tool lying.
+    #
+    # It was time.time(). This tool teleports a book, and a teleport takes the real-time
+    # factor from 0.4 to somewhere near 0.04 permanently -- STATE.md opens with that --
+    # so its thirty-five second observation window was about 1.4 seconds of robot time,
+    # against a gripper trajectory commanded over ten. On 2026-09-08 it reported the
+    # finger sitting at 0.0700 and concluded "NOT HELD -- it stayed behind", when the
+    # jaws had barely been asked to move. Stepped through the same controller with waits
+    # on the simulator clock, the same joint goes to -0.0010, which is fully closed.
+    n.set_parameters([rclpy.parameter.Parameter(
+        "use_sim_time", rclpy.Parameter.Type.BOOL, True)])
+
+    def sim_now():
+        return n.get_clock().now().nanoseconds * 1e-9
+
+    def sim_wait(secs):
+        while rclpy.ok() and sim_now() == 0.0:
+            rclpy.spin_once(n, timeout_sec=0.1)
+        end = sim_now() + secs
+        while rclpy.ok() and sim_now() < end:
+            rclpy.spin_once(n, timeout_sec=0.05)
+
+    sim_wait(8)
 
     def send(pub,names,vals,secs):
         tr=JointTrajectory(); tr.joint_names=names
@@ -63,8 +85,7 @@ def main():
         p.time_from_start=Duration(sec=int(secs),nanosec=int((secs%1)*1e9))
         tr.points=[p]; pub.publish(tr)
     def wait(secs):
-        t=time.time()
-        while time.time()-t<secs: rclpy.spin_once(n,timeout_sec=0.1)
+        sim_wait(secs)
 
     print("posing the arm and opening the jaws fully...")
     send(torso,["torso_lift_joint"],[POSTURE[0]],16)
