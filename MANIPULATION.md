@@ -299,3 +299,53 @@ compliance, IK round-tripping and correct failure when out of reach. 45 tests in
    scoring item in the task; the placement motion deserves proportionate attention.
 4. **Confirm the row numbering direction** with the organisers before trusting row → height
    (see `ORGANISER_QUESTIONS.md`).
+
+---
+
+## The arm does not sag (2026-09-08)
+
+Measured with `tools/in-sim sagcheck.py`, robot parked 2.46 m from the shelf so every
+target is in open air, torso pinned as the grasp controller would pin it:
+
+| Row | Target z (base_link) | Torso | Reach | Est. torque | Miss at x = 0.83 |
+|---|---|---|---|---|---|
+| 1 | 1.391 | 0.350 | 78% | 94% | **4 mm** |
+| 2 | 1.061 | 0.350 | 70% | 131% | **3 mm** |
+| 3 | 0.731 | 0.304 | 74% | 122% | **6 mm** |
+| 4 | 0.401 | 0.000 | 75% | 123% | **4 mm** |
+
+**The arm holds every row to within 6 mm, at up to 131 per cent of estimated rated
+torque.** Sag is not a thing that happens here, and the torque estimate is not a
+predictor of anything — which matches the note above about it reading 6.6 Nm on a joint
+drawing 27.
+
+### What this corrects
+
+Earlier the same day, the same tool reported the arm settling 36 to 51 mm below the row-4
+target and that was written up as sag agreeing with a servo failure. It was wrong. The
+robot was parked 0.675 m from the shelf at the time, so targets at x = 0.75 and 0.83 in
+base_link were 75 to 155 mm INSIDE the shelf boards: the arm was not sagging, it was
+pressing against a shelf. The agreement with the servo was a coincidence.
+
+**Any sagcheck run with the robot in front of the shelf measures the shelf.** The tool
+checks postures against the planning scene, and the shelf is only in the planning scene
+while the grasp controller has put it there.
+
+### One artefact to know about
+
+The first x in each sweep reports a large miss (+80 mm in x, −330 mm in z) and the second
+does not. The pattern is identical at all four heights, which no real reach limit would
+be, and it is almost certainly the arm still travelling when the first sample is taken.
+Treat the first row of a sweep as a warm-up, or pass the x of interest twice.
+
+### So why did the row-4 servo fail?
+
+Not sag. On that run the servo reported "-3 mm depth, -8 mm sideways, -40 mm height after
+40 s, closest it came was 36 mm" with **zero IK solves rejected**, and the arm had already
+arrived at the pre-grasp +15 mm high. An arm that tracks free-air targets to 4 mm does not
+miss by 40 mm unless something is in the way, and by then the grasp has deliberately taken
+the shelf OUT of the planning scene so that the reach can be planned at all. Nothing is
+checking the final approach against the shelf it is reaching into.
+
+That is the open question for the bottom row, and it is a different question from the one
+that was being asked.
