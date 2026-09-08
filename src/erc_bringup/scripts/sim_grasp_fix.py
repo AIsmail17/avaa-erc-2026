@@ -89,6 +89,31 @@ def gz(*args, timeout=15):
         return ""
 
 
+def gz_publish_all(topics, timeout=15):
+    """Publish an empty message to many topics at once.
+
+    In series this took about 25 seconds for twenty books -- a process spawn each --
+    and that is 25 seconds during which every book is welded to a fingertip while the
+    robot is trying to tuck its arms and stand still. Started together they finish in
+    about one.
+    """
+    running = []
+    for topic in topics:
+        try:
+            running.append(subprocess.Popen(
+                ["gz", "topic", "-t", topic, "-m", "gz.msgs.Empty",
+                 "-p", "unused: true"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        except Exception:  # noqa: BLE001
+            pass
+    for process in running:
+        try:
+            process.wait(timeout=timeout)
+        except Exception:  # noqa: BLE001
+            process.kill()
+    return len(running)
+
+
 class GraspFix(Node):
     def __init__(self):
         super().__init__("sim_grasp_fix")
@@ -177,10 +202,9 @@ class GraspFix(Node):
             try:
                 if job == "sweep":
                     names = self._book_names()
-                    for name in names:
-                        gz("topic", "-t", "/grasp_fix/%s/detach" % name,
-                           "-m", "gz.msgs.Empty", "-p", "unused: true")
-                    self.get_logger().info("sweep released %d books" % len(names))
+                    fired = gz_publish_all(
+                        ["/grasp_fix/%s/detach" % name for name in names])
+                    self.get_logger().info("sweep released %d books" % fired)
                 elif job == "poses":
                     self._read_poses()
                 elif job == "attach":
