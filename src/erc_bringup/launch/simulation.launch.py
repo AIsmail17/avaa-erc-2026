@@ -80,9 +80,10 @@ def generate_launch_description():
 
     # ── The book layout, decided here because two things need it ──
     #
-    # It used to be chosen inside the spawn loop further down. The detachable joints
-    # below have to name each book, and they go into the robot description, which is
-    # built here -- so the names have to exist by now.
+    # It used to be chosen inside the spawn loop further down, and was lifted out when
+    # the detachable joints needed the names before the robot description was built.
+    # Those joints are gone; the layout stays here because having it in one place is
+    # better than having it buried in a spawn loop.
     book_layout = []
     for col in range(NUM_COLUMNS):
         colours_this_column = list(BOOK_COLOURS.keys())
@@ -92,52 +93,20 @@ def generate_launch_description():
             book_layout.append((col, row, colour_name,
                                 f'book_col_{col + 1}_row_{row + 1}_{colour_name}'))
 
-    # ── Detachable joints, one per book ──
+    # The detachable joints that used to be injected here are gone.
     #
-    # SIMULATION SCAFFOLDING. See scripts/sim_grasp_fix.py for why a simulated grasp
-    # needs help at all, and MANIPULATION.md for the measurement: this gripper is
-    # position-commanded through a passive four-bar of mimic joints, so a book between
-    # the pads has nothing to push back against and the jaws close straight through it.
+    # They worked -- they welded twenty books to a fingertip firmly enough to hold the
+    # whole robot still -- but DetachableJoint attaches itself as soon as it finds its
+    # child, so every book had to be released at spawn, and even released the twenty
+    # plugins left the base barely able to turn: quaternion z moved 0.04 degrees in ten
+    # seconds during a search that should sweep several revolutions. Four runs failed in
+    # the search with them in and none without.
     #
-    # On the ROBOT, not on the book. The first attempt put the plugin on each book with
-    # the robot as the child, and the plugin loaded, advertised its topics, subscribed,
-    # received the attach message -- verified by echoing the topic -- and welded nothing.
-    # Every documented use of DetachableJoint has the carrier as the parent and the
-    # payload as the child, a vehicle and its cargo, and a free rigid body is not a
-    # sensible parent for a large articulated robot.
-    #
-    # The child link is book_base_link, and the parent is a fingertip because
-    # gripper_left_grasping_link and gripper_left_base_link do not survive the URDF to
-    # SDF conversion: they are massless frames and Gazebo collapses them, so
-    # gz model -m tiago_pro -l lists only the finger chain.
-    # Off unless asked for.
-    #
-    # The joints went in while the approach was completing in 53 to 62 seconds three runs
-    # running, and after they went in the search failed four times over. The base was
-    # measured free -- commanded 0.35 rad/s it turned 78 degrees -- so they are probably
-    # not the cause, but "probably" is not good enough to leave sitting under every run.
-    # A known-good baseline is worth more than an unproven feature on top of one.
-    #
-    #     ros2 launch erc_bringup simulation.launch.py grasp_fix:=true
-    #
-    # Turn it on to work on the grasp, leave it off to trust the approach numbers.
-    joints = []
-    for _, _, _, book_name in book_layout if grasp_fix_wanted else []:
-        joints.append(f"""  <gazebo>
-    <plugin filename="gz-sim-detachable-joint-system"
-            name="gz::sim::systems::DetachableJoint">
-      <parent_link>gripper_left_fingertip_left_link</parent_link>
-      <child_model>{book_name}</child_model>
-      <child_link>book_base_link</child_link>
-      <attach_topic>/grasp_fix/{book_name}/attach</attach_topic>
-      <detach_topic>/grasp_fix/{book_name}/detach</detach_topic>
-      <output_topic>/grasp_fix/{book_name}/state</output_topic>
-      <suppress_child_warning>true</suppress_child_warning>
-    </plugin>
-  </gazebo>
-""")
-    robot_description = robot_description.replace(
-        '</robot>', ''.join(joints) + '</robot>', 1)
+    # scripts/sim_grasp_fix.py now holds a grasped book by setting its pose to follow
+    # the gripper, which adds nothing to the physics at all. See its docstring for the
+    # measurement that made that possible: set_pose on a BOOK is free, and the warning
+    # in STATE.md about it costing the real-time factor was measured teleporting the
+    # robot.
 
     # ── Gazebo Harmonic ──
     # GUI when headless:=false (default), server-only when headless:=true.
@@ -333,8 +302,8 @@ def generate_launch_description():
     with open(book_sdf_path, 'r') as f:
         book_sdf_template = f.read()
 
-    # One substituted temp file per colour. The detachable joints moved to the robot
-    # description above, so the books no longer need to be told apart here.
+    # One substituted temp file per colour. Books of the same colour are identical, so
+    # nothing here needs to tell them apart.
     tmp_book_paths = {}
     for colour_name, rgba in BOOK_COLOURS.items():
         coloured_sdf = book_sdf_template.replace('BOOK_COLOUR_PLACEHOLDER', rgba)
