@@ -246,6 +246,23 @@ def generate_launch_description():
              output='screen'),
     ])
 
+    # ── Simulation grasp fix ──
+    #
+    # Not part of the solution, and launched from here rather than from
+    # avaa_solution/solution.launch.py so it is obvious which side of the line it sits
+    # on. Phase 2 drops it by not launching it; nothing in the solution changes.
+    #
+    # See scripts/sim_grasp_fix.py for why a simulated grasp needs help at all: the
+    # gripper is position-commanded through a passive four-bar of mimic joints, so a
+    # book between the pads has nothing to push back against.
+    #
+    # After the books at 5 s, because it reads their poses.
+    grasp_fix = TimerAction(period=12.0, actions=[
+        Node(package='erc_bringup', executable='sim_grasp_fix.py',
+             parameters=[{'use_sim_time': True}],
+             output='screen'),
+    ])
+
     # ── Book colour substitution ──
     book_sdf_path = os.path.join(arena_dir, 'models', 'book', 'sdf', 'erc_book.sdf')
     with open(book_sdf_path, 'r') as f:
