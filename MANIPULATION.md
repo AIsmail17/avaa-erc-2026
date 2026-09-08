@@ -349,3 +349,58 @@ checking the final approach against the shelf it is reaching into.
 
 That is the open question for the bottom row, and it is a different question from the one
 that was being asked.
+
+---
+
+## Why the jaws close on air: a position-controlled gripper cannot close on an object (2026-09-08)
+
+Three clamps in twenty runs, every one on nothing, with the book never moving from
+x = 2.900 and the finger joint settling at 0.0010 -- a span of 28.7 mm around a book
+30.0 mm thick. The jaws did not stop at the book. They went through it.
+
+That is not a bug in this solution. It is what a position-commanded gripper does in
+Gazebo, and it is well documented.
+
+### The mechanism, from the robot description
+
+    gripper_left_finger_joint    prismatic, command=['position'], effort=10.0
+    gripper_left_fingertip_*     revolute,  mimic of the above x 8.28, effort=0.1
+    gripper_left_inner_finger_*  revolute,  mimic of the above x -8.28, effort=0.1
+
+Only the prismatic joint is actuated. Every link that actually touches the book is a
+**mimic** joint following it through a passive four-bar, and mimic joints are enforced as
+constraints rather than driven through contact. So a book between the pads has nothing to
+push back against: the driven joint goes where it is told and the linkage follows.
+
+`gz_ros2_control` turns a position command into a velocity command --
+`target_vel = -position_proportional_gain * error`, see the comment in
+`config/gazebo_controller_manager_cfg.yaml` -- which does not change the conclusion.
+
+### It is a known limitation, not a local mistake
+
+The ROS answers archive and the gazebo-pkgs issue tracker both describe it in the same
+terms: objects cannot be grasped through a position hardware interface, because the
+fingers move to the commanded position regardless of what is between them. The two
+remedies in general use are
+
+  1. **effort control on the gripper joints**, with PID tuning, so the fingers push
+     rather than teleport; and
+  2. **a grasp fix**: detect contact between the pads and the object, then create a
+     fixed joint between them and stop closing. In Gazebo Harmonic the mechanism is the
+     `DetachableJoint` system; in Gazebo Classic it was `gazebo_grasp_plugin`.
+
+References:
+  - https://answers.ros.org/question/352107/  (object slips from gripper in Gazebo)
+  - https://github.com/JenniferBuehler/gazebo-pkgs/issues/9  (grasp fix, why it exists)
+  - http://docs.ros.org/en/indigo/api/gazebo_grasp_plugin/html/classgazebo_1_1GazeboGraspFix.html
+
+### What this means for the measurements already taken
+
+The grip check added on 2026-09-08 -- fail the grasp when the closed span is more than
+2 mm under the book thickness -- is correct and will now fail EVERY grasp, because a
+position-controlled joint always reaches full closure. That is the honest reading and it
+should stay until the gripper can actually hold something.
+
+It also retires a line of investigation. The pads were being tracked to the millimetre
+against the book to find out why they missed, and on the last clamp they were 53 mm into
+a 160 mm book with the jaws open to 65 mm around a 30 mm spine. They were not missing.
