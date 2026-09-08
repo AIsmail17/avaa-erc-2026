@@ -225,11 +225,35 @@ If `colour camera` says SILENT, restart: `./tools/sim restart --fast --headless`
 
 ```bash
 uptime
-ps -eo pcpu,args --sort=-pcpu | head -5
+ps -eo pcpu,args --sort=-pcpu | head -8
 ```
 
-It has four cores and Gazebo wants most of one. A Minecraft server on this machine on
-2026-09-07 took 218% CPU and dropped the real-time factor from 0.42 to 0.15.
+The NUC is an Intel i7-7567U: **two physical cores, four threads**. Measured from /proc
+over twelve seconds during a live run on 2026-09-08, with the viewer attached:
+
+| | CPU |
+|---|---|
+| `gz sim` | 113% |
+| `mission` | 42% |
+| `grasp` (waiting its turn) | 39% |
+| `deliver` (waiting its turn) | 34% |
+| `perception` | 26% |
+| `approach` | 24% |
+| the rest | ~34% |
+| **total** | **312% of the 400% there is** |
+
+Load average was 6.6. When more is asked than there are threads to give, Gazebo gets less
+than it wants and the real-time factor falls with it -- 0.05 to 0.18 in that state against
+0.42 on an idle machine.
+
+Two of those are avoidable. The viewer is worth about half the speed on its own (0.248
+headless against 0.122 attached, measured back to back), and `grasp` and `deliver` between
+them burn most of a core while doing nothing but waiting for their phase, which is a fault
+in this solution rather than a limit of the machine.
+
+`ps` shows a truncated command and shifting columns; `gz sim` in particular reports itself
+as **ruby**, because Gazebo's launcher is a Ruby script. A careless reading of `top` here
+turned one Gazebo into four mystery processes.
 
 ---
 
