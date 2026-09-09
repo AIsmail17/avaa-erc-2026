@@ -61,7 +61,7 @@ from avaa_solution.moveit_client import MoveItClient, error_name
 # goes. They did once: the fixture tucked to one pose while the solution
 # used another, and every grasp after that was measured from a posture the
 # robot never actually drives in.
-from avaa_solution.approach_node import RIGHT_TUCK
+from avaa_solution.approach_node import RIGHT_TUCK, _wrap
 
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
@@ -147,6 +147,12 @@ GRIPPER_OPEN_MIN = 0.044
 GRIPPER_CLAMP = -0.0010
 
 DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
+
+# How close the right arm has to be to RIGHT_TUCK before the posture search will trust
+# it, and how long to wait. The stow trajectory asks for six seconds; ten gives it room
+# on a loaded machine without stalling a run that will never get there.
+STOW_TOLERANCE_RAD = 0.12
+STOW_TIMEOUT_SEC = 10.0
 
 # The driving posture, chosen to keep the arm INSIDE the base.
 #
@@ -658,6 +664,10 @@ class GraspNode(Node):
         # with Gazebo's own query service.
         self.book_fresh = 6.0
         self.pre_solution = None
+
+        # The right arm stow is a MOTION, not a message, and the posture search cannot
+        # run until it has finished. See _do_scene.
+        self.stow_sent_at = None
 
         self.motion_thread: Optional[threading.Thread] = None
         self.motion_result = None
@@ -1607,6 +1617,22 @@ class GraspNode(Node):
         The approach controller already tucks it, so this is insurance rather than the
         primary mechanism: it costs one message and it removes a failure that looks like
         something else entirely.
+
+        Publishing it is not the same as it having happened, which is what this used to
+        assume. The trajectory takes six seconds and the posture search ran on the next
+        line, against the joint state as it was -- right arm still where it spawned. The
+        search then rejected every candidate and named exactly the collision this
+        docstring predicts. Reproduced on the bench (tools/labgrasp.sh), which does not
+        run the approach controller and so always starts with the arm untucked:
+
+            blocked by: arm_right_5_link/shelf_board_2, arm_right_6_link/shelf_board_2,
+                        arm_right_7_link/shelf_board_2
+            no posture reaches the pre-grasp [0.577, -0.015, 1.346] and can then travel
+            into the shelf
+
+        _do_scene now waits for the arm to arrive before searching. It cannot block to do
+        it -- this runs on a 0.2 s timer under a single-threaded executor, so blocking
+        here stops /joint_states updating and the arm would never be seen to arrive.
         """
         traj = JointTrajectory()
         traj.joint_names = ["arm_right_%d_joint" % i for i in range(1, 8)]
@@ -1617,8 +1643,34 @@ class GraspNode(Node):
         self.pub_arm_right.publish(traj)
         self.get_logger().info("stowing the right arm clear of the shelf")
 
+    def _right_arm_stowed(self) -> bool:
+        """Is the right arm actually at the tuck yet?"""
+        worst = 0.0
+        for i, target in enumerate(RIGHT_TUCK, start=1):
+            actual = self.joints.get("arm_right_%d_joint" % i)
+            if actual is None:
+                return False
+            worst = max(worst, abs(_wrap(actual - target)))
+        return worst < STOW_TOLERANCE_RAD
+
     def _do_scene(self) -> None:
-        self._stow_right_arm()
+        # Send the stow once, then let later ticks watch for it to arrive.
+        if self.stow_sent_at is None:
+            self._stow_right_arm()
+            self.stow_sent_at = self.get_clock().now()
+            return
+
+        waited = (self.get_clock().now() - self.stow_sent_at).nanoseconds * 1e-9
+        if not self._right_arm_stowed():
+            if waited < STOW_TIMEOUT_SEC:
+                return
+            self.get_logger().warn(
+                "the right arm has not reached the stow after %.0f s; searching anyway, "
+                "and if this fails naming arm_right against a shelf board, that is why"
+                % waited)
+        elif waited < STOW_TIMEOUT_SEC:
+            self.get_logger().info("right arm stowed after %.1f s" % waited)
+
         if not self._add_shelf():
             self.get_logger().error("could not describe the shelf to the planner")
             self._enter(State.FAILED)

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The grasp bench: the robot, one book, and nothing else.
 #
-#     tools/lab up [dart|bullet]     bring the bench up (default dart)
+#     tools/lab up [dart|bullet] [moveit]
+#                                    bring the bench up (default dart, no move_group)
 #     tools/lab down                 stop it
 #     tools/lab status               is it running, and how fast
 #     tools/lab log [n]              tail the bench log
@@ -61,6 +62,11 @@ up)
         dart|bullet|bullet-featherstone) ;;
         *) die "engine must be dart or bullet, not $engine" ;;
     esac
+    # move_group is off by default: it costs a slow startup and the jaw tests do not
+    # plan anything. tools/labgrasp.sh, which runs the real grasp controller, needs it.
+    want_moveit=false
+    [ "${2:-}" = "moveit" ] && want_moveit=true
+    [ "${MOVEIT:-0}" = "1" ] && want_moveit=true
 
     # Anything already talking to a world will fight this one for the same topics, and
     # a HALF-dead one is worse than a live one. Bringing the bench up three seconds after
@@ -86,7 +92,7 @@ up)
         "$CONTAINER" /entrypoint.sh bash -c \
         "source /opt/erc_ws/install/setup.bash && \
          ros2 launch erc_bringup grasp_lab.launch.py headless:=${HEADLESS:-true} \
-         > $LOG 2>&1"
+         moveit:=$want_moveit > $LOG 2>&1"
 
     # The controllers are spawned on an eight second timer and the slowest of them is
     # what decides when the bench is usable, so wait for the broadcaster rather than

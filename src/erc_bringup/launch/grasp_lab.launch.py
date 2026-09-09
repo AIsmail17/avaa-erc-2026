@@ -43,13 +43,24 @@ ERC_LAB_Y     lateral offset (default 0.0)
 ERC_LAB_Z     height of the book's centre above the floor (default 1.00)
 ERC_LAB_COLOUR   book colour (default yellow)
 ERC_GRASP_FIX    1 to also run the pose-following grasp aid
+
+Launch arguments
+----------------
+moveit:=true     bring up move_group as well, so the real grasp controller can be run
+                 here instead of at the end of a thirteen minute arena run.
+
+                 There is no shelf in this world, which is the point: if a reach that
+                 stops short in the arena completes here, the shelf collision geometry is
+                 what stops it, and that is a different bug from the arm not reaching.
 """
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
+                            IncludeLaunchDescription, TimerAction)
 from launch.conditions import IfCondition, UnlessCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -197,6 +208,21 @@ def generate_launch_description():
              parameters=[{'use_sim_time': True}], output='screen'),
     ])
 
+    # move_group, from the solution's own launch so the bench plans exactly the way a
+    # real run does -- same kinematics, same joint limits, same controller mapping.
+    moveit = []
+    try:
+        moveit_launch = os.path.join(
+            get_package_share_directory('avaa_solution'), 'launch', 'moveit.launch.py')
+        moveit = [TimerAction(period=12.0, actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(moveit_launch),
+                condition=IfCondition(LaunchConfiguration('moveit')),
+            )])]
+    except Exception as exc:  # noqa: BLE001
+        print('[grasp_lab] move_group NOT available (%s); the bench can still test the '
+              'jaws, but not a planned reach' % exc)
+
     grasp_fix_wanted = os.environ.get('ERC_GRASP_FIX', '').lower() in ('1', 'true', 'yes')
     grasp_fix = TimerAction(period=6.0, actions=([
         Node(package='erc_bringup', executable='sim_grasp_fix.py',
@@ -205,7 +231,11 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('headless', default_value='true'),
+        DeclareLaunchArgument('moveit', default_value='false',
+                              description='bring up move_group so a planned reach can be '
+                                          'tested here'),
         gazebo_gui, gazebo_headless,
         rsp, bridge, contact_bridge,
         spawn_robot, spawn_book, controllers, gripper_clamp, grasp_fix,
+        *moveit,
     ])
