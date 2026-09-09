@@ -181,6 +181,13 @@ def main():
     print("  face at x=%.3f, feeding row %d" % (face_x, row))
 
     print("\nfeeding the controller for %.0f simulated seconds" % SECONDS)
+    # Once the controller says it has the book, stop propping it up, so a real hold can
+    # be told apart from this script holding it.
+    held = [False]
+    node.create_subscription(
+        String, "/grasp_fix/holding",
+        lambda m: held.__setitem__(0, bool(m.data)), 10)
+
     end = None
     while rclpy.ok():
         if end is None:
@@ -194,6 +201,18 @@ def main():
         point.point.x, point.point.y, point.point.z = face_x, by, bz
         pub_point.publish(point)
         pub_yaw.publish(Float32(data=0.0))
+        # Hold the book up.
+        #
+        # In the arena a shelf board carries it. Here it hangs in mid-air, and a book that
+        # falls during the reach makes every arrival number meaningless -- one run
+        # reported a 193 mm height error against a book that was on the floor by then.
+        # Re-placing it each tick is what the shelf does.
+        if not held[0]:
+            gz("service", "-s", "/world/%s/set_pose" % WORLD,
+               "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
+               "--timeout", "400",
+               "--req", 'name: "%s", position: {x: %f, y: %f, z: %f}'
+                        % (book_name, wx, wy, wz), timeout=2)
         spin(0.2)
         if states and states[-1] in ("done", "failed", "FAILED", "DONE"):
             print("  controller reached %s" % states[-1])

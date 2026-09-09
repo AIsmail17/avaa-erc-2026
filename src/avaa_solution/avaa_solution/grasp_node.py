@@ -181,7 +181,26 @@ STOW_TIMEOUT_SEC = 10.0
 # keeping the most compact one with at least 0.15 rad of room at every joint stop. It is
 # also tighter than the old one: the gripper sits 0.29 m from the base axis rather than
 # 0.49 m.
-TUCK_POSE = [0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0]
+# Valid at every torso height, including zero.
+#
+# The previous value, [0.36, -1.83, 0.47, -2.35, 0.0, -1.2, 0.0], was the mirror image of
+# the old RIGHT_TUCK and shared its fault: it folds arm_left_6_link into base_link when
+# the torso is down. Measured against /check_state_validity with an empty group, so the
+# whole robot is checked (tools/tuckvalid.py):
+#
+#     torso 0.00   INVALID   arm_left_6_link vs base_link
+#     torso 0.05 and above    VALID
+#
+# TUCK_TORSO is 0.10, so the design intends this posture to be adopted with the torso
+# already up, and nothing enforces that. There is a path straight to the bad case in this
+# file: _do_raise fails to raise the torso, logs "reaching from where we are", and carries
+# on at torso zero with the arm still here. Every plan after that starts from a state
+# move_group refuses before OMPL does any work, and arrives back as a bare 99999.
+#
+# This one is from tools/find_arm_tuck.py with 0.0 among the heights it checks: 400
+# samples, folded to 0.209 m forward and 0.327 sideways -- comfortably inside a base
+# 0.54 m across, which is what this posture is for.
+TUCK_POSE = [0.3877, -1.6152, 0.0717, 0.0408, 0.5074, -1.4708, 0.6063]
 TUCK_TORSO = 0.10
 
 # The wrist, in base_link: reach along +x, close the fingers across y. Both come from the

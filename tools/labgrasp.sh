@@ -36,6 +36,50 @@ for i in $(seq 1 30); do
 done
 
 echo
+echo "=== putting the arm in the driving posture first"
+# The arena does this during the approach; the bench has no approach controller, so the
+# left arm sits where it spawned -- all-zero, which is fully extended, 0.838 m forward and
+# well inside the shelf boxes grasp_node is about to add. Every plan then starts from a
+# state move_group refuses, and the run fails for a reason that has nothing to do with
+# the grasp. TUCK_POSE and TUCK_TORSO are read from the solution so this cannot drift
+# away from what the arena actually uses.
+docker exec erc_sim /entrypoint.sh bash -c '
+source /opt/erc_ws/install/setup.bash
+python3 - <<PY
+import sys, time
+sys.path.insert(0, "/opt/erc_ws/src/avaa_solution")
+import rclpy
+from builtin_interfaces.msg import Duration
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from avaa_solution.grasp_node import TUCK_POSE, TUCK_TORSO
+
+rclpy.init()
+node = rclpy.create_node("labtuck")
+arm = node.create_publisher(JointTrajectory, "/arm_left_controller/joint_trajectory", 10)
+torso = node.create_publisher(JointTrajectory, "/torso_controller/joint_trajectory", 10)
+time.sleep(2.0)
+
+def send(pub, names, values, secs):
+    t = JointTrajectory()
+    t.joint_names = list(names)
+    p = JointTrajectoryPoint()
+    p.positions = [float(v) for v in values]
+    p.velocities = [0.0] * len(values)
+    p.time_from_start = Duration(sec=secs, nanosec=0)
+    t.points = [p]
+    for _ in range(3):
+        pub.publish(t)
+        time.sleep(0.2)
+
+send(torso, ["torso_lift_joint"], [TUCK_TORSO], 6)
+send(arm, ["arm_left_%d_joint" % i for i in range(1, 8)], TUCK_POSE, 8)
+print("  sent TUCK_POSE and torso %.2f" % TUCK_TORSO)
+node.destroy_node()
+rclpy.shutdown()
+PY'
+sleep 25
+
+echo
 echo "=== starting the grasp controller"
 docker exec -d erc_sim /entrypoint.sh bash -c \
     "source /opt/erc_ws/install/setup.bash && ros2 run avaa_solution grasp --ros-args \

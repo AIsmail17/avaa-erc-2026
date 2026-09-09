@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Find a folded posture for the right arm, scored on where the arm IS.
+"""Find a folded posture for either arm, scored on where the arm IS.
+
+    tools/in-sim find_arm_tuck.py right      -> RIGHT_TUCK, for approach_node
+    tools/in-sim find_arm_tuck.py left       -> TUCK_POSE,  for grasp_node
+
+Both tucks had the same fault and it is worth only writing the search once. The left
+arm's TUCK_POSE folds arm_left_6_link into base_link at torso zero exactly as the old
+RIGHT_TUCK folded arm_right_6_link into it -- the two constants are mirror images of each
+other, so they share the flaw. See tools/tuckvalid.py for the measurement.
+
 
 The first version of this scored candidates by the sum of their joint angles, which is a
 measure of how close a posture is to all-zeros -- and all-zeros is the arm stretched
@@ -25,7 +34,11 @@ sys.path.insert(0, "/opt/erc_ws/src/avaa_solution")
 from avaa_solution.kinematics.arm_chain import ArmChain  # noqa: E402
 
 URDF = "/opt/erc_ws/src/erc_description/urdf/tiago_pro.urdf"
-RIGHT = ["arm_right_%d_joint" % i for i in range(1, 8)]
+SIDE = (sys.argv[1] if len(sys.argv) > 1 else "right").lower()
+if SIDE not in ("left", "right"):
+    sys.exit("usage: find_arm_tuck.py [left|right]")
+ARM = ["arm_%s_%d_joint" % (SIDE, i) for i in range(1, 8)]
+CONSTANT = "RIGHT_TUCK" if SIDE == "right" else "TUCK_POSE"
 # 0.0 belongs here and its absence cost a week.
 #
 # The stow is sent BEFORE the torso is raised, so the height the arm is actually at when
@@ -41,12 +54,12 @@ def main():
     limits = {}
     for joint in ET.parse(URDF).getroot().findall("joint"):
         limit = joint.find("limit")
-        if limit is not None and joint.get("name") in RIGHT:
+        if limit is not None and joint.get("name") in ARM:
             limits[joint.get("name")] = (float(limit.get("lower")),
                                          float(limit.get("upper")))
 
     rclpy.init()
-    node = rclpy.create_node("find_right_tuck")
+    node = rclpy.create_node("find_arm_tuck")
     node.set_parameters([rclpy.parameter.Parameter(
         "use_sim_time", rclpy.Parameter.Type.BOOL, True)])
     latest = {}
@@ -68,14 +81,15 @@ def main():
 
     # The right arm as a chain, so candidates can be scored on where the links end up
     # rather than on how small their angles are.
-    chain = ArmChain.from_urdf(URDF, "base_link", "gripper_right_grasping_link")
+    chain = ArmChain.from_urdf(
+        URDF, "base_link", "gripper_%s_grasping_link" % SIDE)
     names = chain.joint_names
 
     def valid(values, torso):
         state = JointState()
         state.name = list(js.name)
         state.position = list(js.position)
-        for name, value in zip(RIGHT, values):
+        for name, value in zip(ARM, values):
             if name in index:
                 state.position[index[name]] = float(value)
         if "torso_lift_joint" in index:
@@ -84,7 +98,10 @@ def main():
         request.robot_state = RobotState()
         request.robot_state.joint_state = state
         request.robot_state.is_diff = False
-        request.group_name = "arm_left_torso"
+        # An empty group means "check the whole robot". Naming a group here checked
+        # only that group's links, which is how a posture that folds the arm into
+        # base_link passed: the arm being searched was not in the group being checked.
+        request.group_name = ""
         future = client.call_async(request)
         rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
         result = future.result()
@@ -98,7 +115,7 @@ def main():
         # Furthest forward any part of the arm gets, and how far out to the side.
         return max(float(p[0]) for p in points), max(abs(float(p[1])) for p in points)
 
-    print("right arm chain joints: %s" % names)
+    print("%s arm chain joints: %s" % (SIDE, names))
     print("searching, checking each candidate at torso %s" % TORSO_HEIGHTS)
     rng = np.random.default_rng(3)
     best = None
@@ -106,12 +123,12 @@ def main():
     started = time.time()
     while time.time() - started < 260 and checked < 400:
         values = []
-        for name in RIGHT:
+        for name in ARM:
             lo, hi = limits[name]
             centre = 0.5 * (lo + hi)
             values.append(float(np.clip(rng.normal(centre, 0.4 * (hi - lo)), lo, hi)))
         margin = min(min(v - limits[n][0], limits[n][1] - v)
-                     for n, v in zip(RIGHT, values))
+                     for n, v in zip(ARM, values))
         if margin < 0.15:
             continue
         checked += 1
@@ -134,7 +151,7 @@ def main():
         return 1
     print("best of %d samples: %.3f m forward, %.3f sideways"
           % (checked, best[2], best[3]))
-    print("RIGHT_TUCK = [%s]" % ", ".join("%.4f" % v for v in best[1]))
+    print("%s = [%s]" % (CONSTANT, ", ".join("%.4f" % v for v in best[1])))
 
     node.destroy_node()
     rclpy.shutdown()
