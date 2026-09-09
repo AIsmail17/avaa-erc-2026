@@ -36,7 +36,7 @@ from avaa_solution.kinematics.arm_chain import ArmChain  # noqa: E402
 ARM_JOINTS = ["arm_left_%d_joint" % i for i in range(1, 8)]
 CHAIN_JOINTS = ["torso_lift_joint"] + ARM_JOINTS
 FINGER = "gripper_left_finger_joint"
-BASE_Z = 0.186          # base_link sits this far above the world origin
+BASE_Z = 0.0762         # base_link sits this far above the world origin
 BOOK_HALF_DEPTH = 0.08  # book centre to its front face
 
 SENSOR_QOS = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,

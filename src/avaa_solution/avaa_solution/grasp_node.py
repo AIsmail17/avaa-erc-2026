@@ -55,6 +55,7 @@ from tf2_ros import Buffer, TransformListener
 from std_msgs.msg import Float32, Int32, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from avaa_solution import arena
 from avaa_solution.kinematics.arm_chain import ArmChain
 from avaa_solution.moveit_client import MoveItClient, error_name
 # Imported so the two nodes cannot disagree about where the unused arm
@@ -154,7 +155,10 @@ GRIPPER_OPEN_MIN = 0.044
 #                             topples after 78 mm
 GRIPPER_CLAMP = -0.0010
 
-DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
+# The four stocked rows in base_link, top first. See avaa_solution/arena.py: the
+# value used to be 110 mm lower at every row, because base_link was taken to be
+# 0.186 m above the floor and the URDF puts it at 0.0762.
+DEFAULT_ROW_HEIGHTS = list(arena.ROW_HEIGHTS_BASE)
 
 # How close the right arm has to be to RIGHT_TUCK before the posture search will trust
 # it, and how long to wait. The stow trajectory asks for six seconds; ten gives it room

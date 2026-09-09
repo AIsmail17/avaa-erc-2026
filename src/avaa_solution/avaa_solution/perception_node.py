@@ -33,6 +33,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32, Int32
 from tf2_ros import Buffer, TransformListener
 
+from avaa_solution import arena
 from avaa_solution.vision import depth_locator as dl
 from avaa_solution.vision import shelf_plane as sp
 from vision_msgs.msg import (
@@ -63,38 +64,40 @@ TOPIC_SHELF_YAW = "/avaa/perception/shelf_yaw"
 # Where the grasp controller wants the book expressed.
 GRASP_FRAME = "base_link"
 
-# Shelf heights in base_link, top row first, and how far the deprojected height sits
-# above the truth. Measured against Gazebo over 100 published points: +152 mm at 0.7-0.9 m
-# with 41 mm of spread, +193 at 0.9-1.2, +146 at 1.2-1.6, +121 beyond. The bias is not
-# constant enough to name a row on its own -- 0.6 of a row spacing at worst -- but it is
-# nowhere near the 660 mm needed to confuse rows two apart, which is what makes it a
-# usable check on an answer arrived at a completely different way.
-#
-# ASSUMPTION: the bias comes from the bounding box sitting high on the visible face of a
-# book whose lower edge is occluded by the shelf lip. It is treated as a constant here
-# because it does not need to be better than half a row to do this job.
 COLUMNS_ON_SHELF = 5
-ROW_HEIGHTS_BASE = [1.391, 1.061, 0.731, 0.401]
+# Shelf heights in base_link, top row first. See avaa_solution/arena.py.
+ROW_HEIGHTS_BASE = list(arena.ROW_HEIGHTS_BASE)
 
 # The bin rim, in base_link, taken as known rather than measured.
 #
-# The rules fix the bin on a table: table 140 x 80 x 73 cm, bin 50 x 31 x 21 cm, so the
-# rim stands 0.94 m above the floor and base_link sits 0.186 m up. Measured in the
-# simulator the rim is at 0.950, which is 10 mm from the arithmetic.
-#
-# Height is taken as known for the same reason it is taken as known for the shelf rows:
-# depth is trustworthy sideways and in range and is not trustworthy vertically. Measured
-# against ground truth, two settled readings of the bin came back +18 and +14 mm high,
-# and a third taken while the head was still tilting came back +176 mm. A number that
-# depends on whether the head has stopped moving is not a number to place a book with.
-BIN_RIM_BASE_Z = 0.950 - 0.186
+# Height is taken as known because a fix taken while the head is still moving is not a
+# height: two settled readings of the bin came back +18 and +14 mm, and a third taken
+# mid-tilt came back +176 mm. A number that depends on whether the head has stopped is
+# not a number to place a book with. See avaa_solution/arena.py for where the rim is.
+BIN_RIM_BASE_Z = arena.BIN_RIM_BASE_Z
 BIN_DEPTH_M = 0.50
-DEPTH_HEIGHT_BIAS = 0.152
 
-# How far a book fix may sit from its identified row's height and still be that
-# book. Rows are 0.330 m apart, so this cannot confuse two of them, and it is wide
-# enough for the depth bias above and for a book standing proud of its neighbours.
-ROW_HEIGHT_TOLERANCE = 0.20
+# How far above the truth a deprojected book height sits.
+#
+# This was 0.152 m, and almost all of it was not a bias at all: base_link was taken to
+# be 0.186 m above the floor when the URDF puts it at 0.0762, so every ground-truth
+# comparison was made 110 mm too low and the difference was booked as camera error. With
+# the frame right, the residual is what is left.
+#
+# Measured with tools/bookheight.py, which goes straight from one settled frame to
+# Gazebo without passing through this node: over four rows, three head tilts and ranges
+# from 0.65 to 1.62 m the fix reads +5 mm high with 13 mm of spread. Thirteen millimetres
+# against a 330 mm row spacing is a twelve-sigma margin, which is why _cross_check_row
+# can now be believed about a single row rather than only about two.
+DEPTH_HEIGHT_BIAS = 0.005
+
+# How far a book fix may sit from its identified row's height and still be that book.
+#
+# Rows are 0.330 m apart and the fix is good to about 13 mm, so half a row leaves an
+# enormous margin either way: it cannot admit a book from the row above or below, and it
+# will not refuse a book standing proud of its neighbours or a frame taken while the head
+# was still settling.
+ROW_HEIGHT_TOLERANCE = 0.165
 
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
@@ -745,7 +748,7 @@ class PerceptionNode(Node):
         return best + 1
 
     def _cross_check_row(self, point, markers_in_view: bool = False) -> None:
-        """Distrust the marker row when the measured height flatly contradicts it.
+        """Distrust the marker row when the measured height contradicts it.
 
         The row is counted from the books grouped under a column marker, which needs the
         whole column in frame and gets it wrong when neighbouring books are swept in. One
@@ -753,9 +756,26 @@ class PerceptionNode(Node):
         low, and then reported no red book in view for the rest of the run while standing
         squarely in front of it.
 
-        Being one row out is within what the height bias can explain, so that is left
-        alone and only logged. Two rows apart is 660 mm and the height cannot be that
-        wrong, so the height wins.
+        This used to overrule the markers only when the two were two rows apart, on the
+        grounds that one row was "within what the height bias can explain". That is no
+        longer true, and it was never quite true: the 152 mm bias it was reasoning about
+        was 110 mm of base_link being taken as 0.186 m above the floor when the URDF puts
+        it at 0.0762 (see avaa_solution/arena.py). With the frame right, a book fix reads
+        +6 mm high with 9 mm of spread over four rows, three head tilts and ranges from
+        0.65 to 1.6 m (tools/bookheight.py). Rows are 330 mm apart. A measurement that
+        good does not mistake one row for its neighbour, so it is now allowed to say so.
+
+        The other half of the argument is consistency, and it matters more than accuracy.
+        The row and the fix have to describe the SAME book: the arm is sent to the row's
+        tabled height at the fix's x and y, and if the row came from the markers while
+        the fix came from the tracker, a grouping error puts those two on different
+        books and the hand arrives at a place where no book is at all. Taking the row
+        from the tracked book's own height cannot do that. Following the wrong book of
+        the right colour costs the identification; reaching into empty air costs the run.
+
+        Still only while the markers are in frame, and still on a majority of a full
+        deque rather than one frame -- see below for what each of those cost when it was
+        missing.
         """
         if self.reported_row is None:
             return
@@ -778,11 +798,10 @@ class PerceptionNode(Node):
         self.height_votes.append(implied)
         if implied == self.reported_row:
             return
-        if abs(implied - self.reported_row) < 2:
-            self.get_logger().info(
-                f"row {self.reported_row} from the markers, {implied} from the measured "
-                f"height; keeping {self.reported_row}", throttle_duration_sec=10.0)
-            return
+        self.get_logger().info(
+            f"row {self.reported_row} from the markers, {implied} from the measured "
+            f"height; waiting for {self.height_votes.maxlen} heights to agree",
+            throttle_duration_sec=10.0)
 
         # One frame is not evidence, and acting on one cost a run.
         #
@@ -800,7 +819,7 @@ class PerceptionNode(Node):
             return
         tally = Counter(self.height_votes)
         winner, count = tally.most_common(1)[0]
-        if winner == self.reported_row or abs(winner - self.reported_row) < 2:
+        if winner == self.reported_row:
             return
         if count < 0.7 * self.height_votes.maxlen:
             self.get_logger().warn(
@@ -811,7 +830,8 @@ class PerceptionNode(Node):
         self.get_logger().warn(
             f"row {self.reported_row} from the markers, but {count} of "
             f"{len(self.height_votes)} measured heights put the book on row {winner}, "
-            f"{abs(winner - self.reported_row)} rows away. The markers are wrong; "
+            f"{abs(winner - self.reported_row)} row(s) away. The height is good to about "
+            f"10 mm and the rows are 330 mm apart, so the markers are wrong; "
             f"switching to {winner}")
         self.reported_row = winner
         self.row_votes.clear()

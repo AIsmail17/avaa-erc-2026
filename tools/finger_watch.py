@@ -22,7 +22,7 @@ LEFT = "gripper_left_fingertip_left_link"
 RIGHT = "gripper_left_fingertip_right_link"
 GRASP = "gripper_left_grasping_link"
 BASE = "base_link"
-BASE_Z = 0.186
+BASE_Z = 0.0762
 
 
 def gz(*args):

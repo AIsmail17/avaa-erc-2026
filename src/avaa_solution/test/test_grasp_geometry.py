@@ -1,5 +1,10 @@
 """Tests for the row-to-height mapping and the gripper command values.
 
+The heights themselves come from avaa_solution/arena.py, which derives them from
+one measured constant. They are written out here rather than imported, so that a
+change to that constant has to be made deliberately in two places instead of
+silently agreeing with itself.
+
 The row direction is the risky part: the rules number the stocked rows 1-4 without saying
 which end row 1 is. Getting it backwards costs the identification points and sends the arm
 to the wrong shelf, so both directions are pinned down here.
@@ -15,7 +20,7 @@ from avaa_solution.grasp_node import (
     row_to_height,
 )
 
-HEIGHTS = [1.391, 1.061, 0.731, 0.401]   # top shelf first
+HEIGHTS = [1.5008, 1.1708, 0.8408, 0.5108]   # top shelf first
 
 
 def test_defaults_are_ordered_top_shelf_first():
@@ -28,12 +33,14 @@ def test_rows_are_evenly_spaced():
         assert gap == pytest.approx(0.33, abs=0.005)
 
 
-@pytest.mark.parametrize("row,expected", [(1, 1.391), (2, 1.061), (3, 0.731), (4, 0.401)])
+@pytest.mark.parametrize("row,expected", [
+    (1, 1.5008), (2, 1.1708), (3, 0.8408), (4, 0.5108)])
 def test_top_down_numbering(row, expected):
     assert row_to_height(row, HEIGHTS, top_down=True) == pytest.approx(expected)
 
 
-@pytest.mark.parametrize("row,expected", [(1, 0.401), (2, 0.731), (3, 1.061), (4, 1.391)])
+@pytest.mark.parametrize("row,expected", [
+    (1, 0.5108), (2, 0.8408), (3, 1.1708), (4, 1.5008)])
 def test_bottom_up_numbering(row, expected):
     assert row_to_height(row, HEIGHTS, top_down=False) == pytest.approx(expected)
 

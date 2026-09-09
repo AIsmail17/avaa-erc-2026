@@ -6,7 +6,7 @@ from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
 TIPS=["gripper_left_fingertip_left_link","gripper_left_fingertip_right_link"]
-BASE_Z=0.186
+BASE_Z=0.0762
 
 def pose(m,attempts=4):
     for _ in range(attempts):

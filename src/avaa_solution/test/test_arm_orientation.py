@@ -20,7 +20,7 @@ CLOSING = [0.0, 1.0, 0.0]
 
 # Directly in front, one target per shelf row, at the depth a grasp actually reaches to.
 ROW_TARGETS = [
-    [0.836, 0.020, 1.391],
+    [0.836, 0.020, 1.5008],
     [0.836, 0.020, 1.061],
     [0.836, 0.020, 0.731],
     [0.836, 0.020, 0.401],

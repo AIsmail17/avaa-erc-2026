@@ -166,7 +166,7 @@ def main():
     dx, dy = bin_p[0] - robot[0], bin_p[1] - robot[1]
     truth = np.array([dx * math.cos(-yaw) - dy * math.sin(-yaw),
                       dx * math.sin(-yaw) + dy * math.cos(-yaw),
-                      bin_p[2] - 0.186])
+                      bin_p[2] - 0.0762])
     print("bin in base  : vision [%+.3f, %+.3f, %+.3f]"
           % (in_base[0], in_base[1], in_base[2]))
     print("               truth  [%+.3f, %+.3f, %+.3f]"
@@ -186,7 +186,7 @@ def main():
     #
     # So take the camera ray through the middle of the blob and intersect it with the
     # plane of the rim. One measurement, from the part of the sensor that is accurate.
-    rim_base = (bin_p[2] + 0.105) - 0.186
+    rim_base = (bin_p[2] + 0.105) - 0.0762
     ray = dl.deproject(found.cx, found.cy, 1.0, node.intr)
     direction = rot @ np.asarray(ray)
     origin = np.array([t.x, t.y, t.z])

@@ -24,7 +24,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PointStamped
 
-BASE_Z = 0.186
+BASE_Z = 0.0762
 BOOK_HALF_DEPTH = 0.08
 
 

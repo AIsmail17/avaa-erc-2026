@@ -22,7 +22,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 ARM=["arm_left_%d_joint"%i for i in range(1,8)]
 POSTURE=[0.25, 3.14, -2.30, -0.68, -2.07, 1.57, -0.28, -1.80]
 TIPS=["gripper_left_fingertip_left_link","gripper_left_fingertip_right_link"]
-BASE_Z=0.186
+BASE_Z=0.0762
 
 def gz(*a,t=20):
     try: return subprocess.run(["gz",*a],capture_output=True,text=True,timeout=t).stdout

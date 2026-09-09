@@ -100,10 +100,10 @@ def test_clamp_respects_limits(chain):
 
 
 @pytest.mark.parametrize("target", [
-    [0.80, 0.0, 1.391],   # shelf row 1, book centred on the base
-    [0.80, 0.0, 1.061],   # row 2
-    [0.80, 0.0, 0.731],   # row 3
-    [0.80, 0.0, 0.401],   # row 4
+    [0.80, 0.0, 1.5008],   # shelf row 1, book centred on the base
+    [0.80, 0.0, 1.1708],   # row 2
+    [0.80, 0.0, 0.8408],   # row 3
+    [0.80, 0.0, 0.5108],   # row 4
 ])
 def test_every_shelf_row_is_reachable(chain, target):
     solution = chain.ik(target)

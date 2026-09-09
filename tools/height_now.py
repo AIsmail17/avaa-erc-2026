@@ -8,7 +8,7 @@ import math, subprocess, sys, time
 import numpy as np, rclpy
 from tf2_ros import Buffer, TransformListener
 
-BASE_Z = 0.186
+BASE_Z = 0.0762
 TIPS = ["gripper_left_fingertip_left_link", "gripper_left_fingertip_right_link"]
 GRASP = "gripper_left_grasping_link"
 

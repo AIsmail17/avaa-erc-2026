@@ -35,7 +35,7 @@ SENSOR_QOS = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                         history=QoSHistoryPolicy.KEEP_LAST, depth=1)
 
 SHELF_FRONT_X = 2.755      # measured from erc_base_shelf.STL and the world pose
-BASE_Z = 0.186
+BASE_Z = 0.0762
 
 
 def truth():

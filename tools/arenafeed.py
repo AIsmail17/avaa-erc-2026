@@ -45,7 +45,7 @@ BOOK_DEPTH = 0.16
 # base_link sits this far above the floor, so a height measured from the robot's model
 # origin has to lose it before being compared with anything in base_link. Checked against
 # ROW_HEIGHTS_BASE: row 1 is 1.577 in world and 1.391 in base_link.
-BASE_LINK_Z = 0.186
+BASE_LINK_Z = 0.0762   # floor to base_link, base_footprint_joint in the URDF; this was 0.186 and wrong by 110 mm
 # grasp_node's grasp_below_centre_m, so the expected height miss is not zero.
 GRASP_BELOW_CENTRE = 0.045
 
@@ -248,7 +248,7 @@ def main():
         print("  pad middle      (%+.3f, %+.3f, %+.3f)" % pad)
         print("  grasping frame  (%+.3f, %+.3f, %+.3f)" % at_clamp["grasp"])
         # bz is the book's height above the ROBOT ORIGIN, which is on the floor, while
-        # the pads are in base_link, 0.186 m up. Comparing them directly reported a
+        # the pads are in base_link, 0.0762 m up. Comparing them directly reported a
         # 234 mm height error on a reach that was three millimetres out.
         book_in_base_z = bz - BASE_LINK_Z
         print("  book centre     (%+.3f, %+.3f, %+.3f)" % (bx, by, book_in_base_z))

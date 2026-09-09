@@ -452,7 +452,7 @@ IK to a book 0.80 m in front of the base and laterally centred on it:
 torso height may serve every row — worth exploiting, since a full torso stroke costs 10
 seconds and completion time is the tie-breaker.
 
-> `base_link` sits 0.186 m above the floor, so target z in `base_link` is world z − 0.186.
+> `base_link` sits 0.0762 m above the floor, so target z in `base_link` is world z − 0.0762. It was taken to be 0.186 until 2026-09-09, which put every row 110 mm low; see `avaa_solution/arena.py`.
 
 17 unit tests cover the chain, the rotation maths, reachability of all four rows, limit
 compliance, IK round-tripping and correct failure when out of reach. 45 tests in total.

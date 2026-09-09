@@ -51,6 +51,8 @@ from std_msgs.msg import Float32, Int32, String
 from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from avaa_solution import arena
+
 BASE_FRAME = "base_footprint"
 ODOM_FRAME = "odom"
 # The approach ticks at 10 Hz -- see create_timer in __init__. Named so the
@@ -69,7 +71,7 @@ SHOULDER_OFFSET_Y = 0.159
 CAMERA_FRAME = "head_front_camera_depth_optical_frame"
 
 # base_link sits this far above base_footprint. Row heights are quoted in base_link.
-BASE_LINK_Z = 0.186
+BASE_LINK_Z = arena.BASE_LINK_Z
 
 # head_2_joint: negative looks down, roughly one-for-one in radians. Limits from the URDF.
 HEAD_TILT_MIN = -1.047   # about 60 degrees down
@@ -108,7 +110,7 @@ SEARCH_BACK_CLEARANCE = 0.55
 SEARCH_BACK_MAX = 1.6
 
 # Gripper z in base_link for rows 1..4, top shelf first.
-DEFAULT_ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
+DEFAULT_ROW_HEIGHTS = list(arena.ROW_HEIGHTS_BASE)
 
 # Scan returns inside this radius of base_footprint are the robot itself, not obstacles.
 # The base is 0.717 x 0.497 m, so its circumscribed radius is 0.437 m; this sits just
