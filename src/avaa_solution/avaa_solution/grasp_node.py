@@ -1636,6 +1636,24 @@ class GraspNode(Node):
             # An error this large is not a base that has drifted, it is a bad look --
             # the same reading the re-aim bound refuses. Driving on one would put the
             # base into the shelf, which costs half a point every time it happens.
+            #
+            # Tried and reverted 2026-09-09: bounding the CHANGE in the error instead of
+            # its size, so that a genuine accumulated drift could be driven back. The
+            # reasoning was sound -- a bad look jumps, a drifting base accumulates, and
+            # the run that motivated it had the base 688 mm out with the hold refusing to
+            # correct any of it. The result was worse. Measured in erc_world, the base
+            # ran away TWO METRES in one grasp.
+            #
+            # Why: a few lines below, a tick with nothing measurable republishes
+            # hold_last rather than a zero, deliberately, because the coast is a constant
+            # velocity and a stale correction for it is still the right one. That is safe
+            # while every admitted error is under 200 mm and the command it produces is
+            # small. Admit a 700 mm error and it produces a command at the 40 mm/s clip
+            # -- and then the next twenty looks were refused, and that clip kept being
+            # republished into an empty room.
+            #
+            # So the cap stays. The drift it cannot correct is real and still unsolved;
+            # the answer is not to let this loop off its leash.
             if size <= self.hold_limit:
                 for index, value in enumerate(error):
                     if abs(value) <= self.hold_deadband:
@@ -1793,7 +1811,7 @@ class GraspNode(Node):
         self.get_logger().info("folding the left arm clear of the shelf")
 
     def _left_arm_stowed(self) -> bool:
-        """Is the left arm actually at the tuck yet?"""
+        """Whether the left arm has actually reached the tuck."""
         worst = 0.0
         for i, target in enumerate(TUCK_POSE, start=1):
             actual = self.joints.get("arm_left_%d_joint" % i)
@@ -1803,7 +1821,7 @@ class GraspNode(Node):
         return worst < STOW_TOLERANCE_RAD
 
     def _right_arm_stowed(self) -> bool:
-        """Is the right arm actually at the tuck yet?"""
+        """Whether the right arm has actually reached the tuck."""
         worst = 0.0
         for i, target in enumerate(RIGHT_TUCK, start=1):
             actual = self.joints.get("arm_right_%d_joint" % i)
