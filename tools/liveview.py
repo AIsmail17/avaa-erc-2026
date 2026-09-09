@@ -6,29 +6,38 @@
 
 Why this exists rather than the Gazebo window
 ---------------------------------------------
-The Gazebo GUI is the fragile half of the simulator here. It needs an OpenGL context
-through GLX, and on this machine that path fails intermittently:
+Because on this machine the Gazebo window is drawn correctly and Windows never shows it.
 
-    libGL error: glx: failed to create drisw screen
-    libGL error: failed to load driver: swrast
-    [GUI] [Err] Failed to create OpenGL context
+That is worth stating precisely, because the explanation carried here until 2026-09-09
+was wrong in a way that stopped anyone fixing it. It read: no /dev/dri in WSL, so Mesa
+falls back to software GLX, the drisw path fails, and "Failed to create OpenGL context"
+kills the GUI. Measured inside the container, with no environment variables set at all:
 
-Worse, when the GUI is launched as part of the simulation, that abort takes the SERVER
-down with it -- the controllers never spawn and the whole run is lost before the robot
-moves. It is not reliably reproducible either: the identical command succeeds one minute
-and aborts the next, which makes it a bad thing to depend on when you want to watch a
-run.
+    direct rendering: Yes
+    Device: D3D12 (NVIDIA RTX A4500 Laptop GPU)
+    Max core profile version: 4.2
 
-The server does not have that problem. It renders camera sensors through EGL, headless,
-and that has never failed. So this takes the pictures the simulator is already drawing
-and serves them over HTTP as MJPEG. Any browser can display it, nothing is rendered on
-the client, and if it falls over the simulation does not notice.
+WSLg routes GL through /dev/dxg to the real GPU, and gz sim -g renders the arena on it:
+an X11 capture of the window shows the shelf, the books, the bin and the entity tree, at
+about 49% of real time.
 
-It serves two views side by side:
+What fails is the last step, getting those pixels onto the Windows desktop. WSLg is in
+its RAIL fallback -- every window title carries [WARN:COPY MODE] and /mnt/shared_memory
+does not exist -- which is microsoft/wslg#1456, open, no fix. The application renders;
+the compositor never presents it.
+
+So the picture has to leave the container some other way, and HTTP is a fine way. This
+serves MJPEG: the camera sensors the server is already rendering through EGL, and, where
+ImageMagick is installed, the Gazebo window itself, captured from X11 where it is
+perfectly intact.
+
+It serves three views:
 
     spectator   a fixed camera placed in the world, watching the robot from above and
                 to one side -- the view you want in order to see what the robot is doing
     head        the robot's own camera, which is what perception actually sees
+    gui         the Gazebo window, captured from X11 -- the model tree, the controls
+                and the free camera, exactly as drawn, just relayed
 
 The spectator camera is spawned at runtime through the world's create service, so no
 supplied file is touched and it disappears when the simulation restarts.
@@ -46,6 +55,9 @@ from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy)
 from sensor_msgs.msg import Image
+
+GUI_WINDOW_NAME = "Gazebo Sim"
+GUI_FPS = 4.0
 
 SPECTATOR_TOPIC = "/spectator/image"
 HEAD_TOPIC = "/head_front_camera/head_front_camera/color/image_raw"
@@ -75,6 +87,13 @@ PAGE = b"""<!doctype html>
   <figure>
     <img src="/head" width="480">
     <figcaption>Robot head camera &mdash; what perception sees</figcaption>
+  </figure>
+</div>
+<div class="row" style="margin-top:16px">
+  <figure>
+    <img src="/gui" width="1000">
+    <figcaption>The Gazebo window itself &mdash; relayed out of X11, because WSLg
+      will not put it on the Windows desktop (microsoft/wslg#1456)</figcaption>
   </figure>
 </div>
 """
@@ -107,12 +126,68 @@ class Frames(Node):
             self.latest[which] = jpeg.tobytes()
             self.count[which] += 1
 
+    def put(self, which, jpeg):
+        with self.lock:
+            self.latest[which] = jpeg
+
     def get(self, which):
         with self.lock:
             return self.latest.get(which)
 
 
 PLACEHOLDER = None
+
+
+def gui_window_id():
+    """The X11 id of the Gazebo window, or None if there is no window to capture.
+
+    Looked up every time rather than cached: the GUI is attached and detached freely
+    while this server keeps running, and a stale id captures nothing without saying so.
+    """
+    try:
+        tree = subprocess.run(["xwininfo", "-root", "-tree"],
+                              capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in tree.splitlines():
+        if '"%s"' % GUI_WINDOW_NAME in line:
+            word = line.strip().split()[0]
+            if word.startswith("0x"):
+                return word
+    return None
+
+
+def grab_gui(frames):
+    """Relay the Gazebo window into the stream.
+
+    ImageMagick's import reads the window's own pixels out of the X server, so this does
+    not care whether the window is on top, behind a browser, or -- as it is here -- never
+    presented to Windows at all. It is a copy and a process per frame, which is why it
+    runs at a few frames a second rather than thirty.
+    """
+    if subprocess.run(["which", "import"], capture_output=True).returncode != 0:
+        frames.put("gui", placeholder("no ImageMagick: apt-get install imagemagick"))
+        return
+    period = 1.0 / GUI_FPS
+    while True:
+        started = time.time()
+        window = gui_window_id()
+        if window is None:
+            frames.put("gui", placeholder("no Gazebo window -- run: tools/sim gui"))
+            time.sleep(2.0)
+            continue
+        try:
+            shot = subprocess.run(["import", "-silent", "-window", window, "jpg:-"],
+                                  capture_output=True, timeout=15)
+        except subprocess.SubprocessError:
+            time.sleep(1.0)
+            continue
+        if shot.returncode == 0 and shot.stdout:
+            frames.put("gui", shot.stdout)
+        else:
+            frames.put("gui", placeholder("could not read the Gazebo window"))
+            time.sleep(1.0)
+        time.sleep(max(0.0, period - (time.time() - started)))
 
 
 def placeholder(text):
@@ -138,7 +213,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         which = self.path.strip("/")
-        if which not in ("spectator", "head"):
+        if which not in ("spectator", "head", "gui"):
             self.send_error(404)
             return
 
@@ -194,12 +269,14 @@ def main():
         target=lambda: rclpy.spin(node), daemon=True)
     thread.start()
 
+    threading.Thread(target=grab_gui, args=(node,), daemon=True).start()
+
     Handler.frames = node
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("live view on http://localhost:%d" % port, flush=True)
     print("(from Windows, open that in a browser -- WSL forwards localhost)",
           flush=True)
-    print("streams: /spectator and /head", flush=True)
+    print("streams: /spectator, /head and /gui", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

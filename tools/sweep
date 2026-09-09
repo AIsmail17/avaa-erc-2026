@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Clear everything the simulator leaves behind.
+#
+#     tools/sweep            kill the lot and say what survived
+#
+# Every teardown in this project used pkill -f, and pkill -f could not do the job.
+# Observed 2026-09-09: five liveviews holding ports 8090-8094, four bridge pairs and four
+# grasp nodes burning 70% of a core each, all left over from earlier sessions. pkill
+# reported success on each of them and they were still there afterwards -- once with
+# SIGTERM, once with SIGKILL, once with the bracketed patterns that are supposed to stop
+# pkill matching the shell that runs it. The processes were not zombies; they were in R
+# state at 200% CPU.
+#
+# Rather than work out which of pkill's several ways of matching its own command line was
+# to blame, this lists the PIDs in one shell and kills them from another. There is no
+# pattern in the killing shell to match, so nothing can match itself, and the result is
+# checked rather than assumed. Three rounds, because a supervisor can respawn a child
+# once.
+#
+# Why this matters beyond tidiness: a stale liveview holds its port, so the next one dies
+# with "Address already in use" into a log nobody reads while the browser keeps showing a
+# picture of a simulation that ended hours ago. That is the frozen view, and it cost the
+# better part of two days.
+set -u
+CONTAINER="${CONTAINER:-erc_sim}"
+
+PAT='gz sim|liveview\.py|parameter_bridge|ros_gz_bridge|avaa_solution|grasp_lab\.launch|simulation\.launch|solution\.launch|moveit\.launch|controller_manager|move_group|robot_state_publisher|ros2 run|ros2 launch|spawner|python3 - '
+
+listing() {
+    docker exec "$CONTAINER" ps -eo pid=,args= 2>/dev/null \
+        | grep -E "$PAT" | grep -v ' ps -eo'
+}
+
+if ! docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
+    echo "container $CONTAINER is not running; nothing to sweep"
+    exit 0
+fi
+
+for round in 1 2 3; do
+    pids=$(listing | awk '{print $1}' | tr '\n' ' ')
+    [ -z "${pids// /}" ] && break
+    echo "round $round: killing $(echo "$pids" | wc -w) processes"
+    docker exec "$CONTAINER" kill -9 $pids 2>/dev/null
+    sleep 3
+done
+
+docker exec "$CONTAINER" rm -f /tmp/pin_base.py /tmp/liveview.py 2>/dev/null
+
+left=$(listing | wc -l)
+if [ "$left" -eq 0 ]; then
+    echo "container is clear"
+else
+    echo "$left survived, which should not happen:"
+    listing | cut -c1-90 | sed 's/^/    /'
+fi
+
+# The container runs on host networking, so a port can be held from outside it too.
+for p in 8080 8090 8091 8092 8093 8094 8095 8096 8097 8098 8099; do
+    fuser -k "$p"/tcp >/dev/null 2>&1 || true
+done
+held=$(ss -lntH 2>/dev/null | awk '{print $4}' | grep -cE ':(8080|809[0-9])$' || true)
+echo "view ports still held: ${held:-0}"
