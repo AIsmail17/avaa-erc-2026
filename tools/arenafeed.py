@@ -42,6 +42,12 @@ TIP_R = "gripper_left_fingertip_right_link"
 GRASP = "gripper_left_grasping_link"
 PAD_LOCAL = (0.0042, 0.0187, 0.0000)
 BOOK_DEPTH = 0.16
+# base_link sits this far above the floor, so a height measured from the robot's model
+# origin has to lose it before being compared with anything in base_link. Checked against
+# ROW_HEIGHTS_BASE: row 1 is 1.577 in world and 1.391 in base_link.
+BASE_LINK_Z = 0.186
+# grasp_node's grasp_below_centre_m, so the expected height miss is not zero.
+GRASP_BELOW_CENTRE = 0.045
 
 # The four stocked rows, in world z. From simulation.launch.py: the shelf centre is at
 # 1.1, the top board offset is 0.825, rows are 0.33 apart, and rows 0 and 5 are left
@@ -159,12 +165,19 @@ def main():
                                                         world[k]["py"] - robot["py"]))
     book = world[book_name]
 
-    yaw = math.atan2(2.0 * (robot["qw"] * robot["qz"] + robot["qx"] * robot["qy"]),
-                     1.0 - 2.0 * (robot["qy"] ** 2 + robot["qz"] ** 2))
-    dx, dy = book["px"] - robot["px"], book["py"] - robot["py"]
-    bx = dx * math.cos(-yaw) - dy * math.sin(-yaw)
-    by = dx * math.sin(-yaw) + dy * math.cos(-yaw)
-    bz = book["pz"] - robot["pz"]
+    def in_base(robot_pose):
+        """The book, in the base frame of a robot at this pose."""
+        yaw = math.atan2(
+            2.0 * (robot_pose["qw"] * robot_pose["qz"]
+                   + robot_pose["qx"] * robot_pose["qy"]),
+            1.0 - 2.0 * (robot_pose["qy"] ** 2 + robot_pose["qz"] ** 2))
+        dx = book["px"] - robot_pose["px"]
+        dy = book["py"] - robot_pose["py"]
+        return (dx * math.cos(-yaw) - dy * math.sin(-yaw),
+                dx * math.sin(-yaw) + dy * math.cos(-yaw),
+                book["pz"] - robot_pose["pz"])
+
+    bx, by, bz = in_base(robot)
     face_x = bx - BOOK_DEPTH / 2.0
 
     row, miss = true_row(book["pz"])
@@ -181,12 +194,32 @@ def main():
     print("  standoff           %.3f m from the face" % face_x)
     print("\nfeeding row %d for %.0f simulated seconds" % (row, SECONDS))
 
+    # Recompute the point every second, because base_link MOVES.
+    #
+    # This published one figure worked out at the start and kept publishing it, which is
+    # what bookfeed does on the bench and is safe there only because the bench pins the
+    # base. In the arena grasp_node drives the base to hold it against the book, so a
+    # point fixed in base_link walks away from the book at exactly the rate the robot
+    # corrects itself. Measured 2026-09-09: a run that reached its target to 2 mm and ran
+    # all the way to "done" closed the jaws at world y = -1.021 on a book at y = +0.056,
+    # 1.08 m away, on air. sim_grasp_fix reported the nearest book as one from another
+    # column entirely, and the book never moved.
+    #
+    # Every reading is a subprocess, so this holds to about 1 Hz. That is fine here: the
+    # base moves at centimetres a second and nothing is being teleported.
+    last_read = [0.0]
     end = None
     while rclpy.ok():
         if end is None:
             end = sim_now() + SECONDS
         if sim_now() > end:
             break
+        if sim_now() - last_read[0] > 1.0 and "pad" not in at_clamp:
+            last_read[0] = sim_now()
+            fresh = poses().get("tiago_pro")
+            if fresh is not None:
+                bx, by, bz = in_base(fresh)
+                face_x = bx - BOOK_DEPTH / 2.0
         pub_row.publish(Int32(data=int(row)))
         point = PointStamped()
         point.header.frame_id = "base_link"
@@ -214,9 +247,16 @@ def main():
         print("\nAT THE CLAMP, in base_link:")
         print("  pad middle      (%+.3f, %+.3f, %+.3f)" % pad)
         print("  grasping frame  (%+.3f, %+.3f, %+.3f)" % at_clamp["grasp"])
-        print("  book centre fed (%+.3f, %+.3f, %+.3f)" % (bx, by, bz))
+        # bz is the book's height above the ROBOT ORIGIN, which is on the floor, while
+        # the pads are in base_link, 0.186 m up. Comparing them directly reported a
+        # 234 mm height error on a reach that was three millimetres out.
+        book_in_base_z = bz - BASE_LINK_Z
+        print("  book centre     (%+.3f, %+.3f, %+.3f)" % (bx, by, book_in_base_z))
         print("  MISS: %+.0f mm depth, %+.0f mm sideways, %+.0f mm in HEIGHT"
-              % ((pad[0] - bx) * 1000, (pad[1] - by) * 1000, (pad[2] - bz) * 1000))
+              % ((pad[0] - bx) * 1000, (pad[1] - by) * 1000,
+                 (pad[2] - book_in_base_z) * 1000))
+        print("  (the grasp aims %.0f mm below centre on purpose)"
+              % (GRASP_BELOW_CENTRE * 1000))
     else:
         print("\nthe clamp was never reached, so there is no arrival to report")
 

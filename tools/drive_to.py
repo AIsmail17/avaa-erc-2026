@@ -56,6 +56,27 @@ BEARING_TOL = 0.03      # rad, while there is still distance to cover
 YAW_TOL = 0.03          # rad, for the final squaring
 DISTANCE_TOL = 0.020    # m
 
+# Inside this, stop chasing the bearing to the goal.
+#
+# Rotate-then-drive works until the goal is nearly underneath the robot, and then it comes
+# apart: the bearing to a point 30 mm away swings through whole radians on a base that
+# creeps 6 mm a second, so "abs(bearing) > BEARING_TOL" is true almost always and the
+# robot spins in place instead of closing the last few centimetres. It spins until the
+# budget runs out and then reports GAVE UP with a huge heading error, which is what these
+# three arena runs did:
+#
+#     GAVE UP at [2.238, -0.133] yaw +49.9 deg
+#     GAVE UP at [2.242, -0.233] yaw +87.4 deg
+#
+# Nearly perpendicular to a shelf it had driven all the way up to. The grasp then gets a
+# book 384 to 512 mm off to the side, which is past the 200 mm its base hold will correct,
+# so a drive that was 30 mm from finishing hands over a pose nothing downstream can use.
+#
+# Within NEAR_TOL the heading to the shelf is what matters and the remaining lateral error
+# does not: square up to yaw 0, creep along the robot's own x, and accept the sideways
+# residual, which the grasp's base hold absorbs comfortably.
+NEAR_TOL = 0.08         # m
+
 
 def gz(*args, timeout=25):
     return subprocess.run(["gz", *args], capture_output=True, text=True,
@@ -218,6 +239,17 @@ def main():
                 arrived = True
                 break
             node.send(0.0, node.turn(error, 1.2))
+        elif distance <= NEAR_TOL:
+            # Square to the shelf first, then close on x alone.
+            error = wrap(0.0 - yaw)
+            if abs(error) > YAW_TOL:
+                node.send(0.0, node.turn(error, 1.2))
+            elif abs(dx) > DISTANCE_TOL:
+                step = 0.8 * dx
+                node.send(max(-CREEP_SPEED, min(CREEP_SPEED, step)), 0.0)
+            else:
+                arrived = True
+                break
         else:
             bearing = wrap(math.atan2(dy, dx) - yaw)
             # Rotate then drive, never both and never sideways: commanding pure vy yaws
@@ -236,8 +268,9 @@ def main():
     node.hold(1.5)
     x, y, yaw = truth.value
     truth.stop = True
-    print("%s at [%.3f, %.3f] yaw %+.1f deg"
-          % ("arrived" if arrived else "GAVE UP", x, y, math.degrees(yaw)))
+    print("%s at [%.3f, %.3f] yaw %+.1f deg, %.0f mm from the goal in x, %.0f in y"
+          % ("arrived" if arrived else "GAVE UP", x, y, math.degrees(yaw),
+             (goal_x - x) * 1000, (goal_y - y) * 1000))
     print("book %s at [%.3f, %.3f, %.3f]" % (name, book[0], book[1], book[2]))
     print("so the book is %.3f m ahead and %+.3f m to the side"
           % (book[0] - x, book[1] - y))

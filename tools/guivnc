@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# The Gazebo window in a browser, live and clickable.
+#
+#     tools/guivnc          start it and print the URL
+#     tools/guivnc stop     stop it
+#
+# The other route -- tools/liveview.py -- relays a picture, and a picture is enough to
+# watch a run but not to orbit the camera, click an entity or read the inspector. This
+# serves the real window over VNC instead, so the mouse and keyboard go back to Gazebo.
+#
+# Why it is needed at all: WSLg draws the window correctly and never presents it to
+# Windows. Every title carries [WARN:COPY MODE] and /mnt/shared_memory does not exist,
+# which is microsoft/wslg#1456, open, no fix. X11 has the pixels; Windows does not. x11vnc
+# reads them from X11 and websockify puts them in a browser tab, which is a path that does
+# not involve the Windows compositor at all.
+#
+# It serves ONE window by id rather than the whole display, because WSLg is rootless:
+# there is no desktop behind the window to serve.
+set -u
+CONTAINER="${CONTAINER:-erc_sim}"
+VNC_PORT="${VNC_PORT:-5900}"
+WEB_PORT="${WEB_PORT:-6080}"
+
+stop_it() {
+    pids=$(docker exec "$CONTAINER" ps -eo pid=,args= \
+           | grep -E 'x11vnc|websockify' | grep -v ' ps -eo' | awk '{print $1}' | tr '\n' ' ')
+    if [ -n "${pids// /}" ]; then
+        docker exec "$CONTAINER" kill -9 $pids 2>/dev/null
+        echo "stopped: $pids"
+    else
+        echo "nothing was running"
+    fi
+}
+
+if [ "${1:-start}" = "stop" ]; then
+    stop_it
+    exit 0
+fi
+
+if ! docker exec "$CONTAINER" bash -c 'command -v x11vnc >/dev/null && command -v websockify >/dev/null'; then
+    echo "x11vnc and websockify are not in the container. Install them with:"
+    echo "    docker exec $CONTAINER apt-get install -y x11vnc novnc websockify"
+    exit 1
+fi
+
+WINDOW=$(docker exec -e DISPLAY=:0 "$CONTAINER" bash -c \
+    'xwininfo -root -tree 2>/dev/null | grep "\"Gazebo Sim\"" | head -1 | awk "{print \$1}"')
+if [ -z "${WINDOW:-}" ]; then
+    echo "no Gazebo window to serve. Start one first:  tools/sim gui"
+    exit 1
+fi
+echo "serving Gazebo window $WINDOW"
+
+stop_it >/dev/null 2>&1
+sleep 2
+
+docker exec -d -e DISPLAY=:0 "$CONTAINER" bash -c \
+    "x11vnc -display :0 -id $WINDOW -forever -shared -nopw -noshm -noxdamage -wait 40 \
+     -rfbport $VNC_PORT -quiet > /tmp/x11vnc.log 2>&1"
+sleep 4
+docker exec -d "$CONTAINER" bash -c \
+    "websockify --web=/usr/share/novnc $WEB_PORT localhost:$VNC_PORT > /tmp/websockify.log 2>&1"
+sleep 4
+
+if curl -s -m 8 -o /dev/null -w '%{http_code}' "http://localhost:$WEB_PORT/vnc.html" 2>/dev/null | grep -q 200; then
+    echo
+    echo "  http://localhost:$WEB_PORT/vnc.html   -- open in Windows, press Connect"
+    echo
+    echo "It is the real window, so the mouse works: drag to orbit, scroll to zoom."
+else
+    echo "it did not come up. Logs:"
+    docker exec "$CONTAINER" bash -c 'tail -5 /tmp/x11vnc.log; echo ---; tail -5 /tmp/websockify.log'
+    exit 1
+fi
