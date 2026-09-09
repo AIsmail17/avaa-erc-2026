@@ -1714,6 +1714,57 @@ class GraspNode(Node):
         self.pub_arm_right.publish(traj)
         self.get_logger().info("stowing the right arm clear of the shelf")
 
+    def _stow_left_arm(self) -> None:
+        """Fold the working arm before the shelf goes into the planning scene.
+
+        The right arm has been stowed here since the docstring above was written, for the
+        reason it gives: a limb left where it spawned sits inside a shelf board, so every
+        plan after that starts from an invalid state and OMPL refuses before it begins.
+        The same is true of the LEFT arm and was never done, which cost every row 1 grasp
+        in the arena.
+
+        Measured 2026-09-09 with tools/raisecheck.py, against /check_state_validity with
+        the whole robot and the shelf in the scene, at the moment the raise failed:
+
+            current state, as it stands     INVALID   arm_left_5_link vs shelf_board_3,
+                                                      arm_left_6_link vs shelf_board_3,
+                                                      arm_left_7_link vs shelf_board_3
+            goal: torso 0.35 + TUCK_POSE    VALID
+
+        and the goal is valid at every torso height from 0.00 to 0.35. So the raise was
+        never a hard motion; it was a motion out of a state the planner would not accept.
+        The left arm was at [-0.005, +0.002, -0.011, ...] -- straight out, where it spawns
+        -- and reached into the shelf on its own.
+
+        What it cost: the raise came back -2, grasp_node logged "reaching from where we
+        are", and the arm then had to work at torso zero with its shoulder at 0.677. A row
+        1 book at 1.391 is 714 mm above that, which puts it 1121 mm from the shoulder
+        against a measured limit of 1088. Thirty-three millimetres short, on a grasp that
+        would have had 190 mm of margin with the torso up.
+
+        Folded, and only then the shelf. The order matters: fold first and the state is
+        valid because there is no shelf in the scene yet to be invalid against; add the
+        shelf first and there is nothing the planner will move out of.
+        """
+        traj = JointTrajectory()
+        traj.joint_names = ["arm_left_%d_joint" % i for i in range(1, 8)]
+        point = JointTrajectoryPoint()
+        point.positions = [float(v) for v in TUCK_POSE]
+        point.time_from_start = Duration(sec=6, nanosec=0)
+        traj.points = [point]
+        self.pub_arm.publish(traj)
+        self.get_logger().info("folding the left arm clear of the shelf")
+
+    def _left_arm_stowed(self) -> bool:
+        """Is the left arm actually at the tuck yet?"""
+        worst = 0.0
+        for i, target in enumerate(TUCK_POSE, start=1):
+            actual = self.joints.get("arm_left_%d_joint" % i)
+            if actual is None:
+                return False
+            worst = max(worst, abs(_wrap(actual - target)))
+        return worst < STOW_TOLERANCE_RAD
+
     def _right_arm_stowed(self) -> bool:
         """Is the right arm actually at the tuck yet?"""
         worst = 0.0
@@ -1728,19 +1779,22 @@ class GraspNode(Node):
         # Send the stow once, then let later ticks watch for it to arrive.
         if self.stow_sent_at is None:
             self._stow_right_arm()
+            self._stow_left_arm()
             self.stow_sent_at = self.get_clock().now()
             return
 
         waited = (self.get_clock().now() - self.stow_sent_at).nanoseconds * 1e-9
-        if not self._right_arm_stowed():
+        right, left = self._right_arm_stowed(), self._left_arm_stowed()
+        if not (right and left):
             if waited < STOW_TIMEOUT_SEC:
                 return
             self.get_logger().warn(
-                "the right arm has not reached the stow after %.0f s; searching anyway, "
-                "and if this fails naming arm_right against a shelf board, that is why"
-                % waited)
+                "the arms have not reached their stow after %.0f s (right %s, left %s); "
+                "searching anyway, and if this fails naming an arm link against a shelf "
+                "board, that is why"
+                % (waited, "yes" if right else "no", "yes" if left else "no"))
         elif waited < STOW_TIMEOUT_SEC:
-            self.get_logger().info("right arm stowed after %.1f s" % waited)
+            self.get_logger().info("both arms stowed after %.1f s" % waited)
 
         if not self._add_shelf():
             self.get_logger().error("could not describe the shelf to the planner")
