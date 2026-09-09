@@ -43,6 +43,23 @@ ERC_LAB_Y     lateral offset (default 0.0)
 ERC_LAB_Z     height of the book's centre above the floor (default 1.00)
 ERC_LAB_COLOUR   book colour (default yellow)
 ERC_GRASP_FIX    1 to also run the pose-following grasp aid
+ERC_LAB_FLOAT    1 (the default) to switch gravity off for the bench book
+
+                 The book has to stay where the bench puts it or no arrival number
+                 means anything, and neither of the obvious ways works. Holding it up
+                 by repeated set_pose runs at one or two hertz, because every call is
+                 a subprocess, and a book falls 0.78 m in the 0.4 simulated seconds
+                 between placements -- one run had the arm arrive within 30 mm of its
+                 target while the book was 640 mm below it. Standing it on the post
+                 does not work either: the post is spawned at a world coordinate while
+                 the book is placed relative to the base, the two do not coincide, and
+                 a static model cannot be teleported to follow.
+
+                 So on the bench the book floats. This is a fixture and it is only
+                 honest because the question it removes is asked elsewhere: whether a
+                 real grip holds a book against gravity is what tools/canitgrip.py
+                 measures, with gravity on, and the answer is already no. What the
+                 bench is for is the reach and the grasp aid.
 
 Launch arguments
 ----------------
@@ -124,12 +141,18 @@ def generate_launch_description():
     book_sdf_path = os.path.join(arena_dir, 'models', 'book', 'sdf', 'erc_book.sdf')
     with open(book_sdf_path) as f:
         book_sdf = f.read().replace('BOOK_COLOUR_PLACEHOLDER', BOOK_COLOURS[colour])
-    book_file = '/tmp/erc_lab_book_%s.sdf' % colour
+    floating = os.environ.get('ERC_LAB_FLOAT', '1').lower() in ('1', 'true', 'yes')
+    if floating:
+        book_sdf = book_sdf.replace(
+            '<link name="book_base_link">',
+            '<link name="book_base_link">\n      <gravity>false</gravity>', 1)
+    book_file = '/tmp/erc_lab_book_%s%s.sdf' % (colour, '_float' if floating else '')
     with open(book_file, 'w') as f:
         f.write(book_sdf)
 
-    print('[grasp_lab] %s physics, one %s book at (%.2f, %.2f, %.2f) on a %.2f m post'
-          % (engine_name, colour, book_x, book_y, book_z, stand_top))
+    print('[grasp_lab] %s physics, one %s book at (%.2f, %.2f, %.2f) on a %.2f m post%s'
+          % (engine_name, colour, book_x, book_y, book_z, stand_top,
+             ', gravity off' if floating else ''))
 
     headless = LaunchConfiguration('headless')
     gazebo_gui = ExecuteProcess(

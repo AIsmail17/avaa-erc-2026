@@ -18,6 +18,7 @@ short in the arena completes here, then the shelf collision geometry is what sto
 which is a different fault from the arm being unable to reach, and has a different fix.
 """
 import math
+import os
 import subprocess
 import sys
 
@@ -34,6 +35,13 @@ TIP_R = "gripper_left_fingertip_right_link"
 GRASP = "gripper_left_grasping_link"
 PAD_LOCAL = (0.0042, 0.0187, 0.0000)
 BOOK_DEPTH = 0.16
+BOOK_TALL = 0.25
+
+# The post the launch put under the book. Its height is decided from ERC_LAB_Z, and it was
+# placed standing on the floor, so its centre is at half its height.
+LAB_Z = float(os.environ.get("ERC_LAB_Z", "1.00"))
+STAND_HEIGHT = LAB_Z - BOOK_TALL / 2.0
+STAND = "book_stand"
 
 SECONDS = float(sys.argv[1]) if len(sys.argv) > 1 else 240.0
 ROW = int(sys.argv[2]) if len(sys.argv) > 2 else 1
@@ -157,6 +165,22 @@ def main():
     wy = robot["py"] + target[0] * math.sin(yaw) + target[1] * math.cos(yaw)
     wz = robot["pz"] + target[2]
     print("placing %s at base_link (%.3f, %.3f, %.3f)" % (book_name, *target))
+
+    # Move the POST under it, and let the book rest on the post.
+    #
+    # Holding the book in mid-air by repeated set_pose does not work and the numbers say
+    # why: every call is a subprocess, so the loop runs at one or two hertz, and a book
+    # falls 0.78 m in the 0.4 simulated seconds between placements. One run had the arm
+    # arrive within 30 mm of its target while the book was 640 mm below and 550 mm to the
+    # side, and the grasp aid duly reported it 847 mm away. The post is static and does
+    # not fall, which is what the shelf board does in the arena.
+    stand_top = wz - BOOK_TALL / 2.0
+    gz("service", "-s", "/world/%s/set_pose" % WORLD,
+       "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
+       "--timeout", "800",
+       "--req", 'name: "%s", position: {x: %f, y: %f, z: %f}'
+                % (STAND, wx, wy, stand_top - STAND_HEIGHT / 2.0), timeout=4)
+    spin(0.5)
     for _ in range(6):
         gz("service", "-s", "/world/%s/set_pose" % WORLD,
            "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
@@ -184,6 +208,7 @@ def main():
     # Once the controller says it has the book, stop propping it up, so a real hold can
     # be told apart from this script holding it.
     held = [False]
+    ticks = [0]
     node.create_subscription(
         String, "/grasp_fix/holding",
         lambda m: held.__setitem__(0, bool(m.data)), 10)
@@ -201,18 +226,22 @@ def main():
         point.point.x, point.point.y, point.point.z = face_x, by, bz
         pub_point.publish(point)
         pub_yaw.publish(Float32(data=0.0))
-        # Hold the book up.
-        #
-        # In the arena a shelf board carries it. Here it hangs in mid-air, and a book that
-        # falls during the reach makes every arrival number meaningless -- one run
-        # reported a 193 mm height error against a book that was on the floor by then.
-        # Re-placing it each tick is what the shelf does.
-        if not held[0]:
-            gz("service", "-s", "/world/%s/set_pose" % WORLD,
-               "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
-               "--timeout", "400",
-               "--req", 'name: "%s", position: {x: %f, y: %f, z: %f}'
-                        % (book_name, wx, wy, wz), timeout=2)
+        # The post carries the book now, so this only steps in if it has been knocked
+        # off -- and never once the gripper is holding it, or a real pick would be
+        # fought by this script.
+        ticks[0] += 1
+        if not held[0] and ticks[0] % 15 == 0:
+            where = poses().get(book_name)
+            if where is not None:
+                slipped = math.dist((where["px"], where["py"], where["pz"]),
+                                    (wx, wy, wz))
+                if slipped > 0.05:
+                    print("  the book slipped %.0f mm; putting it back" % (slipped * 1000))
+                    gz("service", "-s", "/world/%s/set_pose" % WORLD,
+                       "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
+                       "--timeout", "600",
+                       "--req", 'name: "%s", position: {x: %f, y: %f, z: %f}'
+                                % (book_name, wx, wy, wz), timeout=3)
         spin(0.2)
         if states and states[-1] in ("done", "failed", "FAILED", "DONE"):
             print("  controller reached %s" % states[-1])

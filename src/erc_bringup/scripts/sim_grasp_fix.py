@@ -255,10 +255,26 @@ class GraspFix(Node):
             self.attach_asked = False
             return
         if best_gap > self.reach:
+            # Show the working, not just the verdict.
+            #
+            # This reported a book 858 mm away in a run where the grasp controller had
+            # measured its own pads 87 mm past the book face -- both cannot be true, and
+            # a bare distance gives nothing to tell which is wrong. The composition has
+            # been the fault before: an earlier version took the base heading from odom,
+            # whose frame is only world-aligned if the robot spawned at yaw zero, and
+            # reported 667 mm with the jaws closed around a book.
+            book = self.books.get(best)
             self.get_logger().info(
                 "jaws closed with the nearest book (%s) %.0f mm away, further than the "
-                "%.0f mm this will hold from. Letting the grasp fail honestly."
-                % (best, best_gap * 1000, self.reach * 1000))
+                "%.0f mm this will hold from. Letting the grasp fail honestly.\n"
+                "    gripper composed at (%.3f, %.3f, %.3f), base yaw %+.1f deg\n"
+                "    base at (%.3f, %.3f, %.3f), %d book poses known\n"
+                "    %s at (%.3f, %.3f, %.3f)"
+                % (best, best_gap * 1000, self.reach * 1000,
+                   here[0], here[1], here[2], math.degrees(yaw),
+                   self.robot_pose[0], self.robot_pose[1], self.robot_pose[2],
+                   len(self.books),
+                   best, book[0], book[1], book[2]))
             return
 
         # Remember how it was picked up, so it is carried the same way rather than
