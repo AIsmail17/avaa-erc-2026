@@ -209,7 +209,30 @@ TUCK_TORSO = 0.10
 # inside the shelf, against shelf_back. This one reaches 0.204 m forward and is
 # checked at both torso heights, because raising the torso for the top rows takes
 # the whole upper body with it.
-RIGHT_TUCK = [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0]
+# The right arm's folded posture, valid at EVERY torso height including zero.
+#
+# The previous value, [-0.36, -1.83, -0.47, -2.35, 0.0, -1.2, 0.0], put
+# arm_right_6_link inside base_link whenever the torso was down. Measured against
+# /check_state_validity with nothing else in the planning scene (tools/tuckvalid.py):
+#
+#     torso 0.00   INVALID   arm_right_6_link vs base_link
+#     torso 0.05   VALID
+#     torso 0.10 and above    VALID
+#
+# The stow is sent BEFORE the torso is raised, so zero is the height the arm actually
+# folds at -- and zero was the one height tools/find_right_tuck.py never checked. Once
+# the arm was there the whole robot state was invalid, and move_group refused every
+# subsequent plan before OMPL did any work:
+#
+#     [ompl] Skipping invalid start state (invalid state)
+#     [ompl] Unable to find solution by any of the threads in 0.000458 seconds
+#     [move_group] Catastrophic failure
+#
+# which arrives at the solution as a bare 99999 and looks like an arm that cannot reach.
+#
+# This one comes from the same search with 0.0 added to the heights it checks: 400
+# samples, folded to 0.204 m forward and 0.331 m sideways, valid at 0.0, 0.15 and 0.35.
+RIGHT_TUCK = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
 
 
 def _wrap(angle: float) -> float:

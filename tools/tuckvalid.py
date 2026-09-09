@@ -25,8 +25,10 @@ from sensor_msgs.msg import JointState
 
 sys.path.insert(0, "/opt/erc_ws/src/avaa_solution")
 from avaa_solution.approach_node import RIGHT_TUCK  # noqa: E402
+from avaa_solution.grasp_node import TUCK_POSE, TUCK_TORSO  # noqa: E402
 
 RIGHT = ["arm_right_%d_joint" % i for i in range(1, 8)]
+LEFT = ["arm_left_%d_joint" % i for i in range(1, 8)]
 
 
 def main():
@@ -91,8 +93,32 @@ def main():
 
     print("\nvalidity of the WHOLE robot (empty group means every group):")
     check("as it is now", {})
-    check("right arm exactly at RIGHT_TUCK", dict(zip(RIGHT, RIGHT_TUCK)))
     check("right arm at all zeros", {j: 0.0 for j in RIGHT})
+
+    # Sweep the torso.
+    #
+    # tools/find_right_tuck.py checked candidates at torso 0.15 and 0.35 only, and the
+    # stow is sent BEFORE the torso is raised -- so the one height that was never checked
+    # is the one the arm is actually at when it stows.
+    print("")
+    print("RIGHT_TUCK across the torso range:")
+    tuck = dict(zip(RIGHT, RIGHT_TUCK))
+    for torso in (0.0, 0.05, 0.10, 0.15, 0.25, 0.35):
+        overrides = dict(tuck)
+        overrides["torso_lift_joint"] = torso
+        check("  torso %.2f" % torso, overrides)
+
+    # The LEFT arm's tuck is the mirror of the right one, and the right one was broken at
+    # torso zero, so it is worth asking the same question. TUCK_TORSO is 0.10, i.e. the
+    # design intends this posture to be used with the torso already up -- which is fine
+    # as long as nothing ever adopts it lower.
+    print("")
+    print("TUCK_POSE (left arm) across the torso range, TUCK_TORSO is %.2f:" % TUCK_TORSO)
+    left = dict(zip(LEFT, TUCK_POSE))
+    for torso in (0.0, 0.05, 0.10, 0.15, 0.25, 0.35):
+        overrides = dict(left)
+        overrides["torso_lift_joint"] = torso
+        check("  torso %.2f" % torso, overrides)
 
     node.destroy_node()
     rclpy.shutdown()

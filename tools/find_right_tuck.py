@@ -26,7 +26,15 @@ from avaa_solution.kinematics.arm_chain import ArmChain  # noqa: E402
 
 URDF = "/opt/erc_ws/src/erc_description/urdf/tiago_pro.urdf"
 RIGHT = ["arm_right_%d_joint" % i for i in range(1, 8)]
-TORSO_HEIGHTS = [0.15, 0.35]
+# 0.0 belongs here and its absence cost a week.
+#
+# The stow is sent BEFORE the torso is raised, so the height the arm is actually at when
+# it folds is zero -- and zero was the one height this never checked. The posture it
+# produced, RIGHT_TUCK, is valid at 0.05 and above and puts arm_right_6_link inside
+# base_link at 0.00. Every plan made after the stow then starts from an invalid state and
+# move_group refuses it before OMPL does any work, which reads as an arm that will not
+# move. Measured with tools/tuckvalid.py.
+TORSO_HEIGHTS = [0.0, 0.15, 0.35]
 
 
 def main():
