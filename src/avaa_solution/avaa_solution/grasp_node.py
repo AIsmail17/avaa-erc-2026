@@ -137,10 +137,18 @@ GRIPPER_OPEN_MIN = 0.044
 #
 # All of that was measured at position_proportional_gain 0.1, where the finger
 # controller could not resolve a contact: it crawled toward its target and the book
-# was flicked out on the way. At gain 5 the finger stops ON the book -- commanded to
-# a span of 29.2 mm it settles at 29.6 with the book undisturbed, which is the book
-# holding it open. So the clamp goes back to asking for a firm close, because now
-# the controller can push against something instead of sliding past it.
+# was flicked out on the way. At gain 5 the finger was then recorded as stopping ON the
+# book -- commanded to a span of 29.2 mm and settling at 29.6 with the book undisturbed.
+#
+# That does not reproduce. tools/clampcurve.py closes on a book and on empty air at the
+# same commands and prints both, and wherever the joint landed in the same place so did
+# the span: 35.6 against 35.5 at +0.0015, 35.5 against 35.6 at 0.0000, 35.5 against 35.8
+# at -0.0010. The book was knocked 75 to 2178 mm away rather than gripped. Whatever the
+# earlier reading was, the finger does not stop on the book here, and the clamp value
+# cannot be chosen on the belief that it does.
+#
+# The value is left alone because the band it sits in was measured against ejection and
+# tipping, which are real effects; only the justification changes.
 #    0.0009   0.65 mm a side  ejects the book during the clamp, 1.2 rad of tip
 #    0.0015   0.25 mm a side  survives the clamp, slips during the withdraw and
 #                             topples after 78 mm
@@ -370,6 +378,37 @@ class GraspNode(Node):
         # A Cartesian path that only gets part way is a blocked reach, not a failure to
         # follow one. Below this, the grasp is abandoned rather than half-attempted.
         self.declare_parameter("min_reach_fraction", 0.9)
+        # Whether the finger span can be trusted to prove a grip.
+        #
+        # On the real robot it can: the gripper is force limited, a book between the pads
+        # stops them at the book, and jaws that reach the commanded close were holding
+        # nothing. That test needs no sensor this robot does not have and it is worth
+        # keeping.
+        #
+        # In this simulator it cannot, and the difference is not marginal. Measured with
+        # tools/clampcurve.py, which closes the jaws on a book and on empty air at the
+        # same commands and prints both, against the joint the finger REACHED rather than
+        # the one it was asked for:
+        #
+        #     commanded   free air         with the book      gained
+        #     +0.0015     +0.0022  35.6    -0.0010  35.5      -0.0 mm
+        #     +0.0000     -0.0002  35.5    -0.0010  35.6      +0.0 mm
+        #     -0.0010     -0.0009  35.5    -0.0010  35.8      +0.3 mm
+        #
+        # Wherever the joint landed in the same place, so did the span. The book never
+        # stopped the jaws; it was knocked 75 to 2178 mm away instead. The comment above
+        # GRIPPER_CLAMP claiming the finger stops ON the book does not survive this.
+        #
+        # There is also a plain contradiction inside the solution: GRIPPER_CLAMP is
+        # -0.0010, about 27.7 mm of span, and this test fails anything under 28.0 mm. The
+        # jaws are commanded to a width the test reads as proof of failure, so in
+        # simulation it cannot pass however well the grasp went -- and it refused one
+        # where the pads were measured 80 mm into the book and 2 mm off its centre.
+        #
+        # So it is a parameter rather than a deletion. True keeps the real robot honest;
+        # the simulation sets it false and leans on the geometric check instead, which is
+        # the one that has something to measure.
+        self.declare_parameter("trust_finger_span", True)
         # Arrival is judged per axis, because the axes are not equivalent. Sideways
         # is the tight one: the jaws open to 60.5 mm around a 30 mm book, so much
         # more than 15 mm off centre and a finger meets the front of the book
@@ -581,6 +620,7 @@ class GraspNode(Node):
         self.lift = float(self.get_parameter("lift_m").value)
         self.gripper_time = float(self.get_parameter("gripper_time_sec").value)
         self.min_fraction = float(self.get_parameter("min_reach_fraction").value)
+        self.trust_span = bool(self.get_parameter("trust_finger_span").value)
         self.tol_lateral = float(self.get_parameter("arrival_tol_lateral_m").value)
         self.tol_depth = float(self.get_parameter("arrival_tol_depth_m").value)
         self.tol_height = float(self.get_parameter("arrival_tol_height_m").value)
@@ -2395,7 +2435,14 @@ class GraspNode(Node):
         # again, and a run that says it failed is worth more in a log than a run that
         # says nothing.
         span = self._finger_span()
-        if span is not None and span < BOOK_THICKNESS - 0.002:
+        if span is not None and span < BOOK_THICKNESS - 0.002 and not self.trust_span:
+            self.get_logger().warning(
+                "the jaws closed to %.1f mm around a %.1f mm book, which on this robot "
+                "would mean they closed on nothing -- but trust_finger_span is off, so "
+                "this is the simulator's position-driven fingers closing through the "
+                "book rather than a missed grasp. Going on the geometry instead."
+                % (span * 1000, BOOK_THICKNESS * 1000))
+        elif span is not None and span < BOOK_THICKNESS - 0.002:
             self.get_logger().error(
                 "the jaws closed to %.1f mm and the book is %.1f mm thick, so they "
                 "closed on nothing. Not carrying an empty gripper to the bin."

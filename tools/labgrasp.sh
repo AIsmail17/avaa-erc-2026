@@ -157,7 +157,7 @@ echo
 echo "=== starting the grasp controller"
 docker exec -d erc_sim /entrypoint.sh bash -c \
     "source /opt/erc_ws/install/setup.bash && ros2 run avaa_solution grasp --ros-args \
-     -p use_sim_time:=true -p hold_base:=false > /tmp/labgrasp.log 2>&1"
+     -p use_sim_time:=true -p hold_base:=false -p trust_finger_span:=false > /tmp/labgrasp.log 2>&1"
 sleep 8
 
 echo
