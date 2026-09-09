@@ -112,10 +112,22 @@ def main():
     pub_yaw = node.create_publisher(Float32, "/avaa/perception/shelf_yaw", 10)
 
     states = []
-    node.create_subscription(
-        String, "/avaa/grasp/state",
-        lambda m: (states.append(m.data)
-                   if not states or states[-1] != m.data else None), 10)
+    # Where the gripper is AT THE CLAMP, not where it ends up.
+    #
+    # These numbers used to be read once the feed finished, which is after the arm has
+    # lifted, withdrawn and stowed -- so a grasp that ran to "done" reported the pads
+    # 698 mm short of the book and 1312 mm out in height, describing a folded arm rather
+    # than a reach. That is useless for the one question being asked of it, which is
+    # whether the arm arrives at the right HEIGHT.
+    at_clamp = {}
+
+    def on_state(m):
+        if not states or states[-1] != m.data:
+            states.append(m.data)
+        if m.data == "clamping" and "pad" not in at_clamp:
+            at_clamp["pending"] = True
+
+    node.create_subscription(String, "/avaa/grasp/state", on_state, 10)
 
     def sim_now():
         return node.get_clock().now().nanoseconds * 1e-9
@@ -226,6 +238,15 @@ def main():
         point.point.x, point.point.y, point.point.z = face_x, by, bz
         pub_point.publish(point)
         pub_yaw.publish(Float32(data=0.0))
+        # Snapshot on the tick after the clamp is announced, from this thread, where the
+        # transforms and the pose feed are already being read.
+        if at_clamp.pop("pending", False):
+            try:
+                pa, pb = at(TIP_L, PAD_LOCAL), at(TIP_R, PAD_LOCAL)
+                at_clamp["pad"] = tuple((pa[i] + pb[i]) / 2.0 for i in range(3))
+                at_clamp["grasp"] = at(GRASP, (0.0, 0.0, 0.0))
+            except Exception as exc:  # noqa: BLE001
+                print("  could not read the arrival (%s)" % exc)
         # The post carries the book now, so this only steps in if it has been knocked
         # off -- and never once the gripper is holding it, or a real pick would be
         # fought by this script.
@@ -249,7 +270,21 @@ def main():
 
     print("\nstates seen: %s" % (" -> ".join(states) if states else "none"))
 
-    print("\nwhere the gripper finished:")
+    if "pad" in at_clamp:
+        pad = at_clamp["pad"]
+        print("\nAT THE CLAMP, in base_link:")
+        print("  pad middle      (%+.3f, %+.3f, %+.3f)" % pad)
+        print("  grasping frame  (%+.3f, %+.3f, %+.3f)" % at_clamp["grasp"])
+        print("  book fed at     (%+.3f, %+.3f, %+.3f)" % (bx, by, bz))
+        print("  MISS: %+.0f mm depth, %+.0f mm sideways, %+.0f mm in HEIGHT"
+              % ((pad[0] - bx) * 1000, (pad[1] - by) * 1000, (pad[2] - bz) * 1000))
+        if abs(pad[2] - bz) > 0.15:
+            print("  shelf rows are 330 mm apart, so that is %.1f rows out"
+                  % ((pad[2] - bz) / 0.33))
+    else:
+        print("\nthe clamp was never reached, so there is no arrival to report")
+
+    print("\nwhere the gripper finished (AFTER stowing -- expect a folded arm):")
     try:
         g = at(GRASP, (0.0, 0.0, 0.0))
         a, b = at(TIP_L, PAD_LOCAL), at(TIP_R, PAD_LOCAL)
