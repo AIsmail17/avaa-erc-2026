@@ -5,17 +5,25 @@
 #
 # Every teardown in this project used pkill -f, and pkill -f could not do the job.
 # Observed 2026-09-09: five liveviews holding ports 8090-8094, four bridge pairs and four
-# grasp nodes burning 70% of a core each, all left over from earlier sessions. pkill
-# reported success on each of them and they were still there afterwards -- once with
-# SIGTERM, once with SIGKILL, once with the bracketed patterns that are supposed to stop
-# pkill matching the shell that runs it. The processes were not zombies; they were in R
-# state at 200% CPU.
+# grasp nodes burning 70% of a core each, all left over from earlier sessions, with pkill
+# reporting success on each of them and every one still running afterwards.
 #
-# Rather than work out which of pkill's several ways of matching its own command line was
-# to blame, this lists the PIDs in one shell and kills them from another. There is no
-# pattern in the killing shell to match, so nothing can match itself, and the result is
-# checked rather than assumed. Three rounds, because a supervisor can respawn a child
-# once.
+# The reason, found later the same day: ros2 run spawns the node with a SLASH.
+#
+#     wrapper: /opt/ros/humble/bin/ros2 run avaa_solution grasp
+#     node   : /opt/erc_ws/install/avaa_solution/lib/avaa_solution/grasp
+#
+# So "pkill -f 'avaa_solution grasp'" matches the wrapper, kills it, exits 0, and never
+# touches the node. The node then keeps running with no parent to stop it -- and a grasp
+# node holds the base against its book, so it drives the robot. One was found at 112% of a
+# core steering against a drive that was trying to place the robot for a grasp.
+#
+# This sweep matches on the package name alone, without a following word, so it catches
+# both. It also lists the PIDs in one shell and kills them from another, which removes the
+# other way pkill goes wrong: its patterns appear in the command line of the shell running
+# it, so it can kill itself part way down a list and silently skip the rest. Three rounds,
+# because a supervisor can respawn a child once, and the result is checked rather than
+# assumed.
 #
 # Why this matters beyond tidiness: a stale liveview holds its port, so the next one dies
 # with "Address already in use" into a log nobody reads while the browser keeps showing a

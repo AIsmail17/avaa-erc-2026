@@ -40,7 +40,7 @@ echo "=== clearing anything left over"
 docker exec erc_sim bash -c '
     pkill -f "[l]iveview.py"; pkill -f "[p]arameter_bridge.*spectator";
     pkill -f "[g]rasp_lab.launch.py"; pkill -f "[g]z sim";
-    pkill -f "[a]vaa_solution grasp";
+    pkill -f "[a]vaa_solution.grasp";
     rm -f /tmp/pin_base.py /tmp/liveview.py;
     sleep 3; true' 2>/dev/null
 

@@ -33,11 +33,32 @@ if ./tools/sim status 2>&1 | grep -q 'SILENT'; then
 fi
 
 mkdir -p ~/erc/logs ~/erc/runs
+# The dot is load bearing: ros2 run spawns the node with a SLASH.
+#
+#     wrapper: /opt/ros/humble/bin/ros2 run avaa_solution grasp
+#     node   : /opt/erc_ws/install/avaa_solution/lib/avaa_solution/grasp
+#
+# "avaa_solution grasp" therefore matches the wrapper and never the node, so every
+# teardown in this project killed the wrapper, reported success, and left the node
+# running. Two grasp nodes and a perception node were found alive that way on
+# 2026-09-09, one of them holding the base against a stale book point at 112% of a core
+# while a drive was trying to place the robot -- which is why the robot wandered, ended
+# 0.78 m from a 0.65 m standoff, and once finished with the target book behind it.
+#
+# avaa_solution.grasp matches both.
 docker exec erc_sim bash -c \
-    'pkill -f moveit.launch.py; pkill -f "avaa_solution perception"; pkill -f "avaa_solution grasp"; sleep 2; true'
+    'pkill -f moveit.launch.py; pkill -f "[a]vaa_solution.perception"; pkill -f "[a]vaa_solution.grasp"; sleep 2; true'
 
+# Every timeout here has to fire INSIDE the container.
+#
+# "timeout 420 ./tools/in-sim drive_to.py ..." kills the docker exec client on the host
+# and leaves the python running in the container, still driving. One orphan steered the
+# base for twenty minutes against three later attempts to place the robot; the same thing
+# with a grasp node, which holds the base against its book, turned the robot ninety
+# degrees and left the target behind it. Both looked like the drive and the grasp being
+# broken.
 echo "=== 1. standing back at $FAR m, where the marker is visible"
-timeout 420 ./tools/in-sim drive_to.py "$COLOUR" "$FAR" 2>&1 | tail -3
+INSIM_TIMEOUT=420 ./tools/in-sim drive_to.py "$COLOUR" "$FAR" 2>&1 | tail -3
 
 echo
 echo "=== 2. move_group and perception up"
@@ -69,7 +90,7 @@ fi
 
 echo
 echo "=== 4. closing to $STANDOFF m, perception tracking throughout"
-timeout 420 ./tools/in-sim drive_to.py "$COLOUR" "$STANDOFF" 2>&1 | tail -3
+INSIM_TIMEOUT=420 ./tools/in-sim drive_to.py "$COLOUR" "$STANDOFF" 2>&1 | tail -3
 
 echo
 echo "=== 5. the grasp"
@@ -86,8 +107,9 @@ LOG=~/erc/logs/bench.log
 # With the default, the grasp cannot pass its own check here whatever the arm does,
 # and the run dies on a message about closing on nothing that says nothing about the
 # grasp. Lean on the geometric check instead, which has something real to measure.
-timeout 400 docker exec erc_sim /entrypoint.sh bash -c \
-  "source /opt/erc_ws/install/setup.bash && ros2 run avaa_solution grasp --ros-args \
+docker exec erc_sim /entrypoint.sh bash -c \
+  "source /opt/erc_ws/install/setup.bash && exec timeout -s KILL 400 \
+   ros2 run avaa_solution grasp --ros-args \
    -p use_sim_time:=true -p trust_finger_span:=${TRUST_SPAN:-false}" > "$LOG" 2>&1
 
 echo
