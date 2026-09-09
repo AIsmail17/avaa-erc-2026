@@ -17,6 +17,7 @@ There is no shelf in the lab world, and that is the experiment. If a reach that 
 short in the arena completes here, then the shelf collision geometry is what stops it --
 which is a different fault from the arm being unable to reach, and has a different fix.
 """
+import io
 import math
 import os
 import subprocess
@@ -37,11 +38,53 @@ PAD_LOCAL = (0.0042, 0.0187, 0.0000)
 BOOK_DEPTH = 0.16
 BOOK_TALL = 0.25
 
-# The post the launch put under the book. Its height is decided from ERC_LAB_Z, and it was
-# placed standing on the floor, so its centre is at half its height.
-LAB_Z = float(os.environ.get("ERC_LAB_Z", "1.00"))
-STAND_HEIGHT = LAB_Z - BOOK_TALL / 2.0
+# The post the launch put under the book, measured from the world FILE rather than
+# recomputed from ERC_LAB_Z.
+#
+# It used to be STAND_HEIGHT = ERC_LAB_Z - BOOK_TALL/2, which is the same formula the
+# launch uses and still came out wrong every time, because docker exec starts a fresh
+# environment and inherits nothing from the shell that ran tools/lab. So the launch built
+# the post from labgrasp's book height while this read the 1.00 default:
+#
+#     real post, from /tmp/erc_grasp_lab.sdf   1.0850 m, centred at 0.5425
+#     what this assumed                        0.8750 m
+#
+# The post is then placed by its centre, at stand_top - STAND_HEIGHT/2, so a post 210 mm
+# taller than assumed puts its top 105 mm ABOVE the underside of the book -- and the book
+# visibly clips into the thing it is standing on. Which is what it was doing.
+#
+# Not only cosmetic: DART has to resolve that overlap, so the book is being held by an
+# intersection rather than resting on a surface, in the one measurement this tool exists
+# to make.
 STAND = "book_stand"
+LAB_WORLD = "/tmp/erc_grasp_lab.sdf"
+
+
+def stand_height():
+    """The post's real height, from the world the simulator is actually running."""
+    try:
+        world = io.open(LAB_WORLD, encoding="utf-8").read()
+    except OSError:
+        world = ""
+    inside = world.find('name="%s"' % STAND)
+    if inside != -1:
+        box = world.find("<box><size>", inside)
+        if box != -1:
+            parts = world[box + len("<box><size>"):
+                          world.find("</size>", box)].split()
+            if len(parts) == 3:
+                try:
+                    return float(parts[2])
+                except ValueError:
+                    pass
+    fallback = float(os.environ.get("ERC_LAB_Z", "1.00")) - BOOK_TALL / 2.0
+    print("could not read the post from %s; assuming %.4f m, which may be wrong"
+          % (LAB_WORLD, fallback))
+    return fallback
+
+
+LAB_Z = float(os.environ.get("ERC_LAB_Z", "1.00"))
+STAND_HEIGHT = stand_height()
 
 SECONDS = float(sys.argv[1]) if len(sys.argv) > 1 else 240.0
 ROW = int(sys.argv[2]) if len(sys.argv) > 2 else 1

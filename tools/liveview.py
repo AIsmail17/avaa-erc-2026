@@ -72,30 +72,17 @@ PAGE = b"""<!doctype html>
 <title>AVAA - live simulation</title>
 <style>
   body { background:#111; color:#ddd; font:14px system-ui,sans-serif; margin:0; padding:16px; }
-  h1 { font-size:15px; font-weight:600; margin:0 0 12px; letter-spacing:.02em; }
-  .row { display:flex; flex-wrap:wrap; gap:16px; }
-  figure { margin:0; }
-  figcaption { padding:6px 2px; color:#8b8b8b; font-size:12px; }
+  h1 { font-size:15px; font-weight:600; margin:0 0 4px; letter-spacing:.02em; }
+  p { color:#8b8b8b; font-size:12px; margin:0 0 12px; }
+  a { color:#7aa7d8; }
   img { display:block; background:#000; border:1px solid #333; max-width:100%; height:auto; }
 </style>
 <h1>AVAA &mdash; Emirates Robotics Competition, live from Gazebo</h1>
-<div class="row">
-  <figure>
-    <img src="/spectator" width="720">
-    <figcaption>Spectator camera &mdash; watching the robot</figcaption>
-  </figure>
-  <figure>
-    <img src="/head" width="480">
-    <figcaption>Robot head camera &mdash; what perception sees</figcaption>
-  </figure>
-</div>
-<div class="row" style="margin-top:16px">
-  <figure>
-    <img src="/gui" width="1000">
-    <figcaption>The Gazebo window itself &mdash; relayed out of X11, because WSLg
-      will not put it on the Windows desktop (microsoft/wslg#1456)</figcaption>
-  </figure>
-</div>
+<p>One stream, three panels. Separate streams if you want them:
+   <a href="/gui">/gui</a> &middot;
+   <a href="/spectator">/spectator</a> &middot;
+   <a href="/head">/head</a></p>
+<img src="/all" width="1280">
 """
 
 
@@ -190,11 +177,62 @@ def grab_gui(frames):
         time.sleep(max(0.0, period - (time.time() - started)))
 
 
-def placeholder(text):
+def placeholder_image(text):
     image = np.full((360, 640, 3), 24, np.uint8)
     cv2.putText(image, text, (24, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                 (180, 180, 180), 1, cv2.LINE_AA)
-    return cv2.imencode(".jpg", image)[1].tobytes()
+    return image
+
+
+def placeholder(text):
+    return cv2.imencode(".jpg", placeholder_image(text))[1].tobytes()
+
+
+def compose(frames, width=1280):
+    """One picture with all three views in it.
+
+    Three <img> tags pointed at three MJPEG endpoints is three HTTP connections that never
+    end, and in practice one of them wins and the others sit blank -- reported as "only one
+    view working", and reproducible by reloading the page, which leaves the old streams
+    holding their sockets until they time out. A composite is one connection, so there is
+    nothing to lose a race with, and every panel is from the same instant.
+    """
+    gui = frames.get("gui")
+    spec = frames.get("spectator")
+    head = frames.get("head")
+
+    def decode(jpeg, fallback_text):
+        if jpeg is None:
+            return placeholder_image(fallback_text)
+        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        return image if image is not None else placeholder_image(fallback_text)
+
+    def fit(image, w, h):
+        out = np.zeros((h, w, 3), np.uint8)
+        scale = min(w / image.shape[1], h / image.shape[0])
+        small = cv2.resize(image, (max(1, int(image.shape[1] * scale)),
+                                   max(1, int(image.shape[0] * scale))))
+        y = (h - small.shape[0]) // 2
+        x = (w - small.shape[1]) // 2
+        out[y:y + small.shape[0], x:x + small.shape[1]] = small
+        return out
+
+    def label(image, text):
+        cv2.rectangle(image, (0, 0), (image.shape[1], 22), (20, 20, 20), -1)
+        cv2.putText(image, text, (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (210, 210, 210), 1, cv2.LINE_AA)
+        return image
+
+    half = width // 2
+    top = label(fit(decode(gui, "no Gazebo window"), width, int(width * 0.60)),
+                "Gazebo window (relayed from X11)")
+    left = label(fit(decode(spec, "no spectator camera"), half, int(half * 0.62)),
+                 "Spectator camera")
+    right = label(fit(decode(head, "no head camera"), width - half, int(half * 0.62)),
+                  "Robot head camera")
+    bottom = np.hstack([left, right])
+    return cv2.imencode(".jpg", np.vstack([top, bottom]),
+                        [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -213,7 +251,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         which = self.path.strip("/")
-        if which not in ("spectator", "head", "gui"):
+        if which not in ("spectator", "head", "gui", "all"):
             self.send_error(404)
             return
 
@@ -225,11 +263,16 @@ class Handler(BaseHTTPRequestHandler):
         waiting = placeholder("waiting for %s frames..." % which)
         try:
             while True:
-                jpeg = self.frames.get(which) or waiting
+                if which == "all":
+                    jpeg = compose(self.frames)
+                    pause = 0.25
+                else:
+                    jpeg = self.frames.get(which) or waiting
+                    pause = 0.06
                 self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
                                  b"Content-Length: " + str(len(jpeg)).encode()
                                  + b"\r\n\r\n" + jpeg + b"\r\n")
-                time.sleep(0.06)
+                time.sleep(pause)
         except (BrokenPipeError, ConnectionResetError):
             return  # the tab was closed, which is not an error
 
@@ -276,7 +319,8 @@ def main():
     print("live view on http://localhost:%d" % port, flush=True)
     print("(from Windows, open that in a browser -- WSL forwards localhost)",
           flush=True)
-    print("streams: /spectator, /head and /gui", flush=True)
+    print("streams: /all (everything, one connection), /spectator, /head, /gui",
+          flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
