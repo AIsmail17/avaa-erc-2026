@@ -386,13 +386,41 @@ cmd_gui() {
     # libd3d12.so lives. On a real Linux box neither exists, and forcing them
     # stops Mesa picking the driver it would have chosen correctly for the
     # Intel graphics through /dev/dri.
+    # QT_X11_NO_MITSHM is NOT set here, and that is the whole fix.
+    #
+    # It was, and it is what made the window unreliable. There is no /dev/dri in WSL --
+    # not in the container and not in WSL itself -- so Mesa cannot get a hardware DRI
+    # screen and falls back to software GLX, which is the drisw path. drisw moves its
+    # pixels to the X server through MIT shared memory. Turning MIT-SHM off removes the
+    # only route it has, so it fails to make a screen, then fails to load the driver, and
+    # Qt aborts on the missing context:
+    #
+    #     libGL error: glx: failed to create drisw screen
+    #     libGL error: failed to load driver: swrast
+    #     [GUI] [Err] Failed to create OpenGL context
+    #
+    # Which reads exactly like the WSL virtual GPU having dropped, and was diagnosed as
+    # that for days. It is not: it is this variable. Measured with it removed, software
+    # rendering survived three starts out of three, where every combination tried with it
+    # in place managed at best one out of two.
     local gui_env=(-e "DISPLAY=$(host_display)"
-                   -e QT_X11_NO_MITSHM=1
                    -e XDG_RUNTIME_DIR=/tmp/runtime-root)
     if is_wsl; then
-        gui_env+=(-e GALLIUM_DRIVER=d3d12
-                  -e MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
-                  -e LD_LIBRARY_PATH=/usr/lib/wsl/lib)
+        # Hardware first, software second.
+        #
+        # d3d12 is Mesa talking to the Windows GPU through WSL's virtual adapter, and
+        # /usr/lib/wsl/lib is where libd3d12.so lives. When it works the window is
+        # quick. When it does not, llvmpipe draws on the CPU: slower, and this machine
+        # has 24 cores to spend on it, but it has not failed yet.
+        gui_env+=(-e LD_LIBRARY_PATH=/usr/lib/wsl/lib)
+        if [ "$attempt" -eq 1 ] && [ "${GUI_SOFTWARE:-0}" != "1" ]; then
+            gui_env+=(-e GALLIUM_DRIVER=d3d12
+                      -e MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA)
+            grn "Trying the GPU first."
+        else
+            gui_env+=(-e LIBGL_ALWAYS_SOFTWARE=1 -e GALLIUM_DRIVER=llvmpipe)
+            grn "Drawing on the CPU, which is slower and does not fail."
+        fi
     fi
     grn "Drawing on display $(host_display)."
     docker exec -d "${gui_env[@]}" \

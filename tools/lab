@@ -81,8 +81,29 @@ up)
     # until the processes are actually gone, rather than sleeping and hoping.
     teardown
 
+    # What the window needs, when one is wanted.
+    #
+    # There is no /dev/dri in WSL, so Mesa has no hardware DRI screen and falls back to
+    # software GLX -- the drisw path -- which moves pixels through MIT shared memory.
+    # QT_X11_NO_MITSHM would take that away and the GUI would abort on a missing OpenGL
+    # context; it is deliberately not set anywhere near this. See the long note in
+    # tools/sim under the gui command for the measurement.
+    gui_env=()
+    if [ "${HEADLESS:-true}" != "true" ] && grep -qi microsoft /proc/version 2>/dev/null; then
+        gui_env=(-e "DISPLAY=${DISPLAY:-:0}"
+                 -e XDG_RUNTIME_DIR=/tmp/runtime-root
+                 -e LD_LIBRARY_PATH=/usr/lib/wsl/lib)
+        if [ "${GUI_SOFTWARE:-1}" = "1" ]; then
+            gui_env+=(-e LIBGL_ALWAYS_SOFTWARE=1 -e GALLIUM_DRIVER=llvmpipe)
+            echo "    window on the CPU (GUI_SOFTWARE=0 to try the GPU instead)"
+        else
+            gui_env+=(-e GALLIUM_DRIVER=d3d12 -e MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA)
+            echo "    window on the GPU"
+        fi
+    fi
+
     echo "=== bringing the bench up on $engine physics"
-    docker exec -d \
+    docker exec -d "${gui_env[@]+"${gui_env[@]}"}" \
         -e "ERC_PHYSICS=$engine" \
         -e "ERC_LAB_X=${ERC_LAB_X:-0.75}" \
         -e "ERC_LAB_Y=${ERC_LAB_Y:-0.0}" \

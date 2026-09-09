@@ -105,15 +105,44 @@ cd ~/erc/erc_sim_2026
 `./tools/sim status` says what is running, `./tools/sim log` follows the log, and
 `./tools/sim stop` ends it.
 
-## If the window does not appear
+## The window draws on the CPU here, on purpose
+
+There is no `/dev/dri` in WSL — not in the container, and not in WSL itself. Mesa
+therefore cannot get a hardware DRI screen and falls back to software GLX, the `drisw`
+path, which moves its pixels to the X server through MIT shared memory.
+
+`QT_X11_NO_MITSHM=1` takes that away, and it was being set. Without shared memory `drisw`
+cannot make a screen, cannot load the driver, and Qt aborts on the missing context:
+
+    libGL error: glx: failed to create drisw screen
+    libGL error: failed to load driver: swrast
+    [GUI] [Err] Failed to create OpenGL context
+
+That reads exactly like WSL having dropped the virtual GPU, which is a real failure with
+an identical message, and it was diagnosed as that for days — including a retry loop
+built to wait for a GPU that had never gone anywhere. It is this one variable. With it
+removed, software rendering survived **three starts out of three**; every combination
+tried with it still set managed at best one out of two, and that intermittency is what
+made the wrong diagnosis look plausible.
+
+So the window now draws on the CPU by default. It is slower and it does not fail. This
+machine has 24 cores to spend on it, and the bench still ran at a real-time factor of
+**0.84** with the window open.
+
+To try the GPU instead — quicker when it works, and it does not always:
+
+```bash
+GUI_SOFTWARE=0 HEADLESS=false ./tools/lab up dart
+```
+
+## If the window still does not appear
 
 - `echo $DISPLAY` in the Ubuntu terminal should print `:0`. If it is empty, close the
   terminal and open a new one — WSLg sets it at login.
 - `docker exec erc_sim bash -c 'ls /tmp/.X11-unix'` should list `X0`. If it does not, the
   container was started without the socket mounted; `./tools/sim rebuild` recreates it.
-- The real-time factor with a window on this machine is about **0.37** on the bench
-  against **0.5 to 1.0** headless. A window costs roughly half the speed. That is the
-  price of watching, and it is worth paying while you are actually looking.
+- Keep the terminal open. WSL shuts itself down when no command is running and takes
+  Docker, the container and the window with it.
 
 ---
 
