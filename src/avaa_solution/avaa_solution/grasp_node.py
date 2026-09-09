@@ -776,7 +776,19 @@ class GraspNode(Node):
 
         def run():
             try:
-                self.motion_result = function()
+                result = function()
+                # Say what came back, always.
+                #
+                # A run reported "error 99999" for two motions with no traceback anywhere
+                # in the log, and 99999 is only ever set by the handler below -- which
+                # logs before it sets it. The two facts cannot both be true, so one of
+                # them is not being observed, and guessing which has already cost an
+                # afternoon. This line makes the success path say what it returned, so
+                # the next occurrence is readable rather than deduced.
+                self.get_logger().info(
+                    "%s returned %r (moveit says %r)"
+                    % (label, result, self.moveit.last_failure))
+                self.motion_result = result
             except BaseException as exc:  # noqa: BLE001 - a failed motion is not a crash
                 # repr and a traceback, not str(exc).
                 #
