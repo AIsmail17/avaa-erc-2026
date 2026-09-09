@@ -298,10 +298,27 @@ class GraspNode(Node):
         # dumb joint-space interpolation clear of the shelf.
         self.declare_parameter("standoff_m", 0.15)
         # How far past the book face the GRASPING FRAME is driven, which is not where the
-        # jaws are: they sit 29.7 mm behind that frame, measured from TF. At 0.05 a
-        # perfect arrival put the jaws 20 mm inside the face, and an arrival 29 mm short
-        # in depth -- inside tolerance, and dead on sideways and in height -- closed them
-        # 9 mm in FRONT of the book. 0.11 puts them in the middle of a 160 mm book.
+        # jaws are. At 0.05 a perfect arrival put the jaws 20 mm inside the face, and an
+        # arrival 29 mm short in depth -- inside tolerance, and dead on sideways and in
+        # height -- closed them 9 mm in FRONT of the book.
+        #
+        # The 29.7 mm offset this used to quote is wrong, and it is wrong in a way that
+        # matters because the whole depth budget is built on it. 29.7 mm is the gap
+        # between LINK ORIGINS. The pads are not at their link origins -- the fingertip
+        # collision is its own 10772-triangle visual mesh, whose bounding box centre sits
+        # 18.7 mm off the origin -- and the offset also grows with the jaw opening,
+        # because the pads ride a four-bar. Measured along base +x (tools/padoffset.py):
+        #
+        #     jaw 0.000   pads  6.2 mm behind the grasping frame
+        #     jaw 0.040   pads  8.2 mm
+        #     jaw 0.060   pads 10.7 mm
+        #     jaw 0.068   pads 11.4 mm      <- the opening the reach actually uses
+        #
+        # So 0.11 does not put the jaws in the middle of a 160 mm book; it puts them at
+        # face + 99 mm, about 19 mm deeper than intended. Still inside the book, so this
+        # is margin rather than a miss, and the value is left alone until a bench run can
+        # show what moving it does. It is recorded here so the next person does not
+        # rebuild an argument on the old number.
         self.declare_parameter("grasp_depth_m", 0.11)
         # No lift before withdrawing.
         #
