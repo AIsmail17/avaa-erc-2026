@@ -75,9 +75,20 @@ echo
 echo "=== 5. the grasp"
 LOG=~/erc/logs/bench.log
 : > "$LOG"
+# trust_finger_span:=false, because this script only ever runs in the simulator.
+#
+# The parameter defaults to true, which is right for the real robot: jaws that close
+# past the thickness of the book closed on nothing. In Gazebo they ALWAYS close past
+# it. DART refuses the mimic constraints in this gripper, so the driven joint goes
+# where it is told and the linkage follows through the book -- measured at 27.4 mm
+# around a 30.0 mm book while the book was still sitting on its shelf.
+#
+# With the default, the grasp cannot pass its own check here whatever the arm does,
+# and the run dies on a message about closing on nothing that says nothing about the
+# grasp. Lean on the geometric check instead, which has something real to measure.
 timeout 400 docker exec erc_sim /entrypoint.sh bash -c \
   "source /opt/erc_ws/install/setup.bash && ros2 run avaa_solution grasp --ros-args \
-   -p use_sim_time:=true" > "$LOG" 2>&1
+   -p use_sim_time:=true -p trust_finger_span:=${TRUST_SPAN:-false}" > "$LOG" 2>&1
 
 echo
 grep -vE 'throttle' "$LOG" | tail -45

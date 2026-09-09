@@ -6,6 +6,7 @@
 # every invocation in this project has done by hand until now.
 #
 #     tools/in-sim place_robot.py book_col_3_row_3_yellow 0.68
+#     INSIM_TIMEOUT=300 tools/in-sim drive_to.py red 0.65    # timed out INSIDE the container
 #     tools/in-sim ideal_grasp.py book_col_3_row_3_yellow
 #     tools/in-sim tuck_arm.py 55
 #
@@ -20,5 +21,23 @@ if [ $# -lt 1 ]; then
 fi
 TOOL="$1"; shift
 [ -f "$HERE/$TOOL" ] || { echo "no such tool: $TOOL"; exit 1; }
+# INSIM_TIMEOUT applies INSIDE the container, and it has to.
+#
+# "timeout 420 tools/in-sim drive_to.py ..." does not stop drive_to. timeout kills the
+# docker exec client on this side; the python it started keeps running in the container,
+# and in the case of a driving tool it keeps driving. Observed 2026-09-09: an orphaned
+# drive_to steered the base for twenty minutes while three later commands tried to place
+# the robot, taking it from 0.35 m short of its standoff to 0.78 m and turning it 24
+# degrees off; a grasp node orphaned the same way by graspbench turned the robot about
+# ninety degrees, leaving the target book BEHIND it at x = -0.095. Both looked like the
+# drive and the grasp being broken. Neither was.
+#
+#     INSIM_TIMEOUT=420 tools/in-sim drive_to.py red 0.65
+#
+if [ -n "${INSIM_TIMEOUT:-}" ]; then
+    exec docker exec -i erc_sim /entrypoint.sh bash -c \
+        "source /opt/erc_ws/install/setup.bash && exec timeout -s KILL $INSIM_TIMEOUT python3 - $*" \
+        < "$HERE/$TOOL"
+fi
 exec docker exec -i erc_sim /entrypoint.sh bash -c \
     "source /opt/erc_ws/install/setup.bash && python3 - $*" < "$HERE/$TOOL"
