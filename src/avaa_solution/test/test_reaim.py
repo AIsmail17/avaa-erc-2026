@@ -112,3 +112,51 @@ def test_the_target_that_failed_was_inside_the_arms_reach():
     need = math.dist([0.935, 0.2, 1.346], [float(v) for v in shoulder])
     assert need < ARM_MAX_REACH
     assert need / ARM_MAX_REACH == pytest.approx(0.85, abs=0.02)
+
+
+# The base turns as well as slides, and the turn is the bigger half of what moves a
+# target. Measured on a freshly spawned robot that had never been driven, five windows of
+# ten simulated seconds with nothing commanded (tools/yawrate.py): -0.0061, -0.0055,
+# -0.0048, -0.0043 and -0.0034 rad/s, mean -0.0048, always the same sign.
+YAW_RATE = 0.010          # what the node uses, set above the fresh-robot measurement
+MEASURED_YAW = 0.0048     # what a robot that has never moved actually does
+WORKING_RADIUS = 0.9      # a book at grasping range, from the base
+
+
+def test_yaw_defaults_to_the_old_bound():
+    """Passing no yaw leaves every previous number exactly where it was."""
+    for since in (0.0, 5.0, 30.0, 120.0):
+        assert (reaim_budget(ALLOWANCE, RATE, since, 0.0, WORKING_RADIUS)
+                == pytest.approx(reaim_budget(ALLOWANCE, RATE, since)))
+
+
+def test_yaw_only_matters_at_a_radius():
+    """A target on the axis of rotation does not move when the base turns."""
+    assert (reaim_budget(ALLOWANCE, RATE, 20.0, YAW_RATE, 0.0)
+            == pytest.approx(reaim_budget(ALLOWANCE, RATE, 20.0)))
+
+
+def test_the_turn_is_worth_more_than_the_slide():
+    """At a working radius, w x p is about three times v. It was being ignored."""
+    slide = RATE
+    turn = MEASURED_YAW * WORKING_RADIUS
+    assert turn > 2.5 * (0.0015)          # the measured coast on that same robot
+    assert turn == pytest.approx(0.00432, abs=1e-5)
+    assert slide + turn > slide
+
+
+def test_the_sighting_that_was_wrongly_refused():
+    """The run of 2026-09-09, where ground truth said the book really had moved.
+
+    The log line was "ignoring a sighting that moves the book 252 mm, over the 223 mm
+    the base could have carried it". 223 mm of budget means 13.6 s had passed. With the
+    turn counted, the same 13.6 s buys enough and the sighting is believed.
+    """
+    since = (0.223 - ALLOWANCE) / RATE
+    assert reaim_budget(ALLOWANCE, RATE, since) < 0.252
+    assert reaim_budget(ALLOWANCE, RATE, since, YAW_RATE, WORKING_RADIUS) > 0.252
+
+
+def test_the_impossible_correction_is_still_refused():
+    """169 mm in 0.6 s -- 280 mm/s -- stays impossible with the turn counted."""
+    assert reaim_budget(ALLOWANCE, RATE, 0.6, YAW_RATE, WORKING_RADIUS) < 0.169

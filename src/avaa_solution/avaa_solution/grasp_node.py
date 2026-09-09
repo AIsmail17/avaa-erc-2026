@@ -255,7 +255,8 @@ BOOK_THICKNESS = 0.030
 SHELF_WIDTH = 4.8
 
 
-def reaim_budget(allowance: float, rate: float, since: float) -> float:
+def reaim_budget(allowance: float, rate: float, since: float,
+                 yaw_rate: float = 0.0, radius: float = 0.0) -> float:
     """How far a fresh sighting may move the grasp target before it is disbelieved.
 
     Split out from the node so it can be tested without a simulator, because the number
@@ -284,12 +285,37 @@ def reaim_budget(allowance: float, rate: float, since: float) -> float:
     the end of the arm, after which the servo rejected two hundred consecutive solves.
     A rate bound catches that and admits the rest, which is the whole job.
 
+    The base also TURNS, and the turn is the bigger half. That was missing here until
+    2026-09-09 and it is the reason true sightings were still being refused -- "ignoring
+    a sighting that moves the book 252 mm, over the 223 mm the base could have carried
+    it" -- on a run where the book really had moved that far across base_link.
+
+    Measured on a freshly spawned robot that had never been driven, five windows of ten
+    simulated seconds with nothing commanded (tools/yawrate.py):
+
+        2.9 mm/s  -0.0061 rad/s        mean 1.5 mm/s and -0.0048 rad/s
+        1.4 mm/s  -0.0055 rad/s
+        1.3 mm/s  -0.0048 rad/s        a book 0.9 m out therefore moves 5.9 mm/s:
+        1.4 mm/s  -0.0043 rad/s        1.5 from the coast and 4.3 from the turn
+        0.5 mm/s  -0.0034 rad/s
+
+    Always the same sign. dp/dt = -v - w x p, so at any working distance the rotation is
+    worth about three times the translation, which STATE.md had already written down and
+    nothing had acted on. After the robot has been driven it is larger again: ground
+    truth against odometry over 45 s of a settled robot gave 51.2 mm and -9.02 degrees
+    of real motion against 4.8 mm and +0.75 degrees of odometry (tools/odomvstruth.py),
+    so nine degrees of yaw and 46 mm of travel happened that no wheel reported.
+
+    ``radius`` is how far the target is from the base, because that is the arm the yaw
+    acts through. Passing 0 gives the old translation-only bound.
+
     ``allowance`` covers what perception's own error looks like, measured at 15-35 mm in
     x. ``rate`` is per second since the target was set, and wants to be generous against
     the coast rather than tight to it: the cost of admitting a bad reading is one
     re-aim, and the cost of refusing a true one is reaching for where the book is not.
     """
-    return allowance + rate * max(0.0, since)
+    return (allowance
+            + (rate + abs(yaw_rate) * max(0.0, radius)) * max(0.0, since))
 
 
 def row_to_height(row: int, heights: List[float], top_down: bool = True) -> Optional[float]:
@@ -499,6 +525,10 @@ class GraspNode(Node):
         # set above that rather than at it: refusing a true correction costs a reach
         # for where the book is not, and admitting a doubtful one costs a re-aim.
         self.declare_parameter("reaim_rate_m_per_s", 0.012)
+        # The base turns as well as slides, and at a working radius the turn is worth
+        # about three times the slide. Measured at 0.0048 rad/s on a robot that had
+        # never moved; this is set above that because a driven one is worse.
+        self.declare_parameter("reaim_yaw_rate_rad_per_s", 0.010)
         # How much of the arm's measured maximum reach a target may sit at. Only a
         # sanity bound -- the arm holds 88 per cent of it to a millimetre -- so this is
         # set where the kinematics genuinely run out rather than where the torque does.
@@ -651,6 +681,8 @@ class GraspNode(Node):
         self.reaim_allowance = float(
             self.get_parameter("reaim_allowance_m").value)
         self.reaim_rate = float(self.get_parameter("reaim_rate_m_per_s").value)
+        self.reaim_yaw_rate = float(
+            self.get_parameter("reaim_yaw_rate_rad_per_s").value)
         self.reach_margin = float(self.get_parameter("reach_margin").value)
         self.target_set_at = None
         self.reaches = 0
@@ -1041,7 +1073,12 @@ class GraspNode(Node):
         """
         since = 0.0 if self.target_set_at is None else max(
             0.0, self._now() - self.target_set_at)
-        return reaim_budget(self.reaim_allowance, self.reaim_rate, since)
+        radius = 0.0
+        if self.grasp_target is not None:
+            radius = float(np.linalg.norm(np.asarray(
+                self.grasp_target, dtype=float)[:2]))
+        return reaim_budget(self.reaim_allowance, self.reaim_rate, since,
+                            self.reaim_yaw_rate, radius)
 
     def _from_shoulder(self, point) -> float:
         """How far a point is from the shoulder, which is what the arm has to span."""
