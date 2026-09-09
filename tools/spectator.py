@@ -133,6 +133,30 @@ def main():
         capture_output=True, text=True, timeout=30)
     print("create said:", (out.stdout or out.stderr).strip()[:200])
 
+    # Bridge it into ROS, or nothing can see it.
+    #
+    # Creating the camera is only half the job. Gazebo publishes on its own transport and
+    # tools/liveview.py subscribes in ROS, so without a bridge the topic exists, carries
+    # frames -- measured at 148 in fifteen seconds -- and the viewer sits on "waiting for
+    # spectator frames" for ever. That is what a frozen spectator view actually is, and
+    # it is why the robot's head camera looked fine beside it: the head camera is bridged
+    # by the launch and this one never was.
+    bridged = subprocess.run(
+        ["bash", "-c",
+         "pgrep -f 'parameter_bridge.*spectator' >/dev/null 2>&1 && echo yes || echo no"],
+        capture_output=True, text=True).stdout.strip()
+    if bridged == "yes":
+        print("bridge already running")
+        return
+
+    subprocess.Popen(
+        ["ros2", "run", "ros_gz_bridge", "parameter_bridge",
+         "/%s@sensor_msgs/msg/Image[gz.msgs.Image" % TOPIC.lstrip("/"),
+         "--ros-args", "-p", "use_sim_time:=true"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    print("bridging /%s into ROS" % TOPIC.lstrip("/"))
+
 
 if __name__ == "__main__":
     main()

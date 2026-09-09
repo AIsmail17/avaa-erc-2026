@@ -31,6 +31,22 @@ PHYSICS_ENGINE_PLACEHOLDER
     <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
     <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
 
+    <!-- The Sensors system, purely so the bench can be WATCHED.
+
+         It was left out when this world was written, because the bench has no cameras
+         and rendering is most of what the arena spends its time on. But it is also what
+         renders tools/spectator.py, and without it that camera spawns, reports
+         "create said: data: true", and never produces a topic at all -- which looks
+         exactly like a frozen view.
+
+         ogre2 through EGL, headless, which is the path that has never failed here. The
+         Gazebo GUI needs an OpenGL context through GLX and cannot get a working one in
+         this container; the server rendering sensors offscreen is unaffected by that,
+         and is how the robot is actually watched. -->
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
     <model name="ground_plane">
       <static>true</static>
       <link name="link">
