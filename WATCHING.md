@@ -1,11 +1,129 @@
-# Watching a run on the NUC, in a Gazebo window
+# Watching a run in a Gazebo window
 
-Step by step, for the machine at **192.168.1.26** (`ahmedo@nucserver`), through remote
-desktop. Everything here was run and checked on 2026-09-07; where a number appears it was
-measured on that machine, not guessed.
+Two machines, and they are not equivalent any more.
 
-Every command goes in a terminal **inside your remote desktop session**, not over SSH.
-That matters for exactly one reason, explained under [Why the remote desktop
+**This laptop** has 24 cores, 31 GB and an RTX A4500, against the NUC's 4 threads. The
+simulation runs three to four times faster here and the whole grasp can be watched on a
+bench that starts in under a minute. Start here.
+
+**The NUC** is still the machine the arena runs on when you want the competition world
+end to end, and part two below is unchanged for it.
+
+Everything below was run and checked; where a number appears it was measured, not
+guessed.
+
+---
+
+# Part one — on this laptop
+
+The container already has what it needs: WSLg puts a display at `:0`, the X socket is
+mounted into the container, and `/dev/dxg` is passed through for the GPU. Nothing to
+install and nothing to configure.
+
+## The short version
+
+Open **Windows Terminal** and pick the **Ubuntu-24.04** tab (or run `wsl -d Ubuntu-24.04`
+from PowerShell). Then:
+
+```bash
+cd ~/erc/erc_sim_2026
+HEADLESS=false ./tools/lab up dart
+```
+
+A Gazebo window opens on your Windows desktop with the robot and one book. To watch the
+whole grasp happen in it:
+
+```bash
+HEADLESS=false ERC_GRASP_FIX=1 bash tools/labgrasp.sh
+```
+
+and when you are done:
+
+```bash
+./tools/lab down
+```
+
+## What the bench is, and why it is the one to watch
+
+It is the robot, one book, and nothing else — no shelf, no markers, no walls, no
+collection bin, nineteen fewer books, and no cameras. The arena costs about thirteen
+minutes to reach a grasp and spends eleven of them on an approach that is already
+understood. The bench reaches the same grasp in about two.
+
+What you will see, in order. The left column is what the clock on the wall says with a
+window open; the right is simulated time, which is what the log timestamps count.
+
+| you will see | wall | simulated |
+|---|---|---|
+| the window opens, robot standing, one book floating in front of it | 0:30 | |
+| the arm folds to the driving posture, the base is pinned | 1:30 | |
+| the right arm folds away and the shelf goes into the planner | 3:00 | 0:33 |
+| the torso rises to the row height | 3:50 | 0:51 |
+| the arm unfolds to the pre-grasp, square to the book | 4:50 | 1:14 |
+| the jaws open | 5:10 | 1:22 |
+| the arm reaches in, in two stages, pausing between them | 6:30 | 1:51 |
+| the jaws close | 6:40 | 1:54 |
+| the arm lifts, withdraws, and stows with the book | 9:30 | 3:06 |
+
+Those are from one measured run: 186 simulated seconds from `idle` to `done`, at a
+real-time factor of about 0.37 with the window open. The factor is what decides the wall
+column, and it moves with what else the machine is doing — headless it runs 0.5 to 1.0
+and the whole thing takes about half as long.
+
+The states are printed in the terminal as it goes:
+
+    idle -> scene -> raising -> pregrasp -> opening -> advancing -> servoing
+         -> clamping -> lifting -> withdrawing -> stowing -> done
+
+`done` is the one you are waiting for. `failed` means it stopped and said why on the line
+above.
+
+## Two things that will look wrong and are not
+
+**The book floats.** Gravity is off for the bench book on purpose. It has to stay where
+the bench puts it or no arrival number means anything, and neither alternative works:
+holding it up by repeated `set_pose` runs at one or two hertz because every call is a
+subprocess, and a book falls 0.78 m in the 0.4 simulated seconds between placements.
+Whether a real grip holds a book against gravity is measured separately, with gravity on,
+by `tools/in-sim canitgrip.py`.
+
+**The fingers pass through the book as they close.** They genuinely do, and it is the
+simulator rather than the solution. `MANIPULATION.md` section 1 has the measurements. The
+book still gets picked up because `sim_grasp_fix` carries it, which is scaffolding that
+Phase 2 drops by not launching it.
+
+## Watching the arena instead, here
+
+The full competition world, with the shelf and twenty books:
+
+```bash
+cd ~/erc/erc_sim_2026
+./tools/sim restart --fast          # leave --headless off and you get a window
+./tools/run-once.sh 3 yellow        # column 3, a yellow book
+```
+
+`./tools/sim status` says what is running, `./tools/sim log` follows the log, and
+`./tools/sim stop` ends it.
+
+## If the window does not appear
+
+- `echo $DISPLAY` in the Ubuntu terminal should print `:0`. If it is empty, close the
+  terminal and open a new one — WSLg sets it at login.
+- `docker exec erc_sim bash -c 'ls /tmp/.X11-unix'` should list `X0`. If it does not, the
+  container was started without the socket mounted; `./tools/sim rebuild` recreates it.
+- The real-time factor with a window on this machine is about **0.37** on the bench
+  against **0.5 to 1.0** headless. A window costs roughly half the speed. That is the
+  price of watching, and it is worth paying while you are actually looking.
+
+---
+
+# Part two — on the NUC, through remote desktop
+
+For the machine at **192.168.1.26** (`ahmedo@nucserver`). Everything in this part was run
+and checked on 2026-09-07 on that machine.
+
+Every command in this part goes in a terminal **inside your remote desktop session**, not
+over SSH. That matters for exactly one reason, explained under [Why the remote desktop
 session](#why-the-remote-desktop-session).
 
 ---
