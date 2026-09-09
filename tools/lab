@@ -39,9 +39,16 @@ cmd="${1:-status}"
 shift || true
 
 teardown() {
+    # Bracketed, so pkill does not match the shell that is running it.
+    #
+    # Without the bracket the first pattern killed this very bash -c -- its command line
+    # contains every name in the loop -- so the rest of the list was never swept and the
+    # "something is still running" warning below fired on leftovers this was supposed to
+    # have removed.
     docker exec "$CONTAINER" bash -c '
-        for p in grasp_lab.launch.py simulation.launch.py solution.launch.py \
-                 moveit.launch.py sim_grasp_fix "gz sim" controller_manager spawner; do
+        for p in "[g]rasp_lab.launch.py" "[s]imulation.launch.py" "[s]olution.launch.py" \
+                 "[m]oveit.launch.py" "[s]im_grasp_fix" "[g]z sim" \
+                 "[c]ontroller_manager" "[s]pawner"; do
             pkill -f "$p" 2>/dev/null
         done
         true' 2>/dev/null

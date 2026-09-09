@@ -141,13 +141,20 @@ def main():
     # spectator frames" for ever. That is what a frozen spectator view actually is, and
     # it is why the robot's head camera looked fine beside it: the head camera is bridged
     # by the launch and this one never was.
-    bridged = subprocess.run(
-        ["bash", "-c",
-         "pgrep -f 'parameter_bridge.*spectator' >/dev/null 2>&1 && echo yes || echo no"],
-        capture_output=True, text=True).stdout.strip()
-    if bridged == "yes":
-        print("bridge already running")
-        return
+    # Always replace the bridge. Never keep one.
+    #
+    # This used to skip when a bridge was already running, and that is the wrong way
+    # round: a bridge belongs to the Gazebo session it was started against, and once the
+    # simulation restarts the old one is attached to a transport that no longer exists.
+    # It keeps its ROS topic advertised and simply never publishes again, so the viewer
+    # holds its last frame for ever.
+    #
+    # Measured: eleven frames pulled from the stream over eight minutes, every one of
+    # them 25647 bytes -- the same picture, byte for byte, while the robot was moving.
+    # That is exactly what "the spectator view is frozen" looks like, and there is no
+    # error anywhere to find, because nothing failed.
+    subprocess.run(["bash", "-c", "pkill -f 'parameter_bridge.*spectator'; sleep 1"],
+                   capture_output=True, text=True)
 
     subprocess.Popen(
         ["ros2", "run", "ros_gz_bridge", "parameter_bridge",

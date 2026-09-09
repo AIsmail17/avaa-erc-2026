@@ -144,6 +144,12 @@ else:
 ')
 if [ -n "$BASE" ]; then
     echo "  holding the base at $BASE"
+    # Remove it first.
+    #
+    # A stale /tmp/pin_base.py owned by a different user makes this redirect fail with
+    # "Permission denied", the copy never happens, and the base is never pinned -- which
+    # surfaces much later as the arm reaching for a book that has drifted away from it.
+    docker exec erc_sim bash -c 'rm -f /tmp/pin_base.py' 2>/dev/null
     docker exec -i erc_sim bash -c 'cat > /tmp/pin_base.py' < "$PWD/tools/pin_base.py"
     docker exec -d erc_sim /entrypoint.sh bash -c \
         "source /opt/erc_ws/install/setup.bash && \

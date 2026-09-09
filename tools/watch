@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Watch the robot work, in one terminal, from nothing.
+#
+#     tools/watch            bring everything up and run a grasp
+#     tools/watch view       bring everything up and stop, leaving the view running
+#
+# Then open http://localhost:8080 in Windows.
+#
+# This exists because doing it by hand needs four commands in two terminals and three of
+# the ways to get that wrong are silent:
+#
+#   - tools/labgrasp.sh brings its OWN bench up, so running 'lab up' beside it tears the
+#     run down mid-grasp. That shows as a real-time factor of 0.001 and a state machine
+#     going idle -> failed over and over.
+#   - a liveview left running from an earlier session holds port 8080, so the new one
+#     dies with "Address already in use" and the browser keeps showing the OLD one,
+#     pointed at a simulation that no longer exists. That is a frozen picture with no
+#     error anywhere.
+#   - a stale /tmp file owned by another user makes a copy into the container fail with
+#     "Permission denied" and the thing that needed it just does not happen.
+#
+# So: one command, one terminal, everything cleaned up first.
+set -u
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+MODE="${1:-run}"
+
+echo "=== clearing anything left over"
+    # The bracket in every pattern is load bearing.
+    #
+    # pkill -f matches against full command lines, and the command line of the shell
+    # running these pkills contains the very strings it is searching for. So
+    # 'pkill -f liveview.py' killed THIS shell, and everything after it in the same
+    # bash -c never ran. That is why the cleanup only half happened, why "something is
+    # still running in the container" kept appearing, and ultimately why a liveview from
+    # hours earlier kept its grip on port 8080 and served a frozen picture of a
+    # simulation that no longer existed.
+    #
+    # [l]iveview.py matches the process and not the pattern.
+docker exec erc_sim bash -c '
+    pkill -f "[l]iveview.py"; pkill -f "[p]arameter_bridge.*spectator";
+    pkill -f "[g]rasp_lab.launch.py"; pkill -f "[g]z sim";
+    pkill -f "[a]vaa_solution grasp";
+    rm -f /tmp/pin_base.py /tmp/liveview.py;
+    sleep 3; true' 2>/dev/null
+
+# Free port 8080 from OUTSIDE the container as well.
+#
+# The container runs on host networking, so whatever is listening on 8080 need not be in
+# the container at all -- and pkill inside it then cannot touch the thing holding the
+# port. What happens next is the worst kind of failure: the new liveview dies with
+# "Address already in use" into a log nobody reads, the OLD one keeps serving, and the
+# browser shows a perfectly good picture of a simulation that stopped existing hours ago.
+# That is the frozen spectator view, and it cost most of a day.
+if command -v fuser >/dev/null 2>&1; then
+    fuser -k 8080/tcp >/dev/null 2>&1 || true
+fi
+holder=$(ss -lptnH "sport = :8080" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+if [ -n "${holder:-}" ]; then
+    echo "  killing pid $holder, which still held port 8080"
+    kill -9 "$holder" 2>/dev/null || true
+fi
+sleep 2
+for i in $(seq 1 15); do
+    [ "$(docker exec erc_sim pgrep -f 'gz sim' 2>/dev/null | wc -l)" = "0" ] && break
+    sleep 1
+done
+
+if [ "$MODE" = "view" ]; then
+    echo "=== bench up"
+    HEADLESS=true ./tools/lab up dart 2>&1 | grep -E "real-time|controllers"
+else
+    echo "=== bench up, with move_group, and a grasp to watch"
+fi
+
+start_view() {
+    echo
+    echo "=== spectator camera"
+    ./tools/in-sim spectator.py follow 2>&1 | tail -2
+    echo
+    echo "=== live view"
+    docker exec -i erc_sim bash -c 'cat > /tmp/liveview.py' < tools/liveview.py
+    # A fresh port every time, rather than fighting for 8080.
+    #
+    # The container is on host networking, so 8080 can be held by anything on this
+    # machine, and a liveview that loses the race dies into a log while the OLD one keeps
+    # serving a picture of a simulation that ended hours ago. Killing the holder works
+    # until it does not. Picking a port nobody has is simply a smaller problem, and the
+    # URL is printed anyway.
+    PORT=""
+    for p in $(seq 8090 8099); do
+        if ! (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null; then PORT=$p; break; fi
+        exec 3>&- 2>/dev/null || true
+    done
+    PORT="${PORT:-8090}"
+    docker exec -d erc_sim /entrypoint.sh bash -c \
+        "source /opt/erc_ws/install/setup.bash && python3 /tmp/liveview.py $PORT > /tmp/lv.log 2>&1"
+    sleep 8
+    if ! curl -s -m 5 -o /dev/null "http://localhost:$PORT/" 2>/dev/null; then
+        echo "  the view did not come up:"
+        docker exec erc_sim bash -c 'tail -6 /tmp/lv.log' 2>/dev/null | sed 's/^/    /'
+        return
+    fi
+
+    # Prove the picture MOVES before saying it works.
+    #
+    # A served page and a live picture are different things, and every check here until
+    # now only tested the first. Two frames a few seconds apart, compared byte for byte:
+    # eleven identical ones in a row is how this was eventually caught, long after being
+    # reported as working.
+    one=$(curl -s -m 12 --max-time 12 "http://localhost:$PORT/spectator" 2>/dev/null | head -c 200000 | md5sum | cut -c1-8)
+    sleep 5
+    two=$(curl -s -m 12 --max-time 12 "http://localhost:$PORT/spectator" 2>/dev/null | head -c 200000 | md5sum | cut -c1-8)
+    if [ "$one" = "$two" ]; then
+        echo "  !!! http://localhost:$PORT is serving a FROZEN picture ($one twice)."
+        echo "  !!! The robot may simply be standing still; if it is moving, this is a"
+        echo "  !!! real fault -- check: docker exec erc_sim tail -20 /tmp/lv.log"
+    else
+        echo "  http://localhost:$PORT  -- open that in Windows (picture is LIVE)"
+    fi
+}
+
+if [ "$MODE" = "view" ]; then
+    start_view
+    echo
+    echo "Leave this terminal open. WSL shuts down when nothing is running and takes"
+    echo "the container with it. Ctrl-C here when you are done."
+    while true; do sleep 30; done
+fi
+
+# A grasp, with the view up before it starts so none of it is missed.
+export ERC_GRASP_FIX="${ERC_GRASP_FIX:-1}"
+export FEED_SECONDS="${FEED_SECONDS:-400}"
+bash tools/labgrasp.sh 2>&1 | while IFS= read -r line; do
+    echo "$line"
+    case "$line" in
+        *"move_group up"*) start_view ;;
+    esac
+done
