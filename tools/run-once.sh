@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 set -u
 cd ~/erc/erc_sim_2026
 
