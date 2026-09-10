@@ -5,6 +5,9 @@
 #     tools/linux-sim.sh viewer     attach a second viewer to a running simulator
 #     tools/linux-sim.sh stop       stop both
 #
+#     tools/run-once.sh 3 red       restart it through here and run the solution once,
+#                                   marker 3 and the red book, in that window
+#
 # tools/sim does the same job under WSL and most of it is WSL: Mesa driver juggling,
 # PowerShell, a window WSLg never presents. None of that applies here -- /dev/dri goes
 # straight into the container and Mesa picks the Intel driver on its own.
@@ -72,8 +75,9 @@ start_server() {
     xhost +local: >/dev/null 2>&1 || true
     # With the simulation grasp aid: without it the gripper cannot hold a book, and
     # watching a run that can only push books over shows nothing worth seeing. See
-    # tools/run-once.sh for how its absence was found.
-    docker exec -d -e ERC_GRASP_FIX=1 -e DISPLAY="$DISPLAY" -e XDG_RUNTIME_DIR=/tmp/runtime-root "$CONTAINER" /entrypoint.sh bash -c \
+    # tools/run-once.sh for how its absence was found. ERC_GRASP_FIX=0 still turns it off,
+    # as it does there.
+    docker exec -d -e ERC_GRASP_FIX="${ERC_GRASP_FIX:-1}" -e DISPLAY="$DISPLAY" -e XDG_RUNTIME_DIR=/tmp/runtime-root "$CONTAINER" /entrypoint.sh bash -c \
       'mkdir -p /tmp/runtime-root; source /opt/erc_ws/install/setup.bash && exec ros2 launch erc_bringup simulation.launch.py depth_cloud:=false headless:=false > /tmp/sim.log 2>&1'
     local waited=0
     while [ "$waited" -lt 120 ]; do

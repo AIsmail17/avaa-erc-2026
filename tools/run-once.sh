@@ -29,18 +29,6 @@ fi
 #
 # Started with the GUI, this launch intermittently comes up with Gazebo never
 # initialising: zero controllers reach "Configured and activated", all seven spawners die
-# with "Could not successfully call service /controller_manager/list_controllers after 3
-# attempts", and no colour frames are ever published. Counted over one evening it
-# happened on roughly a third of restarts, and the generous spawner timeouts added in
-# 15982e4 did not help, because the manager they are waiting for never exists.
-#
-# Nothing here needs to be watched. Use `sim gui` to attach a viewer to a running
-# simulation when there is something worth looking at, and the GUI for recording the
-# deliverable video.
-# Headless, and not as an optimisation.
-#
-# Started with the GUI, this launch intermittently comes up with Gazebo never
-# initialising: zero controllers reach "Configured and activated", all seven spawners die
 # on "Could not successfully call service /controller_manager/list_controllers after 3
 # attempts", and no colour frames are ever published. It happened on roughly a third of
 # restarts over one evening, and the generous spawner timeouts in 15982e4 did not help,
@@ -70,7 +58,15 @@ fi
 # ERC_GRASP_FIX=0 tools/run-once.sh ...   still runs without it, deliberately.
 export ERC_GRASP_FIX="${ERC_GRASP_FIX:-1}"
 echo "=== simulation grasp aid: ERC_GRASP_FIX=$ERC_GRASP_FIX"
-./tools/sim restart --fast --headless 2>&1 | tail -3
+# Under WSL, tools/sim restarts the simulator headless. On a Linux desktop -- the laptop --
+# tools/linux-sim.sh restarts it with its window on that screen instead: headless does not
+# render there at all (Mesa's EGL fails on its NVIDIA card, see linux-sim.sh), and the
+# window is the reason for running it there. Everything after this is the same on both.
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  ./tools/sim restart --fast --headless 2>&1 | tail -3
+else
+  ./tools/linux-sim.sh all 2>&1 | tail -3
+fi
 echo "=== waiting for the camera to actually stream"
 ok=0
 for i in $(seq 1 12); do
