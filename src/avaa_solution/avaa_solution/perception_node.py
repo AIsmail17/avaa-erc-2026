@@ -99,6 +99,29 @@ DEPTH_HEIGHT_BIAS = 0.005
 # was still settling.
 ROW_HEIGHT_TOLERANCE = 0.165
 
+# How many whole-shelf readings have to agree on the marker order before it is reported,
+# and what share of all such readings the winner must hold. See _publish_shelf_column.
+SHELF_ORDER_VOTES = 3
+SHELF_ORDER_MAJORITY = 0.7
+
+
+def shelf_order_winner(tally, needed: int = SHELF_ORDER_VOTES,
+                       majority: float = SHELF_ORDER_MAJORITY):
+    """Return the marker ordering the readings agree on, or None if they do not yet.
+
+    ``tally`` maps an ordering -- a tuple of digits left to right -- to how many frames
+    read it. A winner needs ``needed`` votes of its own and ``majority`` of all of them,
+    so one bad frame can neither decide the answer nor, once it is decided, overturn it.
+    """
+    total = sum(tally.values())
+    if total == 0:
+        return None
+    order, count = max(tally.items(), key=lambda item: item[1])
+    if count < needed or count < majority * total:
+        return None
+    return order
+
+
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -180,6 +203,9 @@ class PerceptionNode(Node):
         self.last_book_save: Optional[float] = None
         self.reported_column: Optional[int] = None
         self.shelf_column: Optional[int] = None
+        # Whole-shelf marker orderings seen so far, and how often. See
+        # _publish_shelf_column for why one frame is not enough.
+        self.shelf_orders: Counter = Counter()
         self.last_book_range: Optional[float] = None
         # Half the image width, and how far off centre a marker may be and still have
         # its digit believed.
@@ -1017,7 +1043,7 @@ class PerceptionNode(Node):
         try:
             books = bd.detect_books(frame)
             markers = sorted(mr.read_markers(frame), key=lambda m: m.cx)
-            self._publish_shelf_column(markers)
+            self._publish_shelf_column(markers, frame.shape[1])
             self._publish_shelf_yaw()
             # The markers define the columns. Falling back to gap clustering only when
             # none are visible, since that cannot identify a target column anyway.
@@ -1220,7 +1246,8 @@ class PerceptionNode(Node):
         _, yaw, _ = result
         self.pub_shelf_yaw.publish(Float32(data=float(yaw)))
 
-    def _publish_shelf_column(self, markers: List[mr.Marker]) -> None:
+    def _publish_shelf_column(self, markers: List[mr.Marker],
+                              frame_width: int = 640) -> None:
         """Publish WHICH COLUMN of the shelf carries the target marker, 1 to 5.
 
         This is not _target_column_index, and the difference is a scored point. That one
@@ -1234,37 +1261,78 @@ class PerceptionNode(Node):
         off the edge of the image, so counting from the left counts from the wrong place.
         From the start zone the whole unit is in view, which is where this fires.
 
-        Latched once found. The digits are fixed for the run, so a later view from close
-        up cannot improve on a reading taken with everything visible, and can easily make
-        it worse.
+        Decided by a vote, not by the first frame that qualifies.
+
+        It used to latch on one. Measured 2026-09-10, the first perception-driven run since
+        the row heights were fixed: the base swung past the shelf at a -73 degree heading,
+        one frame passed every check, and it latched "markers left to right are
+        [1, 5, 3, 4, 2], so marker 3 is shelf column 3". The truth, from ground truth and
+        from the camera's own later frames, was [5, 3, 1, 4, 2]: marker 3 on column 2. The
+        robot still drove to the right book -- steering never uses this number -- and the
+        number reported for it was wrong.
+
+        Two things let a frame like that through. read_markers assigns digits globally so
+        that none repeats, which is right when every candidate is a whole plate, and means
+        one misjudged candidate can reshuffle several of its neighbours at once while the
+        result is still a permutation. And plates cut by the edge of the image were
+        admitted: the saved frame from that moment has a "3" sliced by the left border. So
+        a plate touching the border now disqualifies the frame, and an ordering has to be
+        read SHELF_ORDER_VOTES times, and hold SHELF_ORDER_MAJORITY of all readings, before
+        it is reported. Once reported it keeps counting, and a different ordering that
+        later meets the same standard replaces it, loudly.
+
+        The frames are there to vote with. Only three steering log lines in that run had
+        all five markers in view, but those lines are throttled to one every two seconds
+        and perception reads five frames a second.
 
         Which end is column 1 is a parameter, not an assumption. The rules do not say,
         and the same ambiguity applies to the rows. Left to right in an image of the
         robot facing the shelf is the simulator's own numbering -- book_col_1 stands at
         y=+2.0 and book_col_5 at y=-1.9 -- which is the best evidence available.
         """
+        self._count_shelf_order(markers, frame_width)
         if self.shelf_column is not None:
             self.pub_shelf_column.publish(Int32(data=int(self.shelf_column)))
-            return
+
+    def _count_shelf_order(self, markers: List[mr.Marker], frame_width: int) -> None:
+        """Add this frame's whole-shelf reading to the vote, and act if it has been won."""
         if not self.target_digit or len(markers) != COLUMNS_ON_SHELF:
             return
         if not all(m.confident for m in markers):
             return
+        if any(m.x <= 1 or m.x + m.w >= frame_width - 1 for m in markers):
+            return
         ordered = sorted(markers, key=lambda m: m.cx)
-        digits = [m.digit for m in ordered]
+        digits = tuple(m.digit for m in ordered)
         if sorted(digits) != list(range(1, COLUMNS_ON_SHELF + 1)):
             self.get_logger().warn(
                 "five markers in view but their digits are %s, which is not a "
                 "permutation of 1-%d; not identifying the column from this frame"
-                % (digits, COLUMNS_ON_SHELF), throttle_duration_sec=10.0)
+                % (list(digits), COLUMNS_ON_SHELF), throttle_duration_sec=10.0)
             return
-        position = digits.index(self.target_digit) + 1
+        self.shelf_orders[digits] += 1
+        winner = shelf_order_winner(self.shelf_orders)
+        if winner is None:
+            return
+        position = winner.index(self.target_digit) + 1
         if not self.columns_left_to_right:
             position = COLUMNS_ON_SHELF + 1 - position
+        if position == self.shelf_column:
+            return
+        if self.shelf_column is None:
+            self.get_logger().info(
+                "the whole shelf has been read %d times, %d of them as %s, so marker %d "
+                "is shelf column %d"
+                % (sum(self.shelf_orders.values()), self.shelf_orders[winner],
+                   list(winner), self.target_digit, position))
+        else:
+            self.get_logger().warn(
+                "the shelf order has changed its mind: %s now holds %d of %d readings, "
+                "so marker %d is shelf column %d, not %d"
+                % (list(winner), self.shelf_orders[winner],
+                   sum(self.shelf_orders.values()), self.target_digit, position,
+                   self.shelf_column))
         self.shelf_column = position
-        self.get_logger().info(
-            "the whole shelf is in view, markers left to right are %s, so marker %d "
-            "is shelf column %d" % (digits, self.target_digit, position))
         self.pub_shelf_column.publish(Int32(data=int(position)))
 
     def _target_column_index(self, markers: List[mr.Marker]) -> Optional[int]:

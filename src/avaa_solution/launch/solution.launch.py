@@ -133,7 +133,16 @@ def generate_launch_description() -> LaunchDescription:
         name="avaa_grasp",
         output="screen",
         emulate_tty=True,
-        parameters=[sim_time, {"start_phase": "grasp"}],
+        # trust_finger_span off, because this launch only ever runs in the simulator --
+        # use_sim_time is hardcoded above -- and there the finger span says nothing. The
+        # fingers are position-driven through a mimic linkage and close to about 27 mm
+        # THROUGH a 30 mm book whether it is held or not. With the check on, every grasp
+        # in a scored run was declared "closed on nothing" and abandoned before the lift:
+        # measured 2026-09-10, the first perception-driven run since the row heights were
+        # fixed ended "clamping -> failed" on exactly that line. The arena tests never saw
+        # it because they all started grasp_node by hand with the flag already off.
+        # grasp_node falls back to its geometric check, which has something to measure.
+        parameters=[sim_time, {"start_phase": "grasp", "trust_finger_span": False}],
     )
 
     deliver = Node(

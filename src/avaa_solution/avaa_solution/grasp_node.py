@@ -834,6 +834,8 @@ class GraspNode(Node):
         self.hold_imu_max = float(self.get_parameter("hold_imu_max_rad_s").value)
         self.hold_limit = float(self.get_parameter("hold_limit_m").value)
         self.hold_ref = None
+        # Set once the hold has let go of the base for good; see _hold_base.
+        self.hold_released = False
         self.hold_last = None
         # The base's own yaw rate, from the IMU, when it last arrived, and how many
         # samples have gone into it. The filter needs a run-up; see _on_imu.
@@ -1889,6 +1891,31 @@ class GraspNode(Node):
         for it is still the right correction, where a zero twist is not.
         """
         if self.state is State.IDLE and not self._my_turn():
+            return
+        # Let go of the base when this controller is finished with it, and say so once.
+        #
+        # This used to have no way out at all. After a failed grasp it went on publishing
+        # for as long as the node lived -- measured 2026-09-10, eighty seconds and
+        # counting of yaw corrections up to 0.10 rad/s into a base nothing else was
+        # using, on a robot whose mission had already given up. And after a successful
+        # one it kept publishing the yaw damper through DONE while deliver_node drove the
+        # base to the bin on the same /cmd_vel: two controllers, one topic, and the
+        # mecanum plugin obeys whichever spoke last. The delivery has never once been
+        # run with a book in the gripper, so that fight had simply never been seen.
+        #
+        # Finished means FAILED, or -- when a mission is in charge -- the mission having
+        # moved its phase on from this controller's. One zero on the way out, because a
+        # node that stops publishing leaves the plugin applying its last command forever.
+        mission_moved_on = bool(self.start_phase) and self.phase not in (
+            "", self.start_phase)
+        if self.state is State.FAILED or mission_moved_on:
+            if not self.hold_released:
+                self.hold_released = True
+                self.pub_cmd.publish(Twist())
+                self.get_logger().info(
+                    "releasing the base: %s"
+                    % ("the grasp failed" if self.state is State.FAILED
+                       else "the mission has moved on to '%s'" % self.phase))
             return
         self.pub_cmd.publish(self._hold_command())
 

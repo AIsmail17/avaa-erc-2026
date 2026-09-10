@@ -56,6 +56,20 @@ fi
 #
 # Nothing here needs watching. `sim gui` attaches a viewer to a running simulation when
 # there is something worth seeing, and the GUI is still the way to record the video.
+# With the simulation grasp aid, or no grasp can hold.
+#
+# simulation.launch.py only starts sim_grasp_fix when ERC_GRASP_FIX is 1, and tools/sim
+# defaults it to 0. This line never set it -- so every run through here restarted the
+# simulator WITHOUT the aid, and a position-driven gripper then closed through the book
+# and pushed it. Measured 2026-09-10 on the first perception-driven run since the row
+# heights were fixed: pads 1 mm off the book's centre line and 72 mm into it at the
+# clamp, the book shoved 78 mm and twisted 55 degrees, and not one line from the aid,
+# because there was no aid. The arena tests that lifted books had been run on a
+# simulator started by hand with it on, which is why none of them saw this.
+#
+# ERC_GRASP_FIX=0 tools/run-once.sh ...   still runs without it, deliberately.
+export ERC_GRASP_FIX="${ERC_GRASP_FIX:-1}"
+echo "=== simulation grasp aid: ERC_GRASP_FIX=$ERC_GRASP_FIX"
 ./tools/sim restart --fast --headless 2>&1 | tail -3
 echo "=== waiting for the camera to actually stream"
 ok=0
@@ -66,6 +80,10 @@ for i in $(seq 1 12); do
   if [ "$n" -gt 0 ]; then ok=1; break; fi
 done
 if [ "$ok" -eq 0 ]; then echo "the simulator came up blind; not launching"; exit 1; fi
+if [ "$ERC_GRASP_FIX" = "1" ] && ! docker exec erc_sim bash -c 'ps -eo args | grep -v grep | grep -q "sim_grasp_fix.py"'; then
+  echo "ERC_GRASP_FIX=1 but the grasp aid is not running; not launching a run that cannot hold a book"
+  exit 1
+fi
 
 # Long enough for the whole mission, and it kills the run rather than the log.
 #
