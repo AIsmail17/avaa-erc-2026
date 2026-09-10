@@ -39,6 +39,7 @@ by a path straight through the shelf unless something is actually checking.
 
 import math
 import threading
+import time
 import traceback
 from collections import deque
 from enum import Enum
@@ -1557,7 +1558,16 @@ class GraspNode(Node):
         # candidate it has seen; stopping early means taking that instead of a better one
         # that might have turned up, which is a much smaller loss than arriving at the
         # right posture for a base that has since moved half a metre.
-        search_until = self._now() + self.posture_search_budget
+        #
+        # Measured on the WALL clock, and that is not a detail. This used self._now(),
+        # the ROS clock, which under use_sim_time is simulation time delivered by a /clock
+        # subscription -- and that subscription is one of the callbacks the GIL-bound
+        # search keeps from running. The clock froze for the length of the search and the
+        # budget could never expire. Measured 2026-09-10, the sixth full run: a 12 s
+        # budget, no budget warning, and 85 simulated seconds from the shelf entering the
+        # planning scene to 'pre-grasp posture from try 9'. The base coasted 0.8 m in
+        # that time, and the arm then reached for a book 737 mm beyond its gripper.
+        search_until = time.monotonic() + self.posture_search_budget
         # The first attempt is seeded from where the arm already is. Close to the shelf
         # most solutions for the pre-grasp fold the arm back towards the body and are in
         # collision, so an unbiased search spends its budget on postures that were never
@@ -1565,7 +1575,7 @@ class GraspNode(Node):
         # seeded walk through the same reach was clear at every step.
         seed = self._current_joints()
         for attempt in range(attempts):
-            if attempt and self._now() > search_until:
+            if attempt and time.monotonic() > search_until:
                 self.get_logger().warn(
                     "the posture search has used its %.0f s after %d tries; going with "
                     "the best of what it has rather than letting the base drift further"

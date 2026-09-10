@@ -125,6 +125,8 @@ class DeliverNode(Node):
         self.declare_parameter("standoff_m", 0.60)
         self.declare_parameter("standoff_tol_m", 0.05)
         self.declare_parameter("bearing_tol_rad", 0.05)
+        # Beyond this the drive turns in place; inside it, it drives and steers at once.
+        self.declare_parameter("turn_in_place_rad", 0.35)
         self.declare_parameter("drive_speed", 0.12)
         self.declare_parameter("turn_speed", 0.35)
         self.declare_parameter("seek_speed", 0.35)
@@ -170,6 +172,8 @@ class DeliverNode(Node):
         self.standoff = float(self.get_parameter("standoff_m").value)
         self.standoff_tol = float(self.get_parameter("standoff_tol_m").value)
         self.bearing_tol = float(self.get_parameter("bearing_tol_rad").value)
+        self.turn_in_place_rad = float(
+            self.get_parameter("turn_in_place_rad").value)
         self.drive_speed = float(self.get_parameter("drive_speed").value)
         self.turn_speed = float(self.get_parameter("turn_speed").value)
         self.seek_speed = float(self.get_parameter("seek_speed").value)
@@ -607,13 +611,23 @@ class DeliverNode(Node):
         bearing = math.atan2(float(target[1]), max(float(target[0]), 0.05))
         range_error = float(target[0]) - self.standoff
 
-        if abs(bearing) > self.bearing_tol:
+        # Steer and drive together while roughly lined up; turn in place only when far off.
+        #
+        # This used to turn in place until the bin was within bearing_tol -- 0.05 rad,
+        # three degrees -- and drive only then. This base answers a turn command at 30 to
+        # 70 per cent and keeps turning when told to stop, so it overshoots a three-degree
+        # window more often than it lands in it, and every overshoot is another turn in
+        # place instead of progress. Measured 2026-09-10, the sixth full run: the bin in
+        # steady view the whole time, and 180 s to close from 1.92 m ahead and 1.48 m to
+        # the side to 1.64 m and 0.36 m before the drive timed out. Driving with a
+        # proportional turn converges instead of oscillating; the tight bearing is still
+        # required before settling at the standoff.
+        if abs(bearing) > self.turn_in_place_rad:
             command = Twist()
             command.angular.z = float(np.clip(2.0 * bearing,
                                               -self.turn_speed, self.turn_speed))
             self.pub_cmd.publish(command)
             return
-
         if abs(range_error) > self.standoff_tol:
             ahead = self._range_ahead()
             if range_error > 0 and ahead is not None and ahead < self.obstacle_stop:
@@ -625,8 +639,16 @@ class DeliverNode(Node):
                 self._plan_above(target)
                 return
             command = Twist()
-            command.linear.x = float(np.clip(0.6 * range_error,
-                                             -self.drive_speed, self.drive_speed))
+            speed = float(np.clip(0.6 * range_error, -self.drive_speed, self.drive_speed))
+            command.linear.x = speed * max(0.0, math.cos(bearing))
+            command.angular.z = float(np.clip(2.0 * bearing,
+                                              -self.turn_speed, self.turn_speed))
+            self.pub_cmd.publish(command)
+            return
+        if abs(bearing) > self.bearing_tol:
+            command = Twist()
+            command.angular.z = float(np.clip(2.0 * bearing,
+                                              -self.turn_speed, self.turn_speed))
             self.pub_cmd.publish(command)
             return
 
