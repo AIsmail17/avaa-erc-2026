@@ -155,7 +155,10 @@ class DeliverNode(Node):
         self.declare_parameter("hold_base_hz", 20.0)
         # The head angle while hunting for the bin, before there is a range to aim at.
         self.declare_parameter("search_tilt_rad", -0.30)
-        self.declare_parameter("carry_point", [0.34, 0.10, 1.00])
+        # Where grasp_node.CARRY_POSTURE already holds the gripper, so the straight line
+        # to it from wherever the grasp left the arm is a few millimetres, not a climb
+        # through the robot from the tuck.
+        self.declare_parameter("carry_point", [0.32, 0.12, 1.00])
         # Holding the base against the bin. Gentle: the coast is 8 mm/s, so there is
         # nothing here that needs a fast loop, and the book is hanging from an arm that
         # every base movement swings.

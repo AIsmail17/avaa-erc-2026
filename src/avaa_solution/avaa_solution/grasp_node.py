@@ -219,6 +219,23 @@ STOW_TIMEOUT_SEC = 10.0
 TUCK_POSE = [0.3877, -1.6152, 0.0717, 0.0408, 0.5074, -1.4708, 0.6063]
 TUCK_TORSO = 0.10
 
+# Where the arm goes after a book has been lifted and drawn clear: torso, then the seven
+# left arm joints. Not the tuck.
+#
+# The tuck is for driving empty handed, folded inside the base. With a book in the jaws it
+# leaves the book INSIDE the base: on the twelfth full run (2026-09-10) the book sat at
+# y +0.09 to +0.34 and z 0.07 to 0.23 in base_link, most of its width within a body 0.27 m
+# either side, and the base -- being pushed apart from the book every step -- turned at a
+# capped 0.04 rad/s whatever it was asked for (0.10 gave 19 per cent, 0.35 gave 11) and slid
+# 50 to 74 mm sideways as it turned. Delivery could not turn to the bin and lost it twice.
+# Delivery was meant to lift the book to its carry point first, but it tried a straight
+# line up from the tuck, through the robot, and that was refused on every run.
+#
+# This posture puts the gripper at (0.32, +0.12, 1.00) in base_link with the jaws facing
+# forward: arm no wider than 0.21 m either side, lowest arm link at 0.68 m, the book bottom
+# at 0.80 m, every joint at least 3 degrees inside its limits (tools/carrypose2.py).
+CARRY_POSTURE = [0.0514, 4.4561, -2.3589, 2.1834, -1.8739, -1.2281, -1.7124, -2.2395]
+
 # The wrist, in base_link: reach along +x, close the fingers across y. Both come from the
 # URDF -- the fingers sit at y = +/-0.0288 offset +0.0756 along z in gripper_left_base_link,
 # and the grasping frame adds a -pi/2 pitch, which turns those into local x for the
@@ -3304,7 +3321,7 @@ class GraspNode(Node):
             return
         self._enter(State.STOW)
         self._start("stow", lambda: self.moveit.move_to_joints(
-            CHAIN_JOINTS, [TUCK_TORSO] + TUCK_POSE, timeout=240.0))
+            CHAIN_JOINTS, CARRY_POSTURE, timeout=240.0))
 
     def _do_stow(self) -> None:
         done = self._finished()
