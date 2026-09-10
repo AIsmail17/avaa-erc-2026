@@ -169,6 +169,65 @@ def shelf_order_winner(tally, needed: int = SHELF_ORDER_VOTES,
     return order
 
 
+# Plates in one run of a partial view must be evenly spaced, or a plate between two of them
+# was missed and the run is not contiguous. Perspective alone changes neighbouring gaps by
+# well under half again; one missing plate doubles a gap.
+WINDOW_MAX_GAP_RATIO = 1.7
+WINDOW_MIN_PLATES = 3
+
+
+def order_from_windows(windows, columns: int = 5):
+    """Return the one plate order that the most partial views agree with, or None.
+
+    ``windows`` maps a left-to-right run of digits seen together in one frame -- whole plates
+    only, with none missing between them -- to how many frames saw it. A full order agrees
+    with a run if the run appears in it, contiguous and in order.
+
+    The whole shelf is almost never in one frame. On the fifth full run (2026-09-10) not one
+    steering line had all five plates in view; the most was four, at headings from -110 to
+    -41 degrees. But overlapping runs pin the order down between them: [5, 3, 1, 4] and
+    [3, 1, 4, 2] leave only [5, 3, 1, 4, 2]. The winner needs the most support of all 120
+    orders and no tie, so runs that do not yet fix both ends decide nothing, and a single
+    misread run is outvoted by the frames that read the shelf correctly.
+    """
+    import itertools
+
+    if not windows:
+        return None
+    scored = []
+    for order in itertools.permutations(range(1, columns + 1)):
+        text = "," + ",".join(str(d) for d in order) + ","
+        support = sum(count for run, count in windows.items()
+                      if "," + ",".join(str(d) for d in run) + "," in text)
+        scored.append((support, order))
+    scored.sort(reverse=True)
+    best, runner_up = scored[0], scored[1]
+    if best[0] == 0 or best[0] == runner_up[0]:
+        return None
+    return best[1]
+
+
+def contiguous_run(markers, frame_width: int):
+    """Return the digits of the whole plates in view, left to right, if they form a clean run.
+
+    A plate touching the image border is dropped rather than disqualifying the frame: the
+    plates inside it are still a contiguous run. None if fewer than WINDOW_MIN_PLATES remain,
+    a digit repeats, or the spacing says a plate between two of them was missed.
+    """
+    whole = sorted((m for m in markers
+                    if m.confident and m.x > 1 and m.x + m.w < frame_width - 1),
+                   key=lambda m: m.cx)
+    if len(whole) < WINDOW_MIN_PLATES:
+        return None
+    digits = tuple(m.digit for m in whole)
+    if len(set(digits)) != len(digits):
+        return None
+    gaps = [b.cx - a.cx for a, b in zip(whole, whole[1:])]
+    if min(gaps) <= 0 or max(gaps) > WINDOW_MAX_GAP_RATIO * min(gaps):
+        return None
+    return digits
+
+
 # The camera publishes best-effort; a reliable subscriber receives nothing at all.
 SENSOR_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -253,6 +312,9 @@ class PerceptionNode(Node):
         # Whole-shelf marker orderings seen so far, and how often. See
         # _publish_shelf_column for why one frame is not enough.
         self.shelf_orders: Counter = Counter()
+        # Partial left-to-right runs of plates seen together, and how often. See
+        # order_from_windows.
+        self.shelf_windows: Counter = Counter()
         self.last_book_range: Optional[float] = None
         # Half the image width, and how far off centre a marker may be and still have
         # its digit believed.
@@ -1359,45 +1421,33 @@ class PerceptionNode(Node):
             self.pub_shelf_column.publish(Int32(data=int(self.shelf_column)))
 
     def _count_shelf_order(self, markers: List[mr.Marker], frame_width: int) -> None:
-        """Add this frame's whole-shelf reading to the vote, and act if it has been won."""
-        if not self.target_digit or len(markers) != COLUMNS_ON_SHELF:
+        """Add this frame's run of plates to the tally, and publish the order it settles."""
+        if not self.target_digit:
             return
-        if not all(m.confident for m in markers):
+        run = contiguous_run(markers, frame_width)
+        if run is None:
             return
-        if any(m.x <= 1 or m.x + m.w >= frame_width - 1 for m in markers):
-            return
-        ordered = sorted(markers, key=lambda m: m.cx)
-        digits = tuple(m.digit for m in ordered)
-        if sorted(digits) != list(range(1, COLUMNS_ON_SHELF + 1)):
-            self.get_logger().warn(
-                "five markers in view but their digits are %s, which is not a "
-                "permutation of 1-%d; not identifying the column from this frame"
-                % (list(digits), COLUMNS_ON_SHELF), throttle_duration_sec=10.0)
-            return
-        self.shelf_orders[digits] += 1
-        winner = shelf_order_winner(self.shelf_orders)
-        if winner is None:
+        self.shelf_windows[run] += 1
+        if len(run) == COLUMNS_ON_SHELF:
+            self.shelf_orders[run] += 1
+        winner = order_from_windows(self.shelf_windows, COLUMNS_ON_SHELF)
+        if winner is None or self.target_digit not in winner:
             return
         position = winner.index(self.target_digit) + 1
         if not self.columns_left_to_right:
             position = COLUMNS_ON_SHELF + 1 - position
         if position == self.shelf_column:
             return
+        views = sum(self.shelf_windows.values())
         if self.shelf_column is None:
             self.get_logger().info(
-                "the whole shelf has been read %d times, %d of them as %s, so marker %d "
-                "is shelf column %d%s"
-                % (sum(self.shelf_orders.values()), self.shelf_orders[winner],
-                   list(winner), self.target_digit, position,
-                   " (provisional until it is read again)"
-                   if self.shelf_orders[winner] < 3 else ""))
+                "the shelf order is %s, from %d partial view(s) of the plates, so marker %d "
+                "is shelf column %d" % (list(winner), views, self.target_digit, position))
         else:
             self.get_logger().warn(
-                "the shelf order has changed its mind: %s now holds %d of %d readings, "
+                "the shelf order has changed its mind: %d partial view(s) now make it %s, "
                 "so marker %d is shelf column %d, not %d"
-                % (list(winner), self.shelf_orders[winner],
-                   sum(self.shelf_orders.values()), self.target_digit, position,
-                   self.shelf_column))
+                % (views, list(winner), self.target_digit, position, self.shelf_column))
         self.shelf_column = position
         self.pub_shelf_column.publish(Int32(data=int(position)))
 

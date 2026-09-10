@@ -198,7 +198,12 @@ class DeliverNode(Node):
 
         # The same short median the grasp uses: enough to bury one bad frame, short
         # enough that the answer still means now on a base that never stops moving.
+        # Each sighting with the time it was taken. Only the recent ones are used; see
+        # _on_bin.
         self.bin_points = deque(maxlen=9)
+        self.bin_stamps = deque(maxlen=9)
+        # How many times the drive has lost the bin and gone back to looking for it.
+        self.reseeks = 0
         self.bin_point: Optional[np.ndarray] = None
         self.bin_at = None
 
@@ -244,7 +249,18 @@ class DeliverNode(Node):
         self.phase = msg.data
 
     def _on_bin(self, msg: PointStamped) -> None:
+        # Each sighting is in base_link as the base stood when it was taken. While the
+        # base turns, an older one describes a direction that is no longer there, and the
+        # median of nine of them used to be steered by: on the fifth full run
+        # (2026-09-10) the bin was seen at 2.5 to 3.2 m for five minutes and never got
+        # closer. Keep only what is fresh enough to steer by.
+        now = self.get_clock().now()
         self.bin_points.append([msg.point.x, msg.point.y, msg.point.z])
+        self.bin_stamps.append(now)
+        while self.bin_stamps and (
+                (now - self.bin_stamps[0]).nanoseconds / 1e9 > self.bin_fresh):
+            self.bin_stamps.popleft()
+            self.bin_points.popleft()
         self.bin_point = np.median(np.array(self.bin_points, dtype=float), axis=0)
         self.bin_at = self.get_clock().now()
 
@@ -279,7 +295,7 @@ class DeliverNode(Node):
         """Give the bin as measured recently enough to steer by, or None."""
         if self.bin_point is None or self.bin_at is None:
             return None
-        if len(self.bin_points) < 3:
+        if len(self.bin_points) < 2:
             return None
         age = (self.get_clock().now() - self.bin_at).nanoseconds / 1e9
         return self.bin_point if age <= self.bin_fresh else None
@@ -559,12 +575,26 @@ class DeliverNode(Node):
         target = self._bin_now()
         self._aim_head(self._tilt_for(target))
         if target is None:
-            # Lost it. Stop rather than coast: the base keeps whatever motion it is
-            # given, so coasting blind is how a delivery ends up against the table.
             self._stop()
-            if self._elapsed() > self.drive_timeout:
-                self.get_logger().error("lost sight of the bin while closing in")
-                self._enter(State.FAILED)
+            # Lost it: turn and look again rather than wait out the drive timeout in place.
+            #
+            # This used to stand still for up to three minutes, and a base standing
+            # still here is not still -- it coasts. The fifth run ended 3.2 m from the bin
+            # and eleven degrees off it, having waited. Seeking turns in place and has its
+            # own timeout, so this cannot loop for ever; three tries and it gives up.
+            lost_for = ((self.get_clock().now() - self.bin_at).nanoseconds / 1e9
+                        if self.bin_at is not None else self._elapsed())
+            if lost_for > max(3.0 * self.bin_fresh, 4.0):
+                if self.reseeks >= 3:
+                    self.get_logger().error(
+                        "lost sight of the bin while closing in, %d times" % self.reseeks)
+                    self._enter(State.FAILED)
+                    return
+                self.reseeks += 1
+                self.get_logger().warn(
+                    "lost sight of the bin for %.1f s; turning to look for it again (%d of 3)"
+                    % (lost_for, self.reseeks))
+                self._enter(State.SEEK)
             return
         if self._elapsed() > self.drive_timeout:
             self.get_logger().error(

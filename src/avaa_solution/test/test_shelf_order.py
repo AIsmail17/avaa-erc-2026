@@ -1,50 +1,71 @@
-"""The whole-shelf marker order is decided by a vote, not by the first frame that qualifies.
+"""The shelf's plate order is pieced together from partial views, not waited for whole.
 
 On 2026-09-10 one oblique frame read the plates as [1, 5, 3, 4, 2] when they were
-[5, 3, 1, 4, 2], passed every check -- five confident markers, a permutation -- and was
-latched for the rest of the run, reporting marker 3 on the wrong column. These pin down
-the rule that replaced it.
+[5, 3, 1, 4, 2] and was latched; the vote that replaced it then never concluded on the
+fifth run, which never once had all five plates in one frame. These pin down the rule that
+replaced both: runs of plates seen together, and the one order most of them agree with.
 """
 
 from collections import Counter
+from types import SimpleNamespace
 
-from avaa_solution.perception_node import shelf_order_winner
+from avaa_solution.perception_node import (
+    contiguous_run,
+    order_from_windows,
+    shelf_order_winner,
+)
 
 TRUE = (5, 3, 1, 4, 2)
 MISREAD = (1, 5, 3, 4, 2)
 
 
-def test_nothing_read_decides_nothing():
-    assert shelf_order_winner(Counter()) is None
+def plate(digit, cx, width=40, confident=True):
+    return SimpleNamespace(digit=digit, x=int(cx - width / 2), w=width, cx=float(cx),
+                           confident=confident)
 
 
-def test_a_single_clean_reading_answers_provisionally():
-    # The fourth full run saw the whole shelf so rarely that three agreeing readings never
-    # came, and no column was reported at all. One reading now gives an answer.
-    assert shelf_order_winner(Counter({TRUE: 1})) == TRUE
+def test_nothing_seen_decides_nothing():
+    assert order_from_windows(Counter()) is None
 
 
-def test_a_single_misread_is_overturned_once_the_truth_is_read():
-    tally = Counter({MISREAD: 1})
-    assert shelf_order_winner(tally) == MISREAD
-    tally[TRUE] += 3
-    assert shelf_order_winner(tally) == TRUE
+def test_one_whole_shelf_frame_answers():
+    assert order_from_windows(Counter({TRUE: 1})) == TRUE
 
 
-def test_three_agreeing_readings_decide_it():
+def test_overlapping_partial_views_pin_the_order():
+    assert order_from_windows(Counter({(5, 3, 1, 4): 1, (3, 1, 4, 2): 1})) == TRUE
+
+
+def test_a_run_that_leaves_an_end_open_decides_nothing():
+    # [3, 1, 4] could have 5 and 2 either way round it.
+    assert order_from_windows(Counter({(3, 1, 4): 4})) is None
+
+
+def test_the_misread_is_outvoted_by_the_frames_that_read_it_right():
+    tally = Counter({MISREAD: 1, (5, 3, 1, 4): 2, (3, 1, 4, 2): 2})
+    assert order_from_windows(tally) == TRUE
+
+
+def test_the_fifth_run_order_from_its_frames():
+    # 1 sliced by the border was dropped, leaving [2, 3, 5]; the shelf was [4, 1, 2, 3, 5].
+    tally = Counter({(2, 3, 5): 3, (4, 1, 2, 3): 2})
+    assert order_from_windows(tally) == (4, 1, 2, 3, 5)
+
+
+def test_a_plate_on_the_border_is_dropped_not_the_frame():
+    plates = [plate(1, 15), plate(2, 170), plate(3, 360), plate(5, 550)]
+    plates[0].x = 0
+    assert contiguous_run(plates, 640) == (2, 3, 5)
+
+
+def test_a_missed_plate_in_the_middle_breaks_the_run():
+    plates = [plate(2, 100), plate(3, 250), plate(4, 550)]
+    assert contiguous_run(plates, 640) is None
+
+
+def test_too_few_whole_plates_is_not_a_run():
+    assert contiguous_run([plate(2, 200), plate(3, 350)], 640) is None
+
+
+def test_the_old_whole_order_rule_still_agrees():
     assert shelf_order_winner(Counter({TRUE: 3})) == TRUE
-
-
-def test_one_bad_frame_does_not_stop_a_clear_answer():
-    assert shelf_order_winner(Counter({MISREAD: 1, TRUE: 3})) == TRUE
-
-
-def test_a_split_vote_decides_nothing():
-    assert shelf_order_winner(Counter({MISREAD: 3, TRUE: 3})) is None
-
-
-def test_a_later_majority_takes_over():
-    tally = Counter({MISREAD: 3})
-    assert shelf_order_winner(tally) == MISREAD
-    tally[TRUE] += 8
-    assert shelf_order_winner(tally) == TRUE
