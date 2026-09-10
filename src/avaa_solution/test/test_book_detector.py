@@ -164,3 +164,32 @@ def test_the_bin_is_not_returned_as_a_book():
     img = blank()
     put_bin(img)
     assert [b for b in bd.detect_books(img) if b.colour == "red"] == []
+
+
+def test_the_bin_is_found_at_the_size_it_measures_dead_ahead_from_four_metres():
+    # The 1500 square pixel gate hid the bin whenever the robot faced it from much beyond
+    # three metres. Swept across the image at one range after the fourteenth full run it
+    # measured 1978, 1727 and 1498 at 40, 35 and 30 degrees off centre, which puts it near
+    # 970 dead ahead. A wide red box of that area is the bin.
+    img = blank()
+    cv2.rectangle(img, (290, 170), (290 + 46, 170 + 21), BGR["red"], -1)
+    found = bd.detect_bin(img)
+    assert found is not None
+    assert 900 <= found.area <= 1000
+
+
+def test_a_speck_of_red_is_still_not_the_bin():
+    img = blank()
+    cv2.rectangle(img, (300, 170), (315, 178), BGR["red"], -1)
+    assert bd.detect_bin(img) is None
+
+
+def test_every_bin_shaped_blob_is_offered_largest_first():
+    # Perception checks each one against the bin's size in metres, so a large red thing
+    # near the camera must not be the only one offered.
+    img = blank()
+    cv2.rectangle(img, (40, 40), (200, 120), BGR["red"], -1)
+    cv2.rectangle(img, (400, 200), (450, 224), BGR["red"], -1)
+    candidates = bd.detect_bin_candidates(img)
+    assert [c.x for c in candidates] == [40, 400]
+    assert bd.detect_bin(img).x == 40

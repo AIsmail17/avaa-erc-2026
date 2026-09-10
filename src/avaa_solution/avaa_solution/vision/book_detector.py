@@ -77,12 +77,22 @@ ROWS_PER_COLUMN = 4
 # Bin gates, the mirror image of the book gates above.
 #
 # The bin is the same red as a red book -- the module docstring says so, and it is the
-# reason the shape gates exist at all -- so the only thing separating them is size and
-# proportion. A book presents an upright face 6-8 px wide by 14-26 px tall; the bin
-# measured 136 x 66, which is wider than it is tall and two hundred times the area.
-# There is no overlap to argue about, so the gates sit an order of magnitude apart on
-# both counts rather than being tuned to a boundary.
-BIN_MIN_AREA = 1500
+# reason the shape gates exist at all. In the image what separates them is proportion: a
+# book presents an upright face 6-8 px wide by 14-26 px tall, and the bin is wider than
+# it is tall. Size in metres is checked afterwards, with depth, in
+# perception_node.bin_sized, and that is what keeps a red book out.
+#
+# The area gate is only a floor against specks, and at 1500 square pixels it hid the bin
+# whenever the robot faced it from much beyond three metres. A pinhole image stretches
+# what sits off to the side, so the same bin measures less in the middle of the frame
+# than near its edge. Swept across the image with the head after the fourteenth full
+# run, at one range: 1978 square pixels at 40 degrees off centre, 1727 at 35, 1498 at 30
+# and rejected, and about 970 dead ahead by the same falloff. That run's delivery saw
+# the bin only while it was 22 degrees or more to one side, turned towards it, lost it,
+# and gave up after three looks; the ninth run's steady -29 degrees and its +22/-20
+# swinging fit the same explanation. At 400 the bin stays in view dead ahead out to
+# about 5.8 m.
+BIN_MIN_AREA = 400
 BIN_MAX_ASPECT = 0.9
 BIN_MIN_FILL = 0.45
 
@@ -147,24 +157,24 @@ def detect_books(bgr: np.ndarray) -> List[Book]:
     return found
 
 
-def detect_bin(bgr: np.ndarray) -> Optional[Book]:
-    """Return the collection bin, or None if it is not in view.
+def detect_bin_candidates(bgr: np.ndarray) -> List[Book]:
+    """Return every red blob shaped like the collection bin, largest first.
 
-    The bin is returned as a ``Book`` with colour "red" so that everything downstream --
+    Each is returned as a ``Book`` with colour "red" so that everything downstream --
     the depth locator, the annotator, the tests -- takes it without a second code path.
-    It is not a book and nothing treats it as one: only ``detect_bin`` produces it, and
+    It is not a book and nothing treats it as one: only the bin detectors produce it, and
     only the delivery controller asks.
 
-    The largest qualifying blob wins rather than the first. A red book on the shelf can
-    never pass the area gate, but the start zone and a red book seen close up are both
-    red things of some size, and picking the biggest is the difference between aiming at
-    the bin and aiming at whatever happened to be found first.
+    All of them, not just the largest. The shape gates cannot tell the bin from a red
+    thing of the same proportions; its size in metres can, and that needs depth, so it
+    is perception's to check. Offering only the biggest let one near red object hide the
+    bin: rejected on size, with nothing else to try.
     """
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     contours, _ = cv2.findContours(
         _mask_for(hsv, "red"), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    best: Optional[Book] = None
+    found: List[Book] = []
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
         if w == 0 or h == 0:
@@ -174,9 +184,15 @@ def detect_bin(bgr: np.ndarray) -> Optional[Book]:
         fill = area / float(w * h)
         if area < BIN_MIN_AREA or aspect > BIN_MAX_ASPECT or fill < BIN_MIN_FILL:
             continue
-        if best is None or area > best.area:
-            best = Book("red", x, y, w, h, area, aspect, fill)
-    return best
+        found.append(Book("red", x, y, w, h, area, aspect, fill))
+    found.sort(key=lambda book: book.area, reverse=True)
+    return found
+
+
+def detect_bin(bgr: np.ndarray) -> Optional[Book]:
+    """Return the largest bin-shaped red blob, or None if there is none in view."""
+    candidates = detect_bin_candidates(bgr)
+    return candidates[0] if candidates else None
 
 
 def group_into_columns(books: Sequence[Book]) -> List[List[Book]]:

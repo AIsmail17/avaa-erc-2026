@@ -1139,31 +1139,41 @@ class PerceptionNode(Node):
         Publishing nothing when the bin is not in view is the point of the topic: the
         delivery controller turns the robot until something arrives.
         """
-        found = bd.detect_bin(frame)
-        if found is None:
+        candidates = bd.detect_bin_candidates(frame)
+        if not candidates:
             return
         if self.depth_image is None or self.intrinsics is None or not self.depth_frame:
             return
-        point_optical = dl.locate(found.bbox, self.depth_image, self.intrinsics)
-        if point_optical is None:
-            return
-        depth_m = float(point_optical[2])
-        width_mm = found.w * depth_m / self.intrinsics.fx * 1000
-        height_mm = found.h * depth_m / self.intrinsics.fy * 1000
-        area_m2 = found.area * depth_m ** 2 / (self.intrinsics.fx * self.intrinsics.fy)
-        if not bin_sized(found.w, found.h, depth_m,
+        # The largest that measures as big as the bin, not simply the largest: a red book
+        # near the camera can be the biggest red thing in the frame and still be a book.
+        chosen = None
+        for found in candidates:
+            point_optical = dl.locate(found.bbox, self.depth_image, self.intrinsics)
+            if point_optical is None:
+                continue
+            depth_m = float(point_optical[2])
+            width_mm = found.w * depth_m / self.intrinsics.fx * 1000
+            height_mm = found.h * depth_m / self.intrinsics.fy * 1000
+            area_m2 = found.area * depth_m ** 2 / (self.intrinsics.fx * self.intrinsics.fy)
+            if bin_sized(found.w, found.h, depth_m,
                          self.intrinsics.fx, self.intrinsics.fy, found.area):
+                chosen = (found, point_optical, width_mm, height_mm, area_m2, depth_m)
+                break
             self.get_logger().info(
                 "a red shape %d x %d px at %.2f m is %.0f x %.0f mm and %.3f m2, too "
                 "small to be the bin; probably a book, not offering it"
                 % (found.w, found.h, depth_m, width_mm, height_mm, area_m2),
                 throttle_duration_sec=5.0)
+        if chosen is None:
             return
+        found, point_optical, width_mm, height_mm, area_m2, depth_m = chosen
         # Log what the real bin measures, so the gates above are checked against it
-        # rather than against arithmetic about it.
+        # rather than against arithmetic about it -- its pixel area and column too, since
+        # the pixel area is the gate that hid it from the fourteenth run's delivery.
         self.get_logger().info(
-            "bin candidate %.0f x %.0f mm and %.3f m2 at %.2f m"
-            % (width_mm, height_mm, area_m2, depth_m), throttle_duration_sec=5.0)
+            "bin candidate %.0f x %.0f mm and %.3f m2 at %.2f m, %.0f px2 at column %.0f"
+            % (width_mm, height_mm, area_m2, depth_m, found.area, found.cx),
+            throttle_duration_sec=5.0)
         try:
             tf = self.tf_buffer.lookup_transform(
                 GRASP_FRAME, self.depth_frame, rclpy.time.Time())
