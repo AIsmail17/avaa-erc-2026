@@ -63,6 +63,13 @@ def test_a_missed_plate_in_the_middle_breaks_the_run():
     assert contiguous_run(plates, 640) is None
 
 
+def test_foreshortened_plates_seen_from_the_side_are_still_a_run():
+    # Gaps of 90, 120 and 160 px: each neighbour within a third of the last, but the
+    # extremes 1.78 apart -- which the old rule refused.
+    plates = [plate(4, 100), plate(2, 190), plate(5, 310), plate(3, 470)]
+    assert contiguous_run(plates, 640) == (4, 2, 5, 3)
+
+
 def test_too_few_whole_plates_is_not_a_run():
     assert contiguous_run([plate(2, 200), plate(3, 350)], 640) is None
 

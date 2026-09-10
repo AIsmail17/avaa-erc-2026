@@ -169,10 +169,16 @@ def shelf_order_winner(tally, needed: int = SHELF_ORDER_VOTES,
     return order
 
 
-# Plates in one run of a partial view must be evenly spaced, or a plate between two of them
-# was missed and the run is not contiguous. Perspective alone changes neighbouring gaps by
-# well under half again; one missing plate doubles a gap.
-WINDOW_MAX_GAP_RATIO = 1.7
+# Neighbouring gaps in one run of a partial view must be similar, or a plate between two of
+# them was missed and the run is not contiguous. One missing plate doubles a gap against its
+# neighbours.
+#
+# NEIGHBOURING gaps, not the largest against the smallest. Seen from the side the plates
+# foreshorten steadily across the frame, so the first and last gap of four plates can differ
+# by more than this while every adjacent pair stays close. On the seventh full run
+# (2026-09-10) eight steering lines had four plates in view, all at headings of -76 to -44
+# degrees, and no order was ever settled; comparing the extremes is the likely reason.
+WINDOW_MAX_GAP_RATIO = 1.6
 WINDOW_MIN_PLATES = 3
 
 
@@ -223,8 +229,11 @@ def contiguous_run(markers, frame_width: int):
     if len(set(digits)) != len(digits):
         return None
     gaps = [b.cx - a.cx for a, b in zip(whole, whole[1:])]
-    if min(gaps) <= 0 or max(gaps) > WINDOW_MAX_GAP_RATIO * min(gaps):
+    if min(gaps) <= 0:
         return None
+    for near, far in zip(gaps, gaps[1:]):
+        if max(near, far) > WINDOW_MAX_GAP_RATIO * min(near, far):
+            return None
     return digits
 
 
@@ -1432,6 +1441,12 @@ class PerceptionNode(Node):
             self.shelf_orders[run] += 1
         winner = order_from_windows(self.shelf_windows, COLUMNS_ON_SHELF)
         if winner is None or self.target_digit not in winner:
+            if self.shelf_column is None:
+                self.get_logger().info(
+                    "partial views of the plates so far, not yet one order: %s"
+                    % {"".join(str(d) for d in run): count
+                       for run, count in self.shelf_windows.items()},
+                    throttle_duration_sec=5.0)
             return
         position = winner.index(self.target_digit) + 1
         if not self.columns_left_to_right:

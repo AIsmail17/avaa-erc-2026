@@ -610,6 +610,14 @@ class DeliverNode(Node):
 
         bearing = math.atan2(float(target[1]), max(float(target[0]), 0.05))
         range_error = float(target[0]) - self.standoff
+        # What the drive is working from, every two seconds. It logged nothing between
+        # entering and leaving DRIVE, so the seventh full run lost the bin four times and
+        # left no record of the bearing, the range or the command at any point.
+        self.get_logger().info(
+            "driving: bin %.2f m ahead, %+.0f mm aside (bearing %+.1f deg), %d fresh "
+            "sighting(s)" % (float(target[0]), float(target[1]) * 1000,
+                             math.degrees(bearing), len(self.bin_points)),
+            throttle_duration_sec=2.0)
 
         # Steer and drive together while roughly lined up; turn in place only when far off.
         #

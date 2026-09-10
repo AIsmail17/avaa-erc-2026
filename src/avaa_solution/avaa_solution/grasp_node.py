@@ -238,6 +238,11 @@ BOARD_DROP = 0.125 + 0.02
 # found something that is not the shelf. See _hold_command.
 SHELF_YAW_TRUST_RAD = 0.14
 
+# The finger pads sit this far behind the grasping frame along the approach. Measured in
+# every clamp report since: "the grasping frame is at ..., so the pads sit 30 mm behind
+# it" -- 30 to 33 mm across the runs of 2026-09-10.
+PADS_BEHIND_GRASP_M = 0.030
+
 # Height of the left shoulder above base_link when the torso is fully down, measured from
 # the chain: arm_left_1 sits at z = 0.677 + torso.
 SHOULDER_BASE_Z = 0.677
@@ -498,10 +503,22 @@ class GraspNode(Node):
         self.declare_parameter("entry_height_tolerance_m", 0.012)
         # How far in front of the book's face the planned reach stops.
         #
-        # The grasping frame here, so the pads -- 30 mm behind it -- are 50 mm clear.
-        # Far enough that squaring up cannot touch the book, near enough that the servo
-        # only has 130 mm to cover at 60 mm/s.
-        self.declare_parameter("entry_clearance_m", 0.020)
+        # This was 0.020, reasoned from the PADS: 30 mm behind the grasping frame, so
+        # 50 mm clear, and squaring up could not touch the book. The fingers are longer
+        # than the pads -- each fingertip link sits 50 mm out along its finger -- and it
+        # is a finger, not a pad, that meets the book when the jaws move sideways.
+        # Measured 2026-09-10, the seventh full run: at the staging point a fresh
+        # sighting moved the target 27 mm, the servo began squaring up 21 mm sideways,
+        # and 1.2 s later perception saw a 278 x 187 mm red shape at 0.73 m where an
+        # upright book 30 mm wide had been. The jaws closed on its old position 312.4 s
+        # into the run; the book lay 57 mm deeper and over a hundred millimetres aside.
+        #
+        # 70 mm leaves room for a re-aim towards the book and a squaring move with the
+        # fingers still clear of it, for about one more second of servoing.
+        self.declare_parameter("entry_clearance_m", 0.070)
+        # How far short of the book's face the finger ends must be before the servo
+        # may move the jaws sideways. See the squaring in _do_servo.
+        self.declare_parameter("entry_finger_margin_m", 0.040)
         # How far below the middle of the book to grip it.
         #
         # The book is 250 mm tall and 30 mm thick, standing free on a shelf board it
@@ -816,6 +833,8 @@ class GraspNode(Node):
             self.get_parameter("entry_height_tolerance_m").value)
         self.entry_clearance = float(
             self.get_parameter("entry_clearance_m").value)
+        self.entry_finger_margin = float(
+            self.get_parameter("entry_finger_margin_m").value)
         self.below_centre = float(
             self.get_parameter("grasp_below_centre_m").value)
         self.posture_choices = int(
@@ -2733,13 +2752,31 @@ class GraspNode(Node):
         # clearance, go in. Nothing is given up by waiting: the servo re-aims from
         # perception every tick, so time spent squaring up is time spent on a fresher
         # fix of where the book is.
-        if (self.face_x is not None and float(here[0]) < self.face_x
-                and (abs(float(error[1])) > self.entry_lateral
-                     or abs(float(error[2])) > self.entry_height)):
-            error = np.array([0.0, float(error[1]), float(error[2])])
-            self.get_logger().info(
-                "squaring up %.0f mm sideways and %.0f mm in height before going in"
-                % (error[1] * 1000, error[2] * 1000), throttle_duration_sec=2.0)
+        #
+        # Measured against where the FINGERS are, not the grasping frame. Squaring used
+        # to be allowed for as long as the grasping frame was in front of the face, and
+        # the finger ends reach the face first: on the seventh full run a 21 mm sideways
+        # squaring move at the staging point swept a finger across the book and toppled
+        # it. So the jaws move sideways only while the grasping frame is at least
+        # entry_finger_margin short of the face. If they still need to move sideways once
+        # they are closer than that, but before the pads have reached the face, they back
+        # straight out in depth first -- never sideways with a finger against the book.
+        off_line = (abs(float(error[1])) > self.entry_lateral
+                    or abs(float(error[2])) > self.entry_height)
+        if self.face_x is not None and off_line:
+            clear_line = float(self.face_x) - self.entry_finger_margin
+            if float(here[0]) < clear_line:
+                error = np.array([0.0, float(error[1]), float(error[2])])
+                self.get_logger().info(
+                    "squaring up %.0f mm sideways and %.0f mm in height before going in"
+                    % (error[1] * 1000, error[2] * 1000), throttle_duration_sec=2.0)
+            elif float(here[0]) < float(self.face_x) + PADS_BEHIND_GRASP_M:
+                error = np.array([clear_line - float(here[0]), 0.0, 0.0])
+                self.get_logger().warn(
+                    "%.0f mm off the book's line with the fingers at its face; backing "
+                    "out %.0f mm before squaring up"
+                    % (abs(float(target[1]) - float(here[1])) * 1000,
+                       abs(error[0]) * 1000), throttle_duration_sec=2.0)
 
         self._servo_step(target, here, error)
 
