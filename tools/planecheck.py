@@ -75,7 +75,7 @@ class Look(Node):
 
 
 def main():
-    row_height = float(sys.argv[1]) if len(sys.argv) > 1 else 1.061
+    row_height = float(sys.argv[1]) if len(sys.argv) > 1 else 1.1708
     rclpy.init()
     node = Look()
     end = time.time() + 25

@@ -70,6 +70,15 @@ GRIPPER_TOPICS = ("/gripper_left_controller/joint_trajectory",
 FINGER = "gripper_left_finger_joint"
 GRASP_LINK = "gripper_left_grasping_link"
 
+# Gazebo reports the tiago_pro model pose at base_FOOTPRINT, on the floor, and TF gives
+# the gripper in base_LINK. Composing the two without this puts the gripper 76 mm below
+# where it is, and 76 mm is most of the 90 mm this node will hold from.
+#
+# base_footprint_joint in tiago_pro.urdf. Deliberately a local copy rather than an import
+# from avaa_solution: this file is scaffolding that Phase 2 drops, and the dependency runs
+# one way. See avaa_solution/arena.py for the same number and what it cost elsewhere.
+BASE_LINK_Z = 0.0762
+
 # Below this commanded position the solution is closing; above it, opening. The jaws run
 # 0.000 shut to 0.069 open, so this sits well clear of both.
 CLOSING_BELOW = 0.020
@@ -209,7 +218,7 @@ class GraspFix(Node):
         t = tf.transform.translation
         return (bx + t.x * math.cos(yaw) - t.y * math.sin(yaw),
                 by + t.x * math.sin(yaw) + t.y * math.cos(yaw),
-                bz + t.z), yaw
+                bz + BASE_LINK_Z + t.z), yaw
 
     # ------------------------------------------------------------------ the trigger
     def _on_gripper(self, msg: JointTrajectory):
@@ -228,22 +237,42 @@ class GraspFix(Node):
         if asked <= CLOSING_BELOW and self.held is None and not self.attach_asked:
             self.attach_asked = True
             self._ask("pick")
-        elif asked >= OPENING_ABOVE and self.held is not None:
-            self.get_logger().info("released %s" % self.held)
+        elif asked >= OPENING_ABOVE:
+            # Opening ends the attempt whether or not anything was held.
+            #
+            # This used to require self.held, and between that and the early return in
+            # _pick below there was no path back: one clamp that came up short set
+            # attach_asked and nothing ever cleared it, so the node went quiet for the
+            # rest of its life. It is launched once with the simulator and lives for
+            # hours, so "the rest of its life" means every later run in that session.
+            # Observed exactly that -- a clamp at 1731 mm failed honestly at 05:57, and
+            # a grasp four hours later that put the pads 8 mm off the centre of the book
+            # was never even considered.
+            if self.held is not None:
+                self.get_logger().info("released %s" % self.held)
             self.held = None
             self.offset = None
             self.attach_asked = False
 
     def _pick(self):
         """Decide whether the jaws closed on a book, and take it if so. Worker only."""
+        # Read the world FIRST, every time. This decision is made once, at the instant
+        # the jaws close, and it is made by comparing a base pose from Gazebo against a
+        # gripper pose from TF -- so a cached base pose is compared against a live arm.
+        #
+        # The cache is refreshed on a 3 second timer, and this base does not hold still:
+        # measured during one grasp it turned 19.4 degrees and slid 400 mm. Three seconds
+        # of that is tens of millimetres of pure bookkeeping error against a 90 mm
+        # tolerance. On the run that found this, the grasp controller had its pads 1 mm
+        # off the centre line of the book and this node measured the same book 89 mm off
+        # sideways and refused it.
+        self._read_poses()
         here, yaw = self._grasp_link_world()
         if here is None:
             self.get_logger().warn(
                 "no pose for %s, so nothing can be picked up" % GRASP_LINK)
             self.attach_asked = False
             return
-        if not self.books:
-            self._read_poses()
         best, best_gap = None, None
         for name, position in self.books.items():
             gap = math.dist(here, position)
@@ -275,6 +304,8 @@ class GraspFix(Node):
                    self.robot_pose[0], self.robot_pose[1], self.robot_pose[2],
                    len(self.books),
                    best, book[0], book[1], book[2]))
+            # Ready for the next clamp. This is a verdict on one close, not on the run.
+            self.attach_asked = False
             return
 
         # Remember how it was picked up, so it is carried the same way rather than

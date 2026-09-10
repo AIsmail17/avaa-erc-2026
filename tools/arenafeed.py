@@ -43,9 +43,13 @@ GRASP = "gripper_left_grasping_link"
 PAD_LOCAL = (0.0042, 0.0187, 0.0000)
 BOOK_DEPTH = 0.16
 # base_link sits this far above the floor, so a height measured from the robot's model
-# origin has to lose it before being compared with anything in base_link. Checked against
-# ROW_HEIGHTS_BASE: row 1 is 1.577 in world and 1.391 in base_link.
-BASE_LINK_Z = 0.0762   # floor to base_link, base_footprint_joint in the URDF; this was 0.186 and wrong by 110 mm
+# origin has to lose it before being compared with anything in base_link.
+#
+# This was 0.186 until 2026-09-10 and the URDF says 0.0762, which is why this tool
+# used to report a reach as landing 0 mm from the book while the hand was 110 mm
+# below it: the same wrong number aimed the arm and then measured the miss. See
+# avaa_solution/arena.py. Row 1 is 1.577 in world and 1.5008 in base_link.
+BASE_LINK_Z = 0.0762
 # grasp_node's grasp_below_centre_m, so the expected height miss is not zero.
 GRASP_BELOW_CENTRE = 0.045
 
@@ -165,6 +169,18 @@ def main():
                                                         world[k]["py"] - robot["py"]))
     book = world[book_name]
 
+    def base_yaw(robot_pose):
+        """World heading of the base, which is also its yaw error against the shelf.
+
+        The shelf faces -x and a robot square on to it stands at world yaw zero, so the
+        two are the same number. perception_node publishes it as shelf_yaw with exactly
+        that meaning: zero when square on, positive yawed counter-clockwise.
+        """
+        return math.atan2(
+            2.0 * (robot_pose["qw"] * robot_pose["qz"]
+                   + robot_pose["qx"] * robot_pose["qy"]),
+            1.0 - 2.0 * (robot_pose["qy"] ** 2 + robot_pose["qz"] ** 2))
+
     def in_base(robot_pose):
         """The book, in the base frame of a robot at this pose."""
         yaw = math.atan2(
@@ -208,6 +224,7 @@ def main():
     # Every reading is a subprocess, so this holds to about 1 Hz. That is fine here: the
     # base moves at centimetres a second and nothing is being teleported.
     last_read = [0.0]
+    yaw_now = [base_yaw(robot)]
     end = None
     while rclpy.ok():
         if end is None:
@@ -220,13 +237,29 @@ def main():
             if fresh is not None:
                 bx, by, bz = in_base(fresh)
                 face_x = bx - BOOK_DEPTH / 2.0
+                yaw_now[0] = base_yaw(fresh)
         pub_row.publish(Int32(data=int(row)))
         point = PointStamped()
         point.header.frame_id = "base_link"
         point.header.stamp = node.get_clock().now().to_msg()
         point.point.x, point.point.y, point.point.z = face_x, by, bz
         pub_point.publish(point)
-        pub_yaw.publish(Float32(data=0.0))
+        # The TRUE yaw error, not a zero.
+        #
+        # This published 0.0 -- "the shelf is square, nothing to correct" -- for as long
+        # as it existed, and that is not a neutral placeholder. grasp_node's base hold
+        # has two channels, a linear one from the book point and an angular one from
+        # this, and a constant zero switches the angular one off while telling the
+        # controller it is working. Measured on the run that found it: the base turned
+        # 19.4 degrees during a single grasp, the hold never commanded a single
+        # correction for it, and a book 0.72 m out therefore swung 240 mm sideways --
+        # past the 200 mm the linear channel will admit, so that gave up too. The grasp
+        # aid then measured the nearest book 101 mm from the jaws and refused it.
+        #
+        # A harness may leave a signal out. It may not feed a wrong one: the whole point
+        # of arenafeed is to supply what perception WOULD supply if it were right, and
+        # perception would supply this.
+        pub_yaw.publish(Float32(data=float(yaw_now[0])))
         if at_clamp.pop("pending", False):
             try:
                 pa, pb = at(TIP_L, PAD_LOCAL), at(TIP_R, PAD_LOCAL)

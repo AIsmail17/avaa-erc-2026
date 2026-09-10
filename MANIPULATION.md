@@ -583,3 +583,84 @@ should stay until the gripper can actually hold something.
 It also retires a line of investigation. The pads were being tracked to the millimetre
 against the book to find out why they missed, and on the last clamp they were 53 mm into
 a 160 mm book with the jaws open to 65 mm around a 30 mm spine. They were not missing.
+
+---
+
+## `base_link` is 0.0762 m above the floor, not 0.186 — every row was aimed 110 mm low (2026-09-10)
+
+The hand had been missing the book low, and this is the whole of it. One constant joins
+the frame the robot plans in to the frame Gazebo and the rules speak, and it was wrong.
+
+```
+base_footprint_joint, tiago_pro.urdf:   origin xyz="0 0 0.0762"
+this project, in eighteen places:       0.186
+```
+
+`ROW_HEIGHTS_BASE` is world minus that constant, so every row was 110 mm low. The grasp
+aims a further 45 mm below the book centre, and a book is 250 mm tall — so the gripper
+was being sent 155 mm below the centre of it, 30 mm below its bottom edge, into the board
+it stands on.
+
+| | old | corrected |
+|---|---|---|
+| row 1 | 1.391 | **1.5008** |
+| row 2 | 1.061 | **1.1708** |
+| row 3 | 0.731 | **0.8408** |
+| row 4 | 0.401 | **0.5108** |
+| bin rim | 0.764 | **0.8738** |
+
+### Three independent sources, and none of them is the URDF's word for itself
+
+* **TF.** `base_footprint` to `base_link` measures +0.0762, and `base_link` lands at
+  exactly the wheel axle height, which is where TIAGo puts it.
+* **Gazebo.** It agrees with TF about everything downstream, so the chain is sound: asked
+  for `torso_lift_link`, the simulator says world z = 0.9424 and TF says 0.9423 from
+  `base_footprint` — the same number to a tenth of a millimetre. That also settles that
+  `base_footprint` really is the floor plane. `tools/worldtf.py`.
+* **The camera.** Every book fix, deprojected from depth and carried through TF into
+  `base_link`, came back 115 mm above ground-truth-minus-0.186 and within 6 mm of
+  ground-truth-minus-0.0762 — four rows, three head tilts, ranges 0.65 to 1.62 m,
+  9 mm of spread. `tools/bookheight.py`.
+
+### Why nothing caught it
+
+The tools that measured the miss converted ground truth into `base_link` with the **same**
+constant as the code that aimed the arm. Both sides moved together, the difference came
+out as zero, and a reach that was 110 mm low reported as perfect.
+
+**A constant that appears on both sides of a comparison is never tested by that
+comparison.** `test_arena.py` now checks this one against the URDF, which cannot move
+with it.
+
+### What this corrects above
+
+The two reach tables in this document — "Every row is reachable" and "The arm does not
+sag" — were measured against the old conversion. Their **Target z** column is what was
+commanded and is 110 mm low at every row; their **Miss** column was measured with the
+same wrong number, which is why it reads 3–6 mm on reaches that were not. The finding
+those tables carry still stands: the arm goes accurately to wherever it is sent, at every
+row, without sagging. It was being sent to the wrong place.
+
+Two other things follow, and both were read as separate faults at the time:
+
+* **Row 4 read as unreachable.** 0.401 in `base_link` is 110 mm below where the bottom
+  row actually is, and down there the forearm meets the base. At 0.5108 it is not the
+  same question.
+* **`DEPTH_HEIGHT_BIAS` had grown to 0.152 m** absorbing it. The real residual is +6 mm
+  with 9 mm of spread. Rows are 330 mm apart, so the measured height can now name a row
+  outright — and the height cross-check in `perception_node` is allowed to overrule the
+  marker row by one, which it never was before.
+
+### First arena grasp after the fix
+
+Row 3, book fed from ground truth, robot placed at a 0.72 m standoff:
+
+```
+the grasping frame is +0 mm depth, +2 mm sideways, +1 mm height of its target,
+but the PADS are on the book: 80 mm into it, 8 mm off centre sideways,
+42 mm off in height. Clamping on that.
+the jaws stopped at 27.1 mm on a 30.0 mm book, so there is something between them
+```
+
+80 mm into a book 160 mm deep, 8 mm off its centre line, and 42 mm below the centre
+against a deliberate 45. The jaws closed **on the book** for the first time.

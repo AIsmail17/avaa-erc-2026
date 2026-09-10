@@ -28,7 +28,7 @@ from avaa_solution.moveit_client import MoveItClient, error_name  # noqa: E402
 ARM_JOINTS = ["arm_left_%d_joint" % i for i in range(1, 8)]
 CHAIN_JOINTS = ["torso_lift_joint"] + ARM_JOINTS
 TUCK = [0.15, 2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944]
-ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
+ROW_HEIGHTS = [1.5008, 1.1708, 0.8408, 0.5108]
 BOARD_DROP = 0.145
 APPROACH = [1.0, 0.0, 0.0]
 CLOSING = [0.0, 1.0, 0.0]

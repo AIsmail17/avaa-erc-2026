@@ -23,7 +23,7 @@ from std_msgs.msg import String
 # From grasp_node: the shoulder sits this far up the torso, and the aim is a quarter of
 # a metre above the target so the arm reaches DOWN.
 SHOULDER_BASE_Z = 0.677
-ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
+ROW_HEIGHTS = [1.5008, 1.1708, 0.8408, 0.5108]
 TORSO_MIN, TORSO_MAX = 0.0, 0.35
 
 

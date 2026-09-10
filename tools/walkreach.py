@@ -25,7 +25,7 @@ CHAIN_JOINTS = ["torso_lift_joint"] + ["arm_left_%d_joint" % i for i in range(1,
 def main():
     face_x = float(sys.argv[1]) if len(sys.argv) > 1 else 0.64
     book_y = float(sys.argv[2]) if len(sys.argv) > 2 else 0.159
-    height = float(sys.argv[3]) if len(sys.argv) > 3 else 0.731
+    height = float(sys.argv[3]) if len(sys.argv) > 3 else 0.8408
 
     rclpy.init()
     node = rclpy.create_node("walk_reach")

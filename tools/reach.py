@@ -25,7 +25,7 @@ import numpy as np
 sys.path.insert(0, "/opt/erc_ws/src/avaa_solution")
 from avaa_solution.kinematics.arm_chain import ArmChain  # noqa: E402
 
-ROWS = [1.391, 1.061, 0.731, 0.401]
+ROWS = [1.5008, 1.1708, 0.8408, 0.5108]
 SHOULDER_BASE_Z = 0.677
 BOOK_HALF_DEPTH = 0.08
 SHOULDER_Y = 0.159

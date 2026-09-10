@@ -268,7 +268,7 @@ def main():
     bz = truth[2] - BASE_Z
 
     # Which competition row that height is, against the heights the grasp node uses.
-    heights = [1.391, 1.061, 0.731, 0.401]
+    heights = [1.5008, 1.1708, 0.8408, 0.5108]
     row = min(range(4), key=lambda i: abs(heights[i] - bz)) + 1
 
     print("target      : %s at %.2f m" % (name, distance))

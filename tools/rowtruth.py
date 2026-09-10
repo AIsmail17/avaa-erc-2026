@@ -40,7 +40,7 @@ SECONDS = float(sys.argv[2]) if len(sys.argv) > 2 else 60.0
 
 WORLD = "erc_world"
 BASE_LINK_Z = 0.0762
-ROW_HEIGHTS_BASE = [1.391, 1.061, 0.731, 0.401]
+ROW_HEIGHTS_BASE = [1.5008, 1.1708, 0.8408, 0.5108]
 # perception_node.DEPTH_HEIGHT_BIAS: the fix reads high because the book's lower edge is
 # behind the shelf lip, so the bounding box centre is above the book centre.
 DEPTH_HEIGHT_BIAS = 0.152

@@ -50,7 +50,9 @@ from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Pose, PointStamped, Quaternion, Twist
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from sensor_msgs.msg import JointState
+from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
+                       QoSReliabilityPolicy)
+from sensor_msgs.msg import Imu, JointState
 from tf2_ros import Buffer, TransformListener
 from std_msgs.msg import Float32, Int32, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -521,6 +523,48 @@ class GraspNode(Node):
         self.declare_parameter("hold_max_yaw_rad_s", 0.15)
         self.declare_parameter("hold_deadband_m", 0.012)
         self.declare_parameter("hold_yaw_deadband_rad", 0.02)
+        # Damping on the measured yaw RATE, from the IMU, on top of the angle term above.
+        #
+        # The angle term is proportional and it comes from the camera, so it needs the
+        # shelf in frame and it arrives at whatever rate perception manages. The arm goes
+        # in front of the camera on the way in, which is when the base is least able to
+        # afford turning. The IMU has neither problem, and this base's real complaint is
+        # not that it is at the wrong angle but that it will not stop turning: nothing
+        # damps it, so whatever rate it picks up it keeps.
+        #
+        # The filter is not a detail, and a light one does not work.
+        #
+        # The raw signal is 93 Hz of a base that SHAKES: over six seconds, mean
+        # -0.74 deg/s, spread 4.70, range -18.27 to +17.16. The spread is six times the
+        # mean. That is not sensor noise -- the URDF gives the gyro a stddev of 2e-4
+        # rad/s and the measured spread is 0.082, four hundred times it -- it is the
+        # suspension and four mecanum wheels on a physics engine. Braking on the
+        # instantaneous rate therefore spends the entire command budget fighting the
+        # shake: at alpha 0.3 every command saturated at the 0.15 rad/s clip and the
+        # drift was only halved.
+        #
+        # The drift is the slow part, so filter for the slow part. Measured with
+        # tools/yawbrake.py, publishing -gain * (filtered rate) at 20 Hz for ten
+        # simulated seconds against Gazebo ground truth, alpha 0.01 (about a second):
+        #
+        #     gain 0      -8.391 deg      the control, nothing commanded
+        #     gain 2      -0.517 deg      94 per cent of the turn removed, and the
+        #                                 largest command it ever asked for was 0.040
+        #                                 rad/s against a 0.15 clip
+        #     gain 0     -10.231 deg      the control again
+        #     gain 4      +4.997 deg      overshoot: it turned the base the other way
+        #
+        # Killing the turn takes most of the apparent slide with it, which is the point:
+        # the same trials moved 53 mm and 32 mm uncorrected against 40 mm and 10 mm.
+        #
+        # The IMU is worth trusting for this in a way odometry is not. Over four
+        # ten-second windows its integrated yaw tracked ground truth to under half a
+        # degree, while odom saw about a quarter of the turn: -4.2 against -13.3, -2.9
+        # against -16.9 (tools/imudrift.py). Odom is blind here by construction, because
+        # this base slides and turns across its wheels without them reporting it.
+        self.declare_parameter("hold_imu_yaw_gain", 2.0)
+        self.declare_parameter("hold_imu_yaw_deadband_rad_s", 0.004)
+        self.declare_parameter("hold_imu_filter", 0.01)
         # Beyond this the reading is disbelieved rather than driven on.
         self.declare_parameter("hold_limit_m", 0.20)
         self.declare_parameter("reaim_allowance_m", 0.06)
@@ -677,9 +721,17 @@ class GraspNode(Node):
         self.hold_deadband = float(self.get_parameter("hold_deadband_m").value)
         self.hold_yaw_deadband = float(
             self.get_parameter("hold_yaw_deadband_rad").value)
+        self.hold_imu_yaw_gain = float(
+            self.get_parameter("hold_imu_yaw_gain").value)
+        self.hold_imu_yaw_deadband = float(
+            self.get_parameter("hold_imu_yaw_deadband_rad_s").value)
+        self.hold_imu_filter = float(self.get_parameter("hold_imu_filter").value)
         self.hold_limit = float(self.get_parameter("hold_limit_m").value)
         self.hold_ref = None
         self.hold_last = None
+        # The base's own yaw rate, from the IMU, and when it last arrived.
+        self.imu_yaw_rate = None
+        self.imu_yaw_at = None
         self.shelf_yaw = None
         self.shelf_yaw_at = None
         self.reaim_allowance = float(
@@ -775,6 +827,12 @@ class GraspNode(Node):
         self.create_subscription(
             Float32, TOPIC_SHELF_YAW, self._on_shelf_yaw, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
+        # The IMU publishes best effort; a reliable subscriber receives nothing at all.
+        self.create_subscription(
+            Imu, "/base_imu", self._on_imu,
+            QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                       durability=QoSDurabilityPolicy.VOLATILE,
+                       history=QoSHistoryPolicy.KEEP_LAST, depth=10))
         self.pub_gripper = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
         self.pub_arm = self.create_publisher(JointTrajectory, ARM_TOPIC, 10)
         self.pub_arm_right = self.create_publisher(
@@ -1586,6 +1644,20 @@ class GraspNode(Node):
 
     # ------------------------------------------------------------------ states
 
+    def _on_imu(self, msg: Imu) -> None:
+        """Keep a heavily filtered yaw rate, for the base hold to damp against.
+
+        Heavily, and see hold_imu_filter for why: this base shakes six times harder than
+        it drifts, and the drift is the part worth cancelling.
+        """
+        rate = float(msg.angular_velocity.z)
+        if self.imu_yaw_rate is None:
+            self.imu_yaw_rate = rate
+        else:
+            alpha = self.hold_imu_filter
+            self.imu_yaw_rate = (1.0 - alpha) * self.imu_yaw_rate + alpha * rate
+        self.imu_yaw_at = self._now()
+
     def _on_shelf_yaw(self, msg: Float32) -> None:
         self.shelf_yaw = float(msg.data)
         self.shelf_yaw_at = self._now()
@@ -1669,12 +1741,29 @@ class GraspNode(Node):
                     else:
                         twist.linear.y = speed
 
+        # Angle from the camera, rate from the IMU: a P term and a D term on the same
+        # axis, summed and clipped once.
+        #
+        # They answer different questions and the base needs both. The shelf yaw says
+        # where the base is pointing, which is what has to be right for the arm to go
+        # into the opening square. The IMU says whether it is still turning, which is
+        # what makes the angle wrong again a second later. Correcting the angle alone
+        # leaves the rate untouched, and this base has no friction to shed a rate: it
+        # turned 19.4 degrees during one grasp with the angle term commanding nothing at
+        # all, because the only thing publishing shelf yaw at the time was publishing
+        # a constant zero.
+        angular = 0.0
         if (self.shelf_yaw is not None and self.shelf_yaw_at is not None
                 and (self._now() - self.shelf_yaw_at) <= self.book_fresh
                 and abs(self.shelf_yaw) > self.hold_yaw_deadband):
+            angular -= self.hold_yaw_gain * self.shelf_yaw
+        if (self.imu_yaw_rate is not None and self.imu_yaw_at is not None
+                and (self._now() - self.imu_yaw_at) <= self.book_fresh
+                and abs(self.imu_yaw_rate) > self.hold_imu_yaw_deadband):
+            angular -= self.hold_imu_yaw_gain * self.imu_yaw_rate
+        if angular:
             twist.angular.z = float(np.clip(
-                -self.hold_yaw_gain * self.shelf_yaw,
-                -self.hold_max_yaw, self.hold_max_yaw))
+                angular, -self.hold_max_yaw, self.hold_max_yaw))
 
         if twist.linear.x or twist.linear.y or twist.angular.z:
             self.hold_last = twist

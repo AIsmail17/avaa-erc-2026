@@ -30,7 +30,10 @@ from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401
 
 WORLD = "erc_world"
-ROW_HEIGHTS = [1.391, 1.061, 0.731, 0.401]
+# The robot pose Gazebo reports is base_footprint, on the floor; the target below is
+# in base_link. base_footprint_joint in tiago_pro.urdf.
+BASE_LINK_Z = 0.0762
+ROW_HEIGHTS = [1.5008, 1.1708, 0.8408, 0.5108]
 TIP_L = "gripper_left_fingertip_left_link"
 TIP_R = "gripper_left_fingertip_right_link"
 GRASP = "gripper_left_grasping_link"
@@ -98,12 +101,21 @@ ROW = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 # to the base here instead.
 #
 # 0.80 m out is where the arm works: measured, it holds all four rows to 6 mm at that
-# distance. The height is the one the controller itself aims at for the row -- it reported
-# "row 1 at z=1.346" while DEFAULT_ROW_HEIGHTS[1] is 1.061, so there is an offset applied
-# somewhere and the book has to be where the controller will actually go, not where the
-# table says.
+# distance.
+#
+# The height is the one the controller itself aims at, which is the row height less
+# grasp_below_centre_m -- so the pads arrive at the middle of the book and the bench
+# measures the arm rather than the deliberate 45 mm offset.
+#
+# This used to be a hardcoded {0: 1.676, 1: 1.346, ...} copied from a line the
+# controller printed, with two faults. It had no entry for row 4, which silently fell
+# back to row 1 and put the book a metre from where the arm was going. And a base_link
+# height was being added to the robot's FLOOR pose below, so the book sat a base_link
+# height low -- 76 mm, and the whole point of the bench is that it is exact.
 PLACE_X = 0.80
-PLACE_Z = {0: 1.676, 1: 1.346, 2: 1.016, 3: 0.686}
+BELOW_CENTRE = 0.045          # grasp_node's grasp_below_centre_m
+PLACE_Z = {row: height - BELOW_CENTRE
+           for row, height in enumerate(ROW_HEIGHTS, start=1)}
 
 
 def gz(*args, timeout=20):
@@ -215,10 +227,10 @@ def main():
     row = ROW
 
     # Put the book where this bench always puts it, then re-read the truth.
-    target = (PLACE_X, 0.0, PLACE_Z.get(ROW, 1.346))
+    target = (PLACE_X, 0.0, PLACE_Z.get(ROW, PLACE_Z[1]))
     wx = robot["px"] + target[0] * math.cos(yaw) - target[1] * math.sin(yaw)
     wy = robot["py"] + target[0] * math.sin(yaw) + target[1] * math.cos(yaw)
-    wz = robot["pz"] + target[2]
+    wz = robot["pz"] + BASE_LINK_Z + target[2]
     print("placing %s at base_link (%.3f, %.3f, %.3f)" % (book_name, *target))
 
     # Move the POST under it, and let the book rest on the post.

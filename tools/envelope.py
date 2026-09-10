@@ -25,7 +25,7 @@ from avaa_solution.kinematics.arm_chain import ArmChain  # noqa: E402
 from avaa_solution.moveit_client import MoveItClient  # noqa: E402
 
 CHAIN = ["torso_lift_joint"] + ["arm_left_%d_joint" % i for i in range(1, 8)]
-ROWS = [1.391, 1.061, 0.731, 0.401]
+ROWS = [1.5008, 1.1708, 0.8408, 0.5108]
 SHOULDER_BASE_Z = 0.677
 BOARD_DROP = 0.145
 SHELF_DEPTH = 0.30
