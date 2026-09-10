@@ -69,6 +69,7 @@ TOPIC_BIN_POINT = "/avaa/perception/bin_point"
 TOPIC_CMD = "/cmd_vel"
 TOPIC_STATE = "/avaa/deliver/state"
 TOPIC_SCAN = "/scan_front_raw"
+TOPIC_SCAN_REAR = "/scan_rear_raw"
 TOPIC_HEAD = "/head_controller/joint_trajectory"
 GRIPPER_TOPIC = "/gripper_left_controller_raw/joint_trajectory"
 ARM_TOPIC = "/arm_left_controller/joint_trajectory"
@@ -118,6 +119,15 @@ RELEASE_MIN_PAST_FACE_M = 0.10
 # corner, rolled half a turn and turned 45 degrees to the right. See scan_points_in_base.
 FRONT_LASER_XY = (0.27512, -0.18297)
 FRONT_LASER_YAW = -math.pi / 4.0
+FRONT_LASER = (FRONT_LASER_XY[0], FRONT_LASER_XY[1], FRONT_LASER_YAW)
+
+# The rear laser, the same the other way round: base_rear_laser_joint puts it at the
+# rear-left corner, rolled half a turn and turned 135 degrees left. It sees the robot's
+# left side, where the front laser's view ends -- which is where the twenty-first full
+# run lost a leg of the bin's table, squaring up on it from 45 degrees.
+REAR_LASER_XY = (-0.27512, 0.18297)
+REAR_LASER_YAW = 3.0 * math.pi / 4.0
+REAR_LASER = (REAR_LASER_XY[0], REAR_LASER_XY[1], REAR_LASER_YAW)
 
 # Half the length and width of the base's collision box in the laser plane (the URDF's
 # 0.717 x 0.497 m). A return inside it is the robot seeing itself.
@@ -125,7 +135,7 @@ BASE_HALF_LENGTH = 0.3585
 BASE_HALF_WIDTH = 0.2485
 
 
-def scan_points_in_base(ranges, angle_min, angle_increment):
+def scan_points_in_base(ranges, angle_min, angle_increment, mount=FRONT_LASER):
     """Return the front laser's returns as (x, y) in base_link, leaving out the robot.
 
     The laser does not look ahead. base_front_laser_joint puts it at the base's front-
@@ -139,7 +149,7 @@ def scan_points_in_base(ranges, angle_min, angle_increment):
     read a steady 0.75 m ahead. Transforming every return, and leaving out only what
     falls inside the base's own collision box, keeps that leg.
     """
-    c, s = math.cos(FRONT_LASER_YAW), math.sin(FRONT_LASER_YAW)
+    c, s = math.cos(mount[2]), math.sin(mount[2])
     points = []
     for index, distance in enumerate(ranges):
         if not math.isfinite(distance) or distance <= 0.0:
@@ -147,8 +157,8 @@ def scan_points_in_base(ranges, angle_min, angle_increment):
         angle = angle_min + index * angle_increment
         # The roll turns the laser upside down, which mirrors its y.
         lx, ly = distance * math.cos(angle), -distance * math.sin(angle)
-        x = FRONT_LASER_XY[0] + c * lx - s * ly
-        y = FRONT_LASER_XY[1] + s * lx + c * ly
+        x = mount[0] + c * lx - s * ly
+        y = mount[1] + s * lx + c * ly
         if abs(x) <= BASE_HALF_LENGTH and abs(y) <= BASE_HALF_WIDTH:
             continue
         points.append((x, y))
@@ -338,6 +348,11 @@ class DeliverNode(Node):
         self.scan_ranges: List[float] = []
         self.scan_angle_min = 0.0
         self.scan_angle_inc = 0.0
+        self.rear_ranges = []
+        self.rear_angle_min = 0.0
+        self.rear_angle_inc = 0.0
+        # The legs the last look at the table found, for the squaring-up log.
+        self.table_legs = []
 
         # The same short median the grasp uses: enough to bury one bad frame, short
         # enough that the answer still means now on a base that never stops moving.
@@ -366,6 +381,7 @@ class DeliverNode(Node):
             String, "/avaa/mission/phase", self._on_phase, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
         self.create_subscription(LaserScan, TOPIC_SCAN, self._on_scan, SENSOR_QOS)
+        self.create_subscription(LaserScan, TOPIC_SCAN_REAR, self._on_scan_rear, SENSOR_QOS)
 
         self.pub_cmd = self.create_publisher(Twist, TOPIC_CMD, 10)
         self.pub_head = self.create_publisher(JointTrajectory, TOPIC_HEAD, 10)
@@ -417,6 +433,11 @@ class DeliverNode(Node):
         self.scan_ranges = list(msg.ranges)
         self.scan_angle_min = msg.angle_min
         self.scan_angle_inc = msg.angle_increment
+
+    def _on_scan_rear(self, msg: LaserScan) -> None:
+        self.rear_ranges = list(msg.ranges)
+        self.rear_angle_min = msg.angle_min
+        self.rear_angle_inc = msg.angle_increment
 
     # ------------------------------------------------------------------ helpers
 
@@ -891,13 +912,24 @@ class DeliverNode(Node):
         self._plan_above(target)
 
     def _table_bin(self, near=None):
-        """Give (bin centre, inward normal) from the legs of the bin's table, or None."""
-        if not self.scan_ranges:
-            return None
-        points = scan_points_in_base(
-            self.scan_ranges, self.scan_angle_min, self.scan_angle_inc)
+        """Give (bin centre, inward normal) from the legs of the bin's table, or None.
+
+        Legs from both lasers: each scan is clustered on its own, since clustering
+        follows scan order, and a rear-laser leg within 0.10 m of a front-laser one is the
+        same leg.
+        """
+        legs = []
+        if self.scan_ranges:
+            legs = leg_candidates(scan_points_in_base(
+                self.scan_ranges, self.scan_angle_min, self.scan_angle_inc, FRONT_LASER))
+        if self.rear_ranges:
+            for leg in leg_candidates(scan_points_in_base(
+                    self.rear_ranges, self.rear_angle_min, self.rear_angle_inc, REAR_LASER)):
+                if all(math.hypot(leg[0] - o[0], leg[1] - o[1]) > 0.10 for o in legs):
+                    legs.append(leg)
+        self.table_legs = legs
         near_xy = None if near is None else (float(near[0]), float(near[1]))
-        return bin_from_legs(leg_candidates(points), near=near_xy)
+        return bin_from_legs(legs, near=near_xy)
 
     def _do_table(self) -> None:
         """Square up in front of the bin on the legs of its table, then place the book.
@@ -908,7 +940,18 @@ class DeliverNode(Node):
         the normal, and places the book at the centre: straight ahead, square to the table,
         with the legs out beside the base. Anything in the base's path still stops it.
         """
-        found = self._table_bin(near=self.table_centre)
+        # Which legs are the bin's is asked of perception whenever it can see the bin, and
+        # of the last answer only when it cannot. Asking only the last answer let one bad
+        # pairing stand: the twenty-first full run's estimate moved 0.33 m sideways in two
+        # seconds and nothing then could say whether the first or the second was right.
+        sighting = self._bin_now()
+        found = self._table_bin(near=sighting if sighting is not None else self.table_centre)
+        self.get_logger().info(
+            "table legs seen: %d at %s; the bin by its colour %s"
+            % (len(self.table_legs), [[round(x, 2), round(y, 2)] for x, y in self.table_legs],
+               "not in view" if sighting is None
+               else np.round(np.asarray(sighting, dtype=float)[:2], 2).tolist()),
+            throttle_duration_sec=2.0)
         if found is None:
             self._stop()
             if (self.table_seen_at is None

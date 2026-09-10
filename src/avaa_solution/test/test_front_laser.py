@@ -5,8 +5,8 @@ import math
 import pytest
 
 from avaa_solution.deliver_node import (BASE_HALF_LENGTH, BASE_HALF_WIDTH, FRONT_LASER_XY,
-                                        base_gap, blocked_by, front_clearance,
-                                        scan_points_in_base)
+                                        REAR_LASER, REAR_LASER_XY, base_gap, blocked_by,
+                                        front_clearance, scan_points_in_base)
 
 START = math.radians(-134.0)
 STEP = math.radians(1.0)
@@ -75,3 +75,15 @@ def test_something_in_the_path_stops_it_anywhere():
 
 def test_nothing_in_view_does_not_stop_it():
     assert not blocked_by(None, None, 0.80, 0.10, 0.08)
+
+
+def test_rear_scan_angle_minus_45_is_straight_back():
+    [(x, y)] = scan_points_in_base(scan_with({-45: 1.0}), START, STEP, REAR_LASER)
+    assert x == pytest.approx(REAR_LASER_XY[0] - 1.0, abs=1e-3)
+    assert y == pytest.approx(REAR_LASER_XY[1], abs=1e-3)
+
+
+def test_rear_scan_angle_plus_45_is_to_the_left():
+    [(x, y)] = scan_points_in_base(scan_with({45: 1.0}), START, STEP, REAR_LASER)
+    assert x == pytest.approx(REAR_LASER_XY[0], abs=1e-3)
+    assert y == pytest.approx(REAR_LASER_XY[1] + 1.0, abs=1e-3)
