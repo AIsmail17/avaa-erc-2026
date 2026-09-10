@@ -93,6 +93,27 @@ def gz(*args, timeout=15):
         return ""
 
 
+def quat_mul(a, b):
+    """Multiply two (x, y, z, w) quaternions: a after b."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz)
+
+
+def quat_conj(q):
+    """Invert a unit (x, y, z, w) quaternion."""
+    return (-q[0], -q[1], -q[2], q[3])
+
+
+def quat_rotate(q, v):
+    """Rotate the vector v by the unit quaternion q."""
+    x, y, z, _ = quat_mul(quat_mul(q, (v[0], v[1], v[2], 0.0)), quat_conj(q))
+    return (x, y, z)
+
+
 class GraspFix(Node):
     def __init__(self):
         super().__init__("sim_grasp_fix")
@@ -106,6 +127,8 @@ class GraspFix(Node):
         self.held = None
         self.offset = None          # book position in the gripper's frame, at pick-up
         self.book_yaw_offset = 0.0
+        self.book_quats = {}
+        self.rel_quat = None        # the book's orientation in the gripper's frame, at pick-up
         self.books = {}
         self.robot_pose = None
         self.attach_asked = False
@@ -193,6 +216,10 @@ class GraspFix(Node):
                  if k.startswith("book_") and {"px", "py", "pz"} <= set(v)}
         if books:
             self.books = books
+        quats = {k: (v["qx"], v["qy"], v["qz"], v["qw"]) for k, v in poses.items()
+                 if k.startswith("book_") and {"qx", "qy", "qz", "qw"} <= set(v)}
+        if quats:
+            self.book_quats = quats
         robot = poses.get("tiago_pro")
         if robot and {"px", "py", "pz", "qx", "qy", "qz", "qw"} <= set(robot):
             yaw = math.atan2(
@@ -219,6 +246,26 @@ class GraspFix(Node):
         return (bx + t.x * math.cos(yaw) - t.y * math.sin(yaw),
                 by + t.x * math.sin(yaw) + t.y * math.cos(yaw),
                 bz + BASE_LINK_Z + t.z), yaw
+
+    def _grasp_link_world_pose(self):
+        """Where the grasping link is and how it is turned, in world coordinates.
+
+        The same composition as _grasp_link_world, with the link's orientation kept: the
+        base's heading from Gazebo, then the link's rotation from TF. (None, None) when
+        either is not known yet.
+        """
+        try:
+            tf = self.buf.lookup_transform("base_link", GRASP_LINK, rclpy.time.Time())
+        except Exception:  # noqa: BLE001
+            return None, None
+        if self.robot_pose is None:
+            return None, None
+        bx, by, bz, yaw = self.robot_pose
+        base = (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+        t, r = tf.transform.translation, tf.transform.rotation
+        shift = quat_rotate(base, (t.x, t.y, t.z))
+        position = (bx + shift[0], by + shift[1], bz + BASE_LINK_Z + shift[2])
+        return position, quat_mul(base, (r.x, r.y, r.z, r.w))
 
     # ------------------------------------------------------------------ the trigger
     def _on_gripper(self, msg: JointTrajectory):
@@ -308,39 +355,51 @@ class GraspFix(Node):
             self.attach_asked = False
             return
 
-        # Remember how it was picked up, so it is carried the same way rather than
-        # snapping to the middle of the jaws.
+        # Remember how it was picked up -- where the book sits and how it is turned, in
+        # the grasping link's own frame -- so it is carried exactly as it was taken.
+        #
+        # This kept only the book's offset against the base's heading, and set the book
+        # upright a quarter turn from the base whatever the gripper did, so the book never
+        # turned with the hand. Watched on the laptop on 2026-09-11 it sat across the
+        # fingers, flat side in the jaws; and two runs that day aborted Gazebo's physics
+        # 28 s into the stow after a grasp (ODE INTERNAL ERROR 1: assertion
+        # d[i] != dReal(0.0) failed), most likely from the book being teleported through
+        # the arm as it folded.
         book = self.books[best]
-        dx, dy = book[0] - here[0], book[1] - here[1]
-        self.offset = (dx * math.cos(-yaw) - dy * math.sin(-yaw),
-                       dx * math.sin(-yaw) + dy * math.cos(-yaw),
-                       book[2] - here[2])
+        link_position, link_quat = self._grasp_link_world_pose()
+        book_quat = self.book_quats.get(best)
+        if link_position is None or book_quat is None:
+            self.get_logger().warn(
+                "no full pose for %s or %s, so it is not picked up" % (GRASP_LINK, best))
+            self.attach_asked = False
+            return
+        inverse = quat_conj(link_quat)
+        self.offset = quat_rotate(inverse, (book[0] - link_position[0],
+                                            book[1] - link_position[1],
+                                            book[2] - link_position[2]))
+        self.rel_quat = quat_mul(inverse, book_quat)
         self.held = best
         self.get_logger().info(
             "picked up %s, %.0f mm from the grasping link" % (best, best_gap * 1000))
 
     def _follow(self):
-        """Keep the held book where the gripper is. Worker only."""
-        if self.held is None or self.offset is None:
+        """Keep the held book in the hand, placed and turned as it was picked up. Worker only."""
+        if self.held is None or self.offset is None or self.rel_quat is None:
             return
-        here, yaw = self._grasp_link_world()
-        if here is None:
+        link_position, link_quat = self._grasp_link_world_pose()
+        if link_position is None:
             return
-        ox, oy, oz = self.offset
-        x = here[0] + ox * math.cos(yaw) - oy * math.sin(yaw)
-        y = here[1] + ox * math.sin(yaw) + oy * math.cos(yaw)
-        z = here[2] + oz
-        # The book was spawned rotated a quarter turn; keep it that way and let it yaw
-        # with the base, so it looks carried rather than dragged sideways.
-        half = 0.5 * (yaw + math.pi / 2.0)
+        shift = quat_rotate(link_quat, self.offset)
+        x = link_position[0] + shift[0]
+        y = link_position[1] + shift[1]
+        z = link_position[2] + shift[2]
+        q = quat_mul(link_quat, self.rel_quat)
         gz("service", "-s", "/world/%s/set_pose" % self.world,
            "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
            "--timeout", "800",
            "--req", 'name: "%s", position: {x: %f, y: %f, z: %f}, '
                     'orientation: {x: %f, y: %f, z: %f, w: %f}'
-                    % (self.held, x, y, z,
-                       math.sin(half) * 0.0, math.sin(half) * 0.0,
-                       math.sin(half), math.cos(half)),
+                    % (self.held, x, y, z, q[0], q[1], q[2], q[3]),
            timeout=3)
 
     def _report(self):
