@@ -386,7 +386,19 @@ class ApproachNode(Node):
         # out of reach -- it holds the base already and knows the shortfall to the
         # millimetre. That is worth doing and is not done here.
         self.declare_parameter("standoff_m", 0.65)
-        self.declare_parameter("centre_tolerance_px", 12.0)
+        # How far off the middle of the image the column may sit and still count as
+        # centred.
+        #
+        # 12 px -- two degrees -- was finer than this base can turn to. So close in,
+        # turn_for asks for 0.03 to 0.14 rad/s, and that barely moves the error: the
+        # seventeenth full run closed on its column from -303 px to -24 in 38 s, then sat
+        # between -16 and -30 for 115 s with its row already read, until centring timed
+        # out. The sixteenth hovered on the same boundary, -15 to +14 px. Squaring hunted
+        # along its tolerance in just this way, which is why square_tolerance_rad is five
+        # degrees. 30 px is five degrees here too, and nothing after this needs the
+        # column nearer the middle: APPROACH strafes the lateral error out as it drives
+        # (_lateral_error), from the book once it has a fix on it.
+        self.declare_parameter("centre_tolerance_px", 30.0)
         self.declare_parameter("standoff_tolerance_m", 0.05)
         # 0.05 rad is 2.9 degrees, and the shelf angle reads to about that, so the
         # squaring hunted along its own tolerance boundary and never declared itself
