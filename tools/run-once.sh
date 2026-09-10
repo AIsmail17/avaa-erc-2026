@@ -140,8 +140,11 @@ while kill -0 "$CLIENT" 2>/dev/null; do
     # five were found alive twenty minutes after the launch was killed, and the client
     # this script waits on never returned. Ten seconds for a clean exit, then no choice.
     sleep 10
+    # move_group too: it is started by the same launch but runs as its own binary, which the
+    # patterns above miss. After the thirteenth run one was still up 565 s later, and starting
+    # a fresh one for a measurement put two on the same planning scene.
     stragglers=$(docker exec erc_sim ps -eo pid=,args= \
-      | grep -E "avaa_solution/lib/avaa_solution/|ros2 launch avaa_solution" \
+      | grep -E "avaa_solution/lib/avaa_solution/|ros2 launch avaa_solution|moveit_ros_move_group/move_group" \
       | grep -v " ps -eo" | awk '{print $1}' | tr '\n' ' ')
     if [ -n "${stragglers// /}" ]; then
       echo "=== nodes still up after the launch stopped; killing: $stragglers"
