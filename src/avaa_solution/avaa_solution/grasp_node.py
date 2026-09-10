@@ -243,6 +243,10 @@ SHELF_YAW_TRUST_RAD = 0.14
 # it" -- 30 to 33 mm across the runs of 2026-09-10.
 PADS_BEHIND_GRASP_M = 0.030
 
+# Wrist orientation tolerances once the fingers are going in, in radians: four degrees,
+# then seven. A book 30 x 160 mm turned seven degrees is 49 mm across the jaws' 65.
+WRIST_GOING_IN = (0.07, 0.12)
+
 # Height of the left shoulder above base_link when the torso is fully down, measured from
 # the chain: arm_left_1 sits at z = 0.677 + torso.
 SHOULDER_BASE_Z = 0.677
@@ -911,6 +915,7 @@ class GraspNode(Node):
             self.get_parameter("servo_stuck_limit").value)
         self.servo_good = 0
         self.servo_best = None
+        self.servo_target_frozen = False
         # Consecutive ticks with the pads around the book, counted like servo_good.
         self.pads_good = 0
         self.servo_rejected = 0
@@ -2655,6 +2660,7 @@ class GraspNode(Node):
         self.servo_since = self._now()
         self.servo_good = 0
         self.servo_best = None
+        self.servo_target_frozen = False
         # Consecutive ticks with the pads around the book, counted like servo_good.
         self.pads_good = 0
         self.servo_rejected = 0
@@ -2675,7 +2681,26 @@ class GraspNode(Node):
         put the loop back at the speed that failed.
         """
         self._hold_gripper(GRIPPER_OPEN)
-        self._refresh_targets()
+        # Stop taking fresh sightings once the fingers are going in.
+        #
+        # From there the gripper covers the book, and a fix of it only gets worse. Measured
+        # 2026-09-10, the tenth full run, with the book's box logged at every close fix:
+        # 31 x 72 px and steady through the reach, then from 352.1 s -- the servo advancing
+        # in depth -- its height fell 72, 68, 61, 57, 50, 47, 41 px while its width held,
+        # the depth read 44 mm long and the height 40 mm high, and the servo re-aimed 9 and
+        # 18 mm on those. Squaring up happens with the fingers clear, on fixes that are still
+        # good; after that the target is held where those put it.
+        here_before = self._gripper_now()
+        going_in = (self.face_x is not None and here_before is not None
+                    and float(here_before[0])
+                    >= float(self.face_x) - self.entry_finger_margin)
+        if not going_in:
+            self._refresh_targets()
+        elif not self.servo_target_frozen:
+            self.servo_target_frozen = True
+            self.get_logger().info(
+                "fingers going in; holding the target at %s rather than re-aiming on a book "
+                "the gripper is now covering" % np.round(self.grasp_target, 3).tolist())
         target = np.asarray(self.grasp_target, dtype=float)
 
         here = self._gripper_now()
@@ -2829,7 +2854,20 @@ class GraspNode(Node):
         # arrive from the far side of the book, which was measured putting the approach
         # axis 78 degrees off.
         solution = None
-        for tolerance in (0.26, 0.40, 0.55):
+        # Hold the wrist square once the fingers are going in.
+        #
+        # The servo used to accept up to 15 degrees of wrist error on its first try and
+        # relax to 23 and then 31 if it had to. The jaws open to 65 mm; a book 30 mm
+        # across and 160 mm deep, turned 15 degrees to them, is 70 mm wide across them,
+        # and at 23 degrees it is 90. So a fingertip meets a corner and pushes. Measured
+        # 2026-09-10: on the seventh, ninth and tenth full runs the book ended 57 to 62 mm
+        # deeper in the shelf and about 100 mm beside jaws the grasp reported centred on
+        # it, and on the tenth the logged box shows it starting to move as the jaws went
+        # in. Squaring up may still bend the wrist; going in may bend it four degrees.
+        going_in = (self.face_x is not None
+                    and float(here[0]) >= float(self.face_x) - self.entry_finger_margin)
+        tolerances = WRIST_GOING_IN if going_in else (0.26, 0.40, 0.55)
+        for tolerance in tolerances:
             for scale in (1.0, 0.5, 0.25):
                 step = min(self.servo_step * scale, distance)
                 goal = here + error * (step / distance)
@@ -2844,10 +2882,16 @@ class GraspNode(Node):
                     solution = candidate
                     break
             if solution is not None:
-                if tolerance > 0.26:
+                if going_in:
+                    axis = self.chain.fk(solution)[:3, 1]
+                    self.get_logger().info(
+                        "going in with the jaws %.1f degrees off square to the shelf"
+                        % abs(math.degrees(math.atan2(float(axis[0]), abs(float(axis[1]))))),
+                        throttle_duration_sec=1.0)
+                if tolerance > tolerances[0]:
                     self.get_logger().info(
                         "the wrist had to give %.0f degrees to close the last %.0f mm"
-                        % (math.degrees(tolerance - 0.26), distance * 1000),
+                        % (math.degrees(tolerance - tolerances[0]), distance * 1000),
                         throttle_duration_sec=5.0)
                 lift = solution[0] - joints[0]
                 if abs(lift) > 0.002:
