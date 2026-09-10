@@ -229,6 +229,14 @@ GRASP_CLOSING = [0.0, 1.0, 0.0]
 # the row height. The 0.02 is half the board thickness.
 BOARD_DROP = 0.125 + 0.02
 
+# The largest shelf yaw the base hold will believe once the base has been squared.
+#
+# _do_idle turns the base square to within a degree and a half before anything is
+# planned, and the IMU damper holds the heading from there. A depth-plane yaw bigger
+# than this after that point is not the base having turned, it is the plane fit having
+# found something that is not the shelf. See _hold_command.
+SHELF_YAW_TRUST_RAD = 0.14
+
 # Height of the left shoulder above base_link when the torso is fully down, measured from
 # the chain: arm_left_1 sits at z = 0.677 + torso.
 SHOULDER_BASE_Z = 0.677
@@ -2022,9 +2030,28 @@ class GraspNode(Node):
         # all, because the only thing publishing shelf yaw at the time was publishing
         # a constant zero.
         angular = 0.0
+        # The shelf yaw steers the base only while the arm is still folded, and only
+        # when it is small enough to be true.
+        #
+        # The depth-plane fit takes the largest flat vertical surface in front of the
+        # camera to be the shelf. Once the arm rises in front of the head it can be the
+        # arm. Measured 2026-09-10, the fourth full run: from 237.9 s, reaching to the
+        # pre-grasp on the top row with the book 15 mm from where it was latched, this
+        # term pinned the turn command at the +0.150 rad/s clip and held it there for
+        # fifty seconds. The arm turns with the base, so the false yaw never went away,
+        # and when the jaws closed the base was facing 135 degrees from the shelf -- the
+        # grasp aid measured them 1487 mm from the nearest book. Only this term can reach
+        # the clip: the IMU damper is capped at 0.05 and always opposes the motion.
+        #
+        # So: IDLE and SCENE only, before the arm leaves its tuck, and never beyond
+        # SHELF_YAW_TRUST_RAD. The IMU damper keeps the heading for the rest.
+        shelf_yaw_trusted = (
+            self.state in (State.IDLE, State.SCENE)
+            and self.shelf_yaw is not None
+            and abs(self.shelf_yaw) <= SHELF_YAW_TRUST_RAD)
         if (self.shelf_yaw is not None and self.shelf_yaw_at is not None
                 and (self._now() - self.shelf_yaw_at) <= self.book_fresh
-                and abs(self.shelf_yaw) > self.hold_yaw_deadband):
+                and abs(self.shelf_yaw) > self.hold_yaw_deadband and shelf_yaw_trusted):
             angular -= self.hold_yaw_gain * self.shelf_yaw
         if (self.imu_yaw_rate is not None and self.imu_yaw_at is not None
                 and self.imu_samples >= self.hold_imu_warmup
@@ -2065,12 +2092,12 @@ class GraspNode(Node):
         # the wheels for a zero they have no friction to enforce.
         if not fresh and self.hold_last is not None:
             if linear_off:
-                # Replaying the last command would replay its LINEAR part too: a
-                # correction worked out before the servo started, for a base and a
-                # book that have both moved since. Keep only the turn.
-                replay = Twist()
-                replay.angular.z = self.hold_last.angular.z
-                return replay
+                # Replay nothing. The linear part was worked out before the reach, for a
+                # base and a book that have both moved since; and replaying a TURN keeps
+                # a base turning with nobody watching -- the fourth run replayed a
+                # +0.150 rad/s command for as long as the book was out of sight. The
+                # IMU damper in twist is recomputed every tick and needs no book.
+                return twist
             return self.hold_last
         return twist
 

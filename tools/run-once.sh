@@ -111,7 +111,12 @@ CLIENT=$!
     echo "=== $LAUNCH_TIMEOUT s elapsed; stopping the launch" >> /tmp/run_raw.log
     docker exec erc_sim bash -c 'pkill -f "ros2 launch avaa_solution solution.launch.py"' \
       >/dev/null 2>&1
-  fi ) &
+  # Its output goes nowhere, and it is killed with its children below. Otherwise its
+  # sleep outlives it: killing the subshell leaves sleep holding this script's stdout,
+  # and whatever pipes that stdout -- run-once.sh | tail, which is how it is always
+  # run -- waits the full LAUNCH_TIMEOUT for a pipe nobody is writing to. Found
+  # 2026-09-10 as a finished run still 'running' after its log had been kept.
+  fi ) >/dev/null 2>&1 &
 GUARD=$!
 # Stop when the MISSION stops, not when the clock runs out.
 #
@@ -147,6 +152,7 @@ while kill -0 "$CLIENT" 2>/dev/null; do
   sleep 15
 done
 wait "$CLIENT" 2>/dev/null || true
+pkill -P "$GUARD" 2>/dev/null || true
 kill "$GUARD" 2>/dev/null || true
 # Whatever ended the launch, leave nothing of it behind for the next run to trip over.
 docker exec erc_sim bash -c 'pkill -f "ros2 launch avaa_solution solution.launch.py"' \

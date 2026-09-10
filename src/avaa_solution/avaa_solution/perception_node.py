@@ -142,7 +142,13 @@ ROW_HEIGHT_TOLERANCE = 0.165
 
 # How many whole-shelf readings have to agree on the marker order before it is reported,
 # and what share of all such readings the winner must hold. See _publish_shelf_column.
-SHELF_ORDER_VOTES = 3
+#
+# One, as a provisional answer that a later majority can overturn. Three was measured to
+# be too many: on the fourth full run (2026-09-10) the whole shelf was in one clean frame so
+# rarely that the vote never concluded and no column was reported at all -- which scores
+# the same as a wrong one, every time. The misread that made three look necessary came
+# from a plate sliced by the image border, and frames like that no longer vote.
+SHELF_ORDER_VOTES = 1
 SHELF_ORDER_MAJORITY = 0.7
 
 
@@ -1380,9 +1386,11 @@ class PerceptionNode(Node):
         if self.shelf_column is None:
             self.get_logger().info(
                 "the whole shelf has been read %d times, %d of them as %s, so marker %d "
-                "is shelf column %d"
+                "is shelf column %d%s"
                 % (sum(self.shelf_orders.values()), self.shelf_orders[winner],
-                   list(winner), self.target_digit, position))
+                   list(winner), self.target_digit, position,
+                   " (provisional until it is read again)"
+                   if self.shelf_orders[winner] < 3 else ""))
         else:
             self.get_logger().warn(
                 "the shelf order has changed its mind: %s now holds %d of %d readings, "

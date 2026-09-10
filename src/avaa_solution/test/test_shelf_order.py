@@ -18,8 +18,17 @@ def test_nothing_read_decides_nothing():
     assert shelf_order_winner(Counter()) is None
 
 
-def test_the_frame_that_caused_it_is_not_enough_on_its_own():
-    assert shelf_order_winner(Counter({MISREAD: 1})) is None
+def test_a_single_clean_reading_answers_provisionally():
+    # The fourth full run saw the whole shelf so rarely that three agreeing readings never
+    # came, and no column was reported at all. One reading now gives an answer.
+    assert shelf_order_winner(Counter({TRUE: 1})) == TRUE
+
+
+def test_a_single_misread_is_overturned_once_the_truth_is_read():
+    tally = Counter({MISREAD: 1})
+    assert shelf_order_winner(tally) == MISREAD
+    tally[TRUE] += 3
+    assert shelf_order_winner(tally) == TRUE
 
 
 def test_three_agreeing_readings_decide_it():
