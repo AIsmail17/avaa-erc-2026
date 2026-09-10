@@ -63,6 +63,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from avaa_solution.kinematics.arm_chain import ArmChain
 from avaa_solution.moveit_client import MoveItClient, error_name
+from avaa_solution.table_frame import bin_from_legs, leg_candidates, standoff_goal
 
 TOPIC_BIN_POINT = "/avaa/perception/bin_point"
 TOPIC_CMD = "/cmd_vel"
@@ -205,6 +206,7 @@ class State(Enum):
     CARRY = "carry"
     SEEK = "seeking"
     DRIVE = "driving"
+    TABLE = "squaring"
     ABOVE = "above"
     LOWER = "lowering"
     RELEASE = "releasing"
@@ -255,6 +257,14 @@ class DeliverNode(Node):
         # beside the base's front half. Both measured from the base's collision box.
         self.declare_parameter("obstacle_stop_m", 0.10)
         self.declare_parameter("corner_stop_m", 0.08)
+        # Squaring up on the table's legs (see _do_table and table_frame): start once
+        # the bin is this near by its colour, stand this far short of its centre, arrive
+        # within these tolerances, and go back to the colour if the legs are gone this long.
+        self.declare_parameter("table_range_m", 2.5)
+        self.declare_parameter("table_standoff_m", 0.82)
+        self.declare_parameter("table_goal_tolerance_m", 0.06)
+        self.declare_parameter("table_heading_tolerance_rad", 0.09)
+        self.declare_parameter("table_lost_sec", 4.0)
         self.declare_parameter("auto_start", True)
         # Empty means start as soon as the joints are known, which is how
         # the delivery is exercised on its own. The mission sets it to
@@ -283,6 +293,11 @@ class DeliverNode(Node):
         self.hold_deadband = float(self.get_parameter("hold_deadband_m").value)
         self.hold_limit = float(self.get_parameter("hold_limit_m").value)
         self.hold_ref = None
+        # The bin as the table's legs place it, while squaring up. See _do_table.
+        self.table_centre = None
+        self.table_seen_at = None
+        self.table_rim = None
+        self.table_arrived = False
         self.hold_last = None
         self.standoff = float(self.get_parameter("standoff_m").value)
         self.standoff_tol = float(self.get_parameter("standoff_tol_m").value)
@@ -304,6 +319,12 @@ class DeliverNode(Node):
         self.drive_timeout = float(self.get_parameter("drive_timeout_sec").value)
         self.obstacle_stop = float(self.get_parameter("obstacle_stop_m").value)
         self.corner_stop = float(self.get_parameter("corner_stop_m").value)
+        self.table_range = float(self.get_parameter("table_range_m").value)
+        self.table_standoff = float(self.get_parameter("table_standoff_m").value)
+        self.table_goal_tol = float(self.get_parameter("table_goal_tolerance_m").value)
+        self.table_heading_tol = float(
+            self.get_parameter("table_heading_tolerance_rad").value)
+        self.table_lost = float(self.get_parameter("table_lost_sec").value)
         self.search_tilt = float(self.get_parameter("search_tilt_rad").value)
         self.hold_base_hz = float(self.get_parameter("hold_base_hz").value)
         self.start_phase = str(self.get_parameter("start_phase").value)
@@ -582,7 +603,7 @@ class DeliverNode(Node):
         Only in the states where this node is not itself driving -- SEEK and DRIVE
         publish their own commands and must not be argued with.
         """
-        if self.state in (State.SEEK, State.DRIVE, State.IDLE):
+        if self.state in (State.SEEK, State.DRIVE, State.TABLE, State.IDLE):
             return
         self.pub_cmd.publish(self._hold_command())
 
@@ -629,6 +650,7 @@ class DeliverNode(Node):
             State.CARRY: self._do_carry,
             State.SEEK: self._do_seek,
             State.DRIVE: self._do_drive,
+            State.TABLE: self._do_table,
             State.ABOVE: self._do_above,
             State.LOWER: self._do_lower,
             State.RELEASE: self._do_release,
@@ -746,6 +768,26 @@ class DeliverNode(Node):
             self._enter(State.FAILED)
             return
 
+        # Near enough to see the table's legs: square up on them instead. Perception's
+        # sighting is only asked which legs are the bin's -- from an angle it measures the
+        # corner of the bin nearest the camera, and the twentieth full run put the book
+        # down on that corner's rim. See table_frame.
+        if float(target[0]) < self.table_range:
+            found = self._table_bin(near=target)
+            if found is not None:
+                self.get_logger().info(
+                    "the bin's table is in view: the bin's centre is at %s by the legs, "
+                    "%s by its colour; squaring up on the legs"
+                    % (np.round(found[0], 3).tolist(),
+                       np.round(np.asarray(target, dtype=float)[:2], 3).tolist()))
+                self.table_centre = found[0]
+                self.table_seen_at = self._now()
+                self.table_rim = float(target[2])
+                self.table_arrived = False
+                self._stop()
+                self._enter(State.TABLE)
+                return
+
         bearing = math.atan2(float(target[1]), max(float(target[0]), 0.05))
         range_error = float(target[0]) - self.standoff
         # What the drive is working from, every two seconds. It logged nothing between
@@ -848,7 +890,95 @@ class DeliverNode(Node):
         self._enter(State.ABOVE)
         self._plan_above(target)
 
-    def _plan_above(self, target) -> None:
+    def _table_bin(self, near=None):
+        """Give (bin centre, inward normal) from the legs of the bin's table, or None."""
+        if not self.scan_ranges:
+            return None
+        points = scan_points_in_base(
+            self.scan_ranges, self.scan_angle_min, self.scan_angle_inc)
+        near_xy = None if near is None else (float(near[0]), float(near[1]))
+        return bin_from_legs(leg_candidates(points), near=near_xy)
+
+    def _do_table(self) -> None:
+        """Square up in front of the bin on the legs of its table, then place the book.
+
+        Every tick the legs are measured again and the bin's centre worked out from them
+        (table_frame), so nothing here relies on odom. The robot drives to the point
+        table_standoff_m short of that centre along the table's normal, turns to face along
+        the normal, and places the book at the centre: straight ahead, square to the table,
+        with the legs out beside the base. Anything in the base's path still stops it.
+        """
+        found = self._table_bin(near=self.table_centre)
+        if found is None:
+            self._stop()
+            if (self.table_seen_at is None
+                    or self._now() - self.table_seen_at > self.table_lost):
+                self.get_logger().warn(
+                    "lost the table's legs for %.0f s; driving on the bin's colour again"
+                    % self.table_lost)
+                self._enter(State.DRIVE)
+            return
+        centre, normal = found
+        self.table_centre = centre
+        self.table_seen_at = self._now()
+        self._aim_head(self._tilt_for(np.array([centre[0], centre[1], self.table_rim])))
+        if self._elapsed() > self.drive_timeout:
+            self.get_logger().error(
+                "could not square up on the table in %.0f s (the bin's centre %.2f m ahead, "
+                "%+.0f mm to the side)" % (self.drive_timeout, centre[0], centre[1] * 1000))
+            self._enter(State.FAILED)
+            return
+
+        goal, heading = standoff_goal(centre, normal, self.table_standoff)
+        distance = math.hypot(goal[0], goal[1])
+        toward = math.atan2(goal[1], goal[0])
+        ahead, nearest = self._front_clearance()
+        self.get_logger().info(
+            "squaring up: the bin's centre at (%.2f, %+.2f) by the legs; the standoff point "
+            "%.2f m away at %+.0f deg; facing %+.1f deg off the table's normal; room ahead "
+            "of the bumper %s, nearest thing beside the base %s"
+            % (centre[0], centre[1], distance, math.degrees(toward), math.degrees(heading),
+               "%.2f m" % ahead if ahead is not None else "clear",
+               "%.2f m" % nearest if nearest is not None else "clear"),
+            throttle_duration_sec=2.0)
+
+        # Arrived is sticky, with some slack, because this base coasts: once at the point,
+        # the turn to square up is not undone by the point drifting a few centimetres.
+        if distance <= self.table_goal_tol:
+            self.table_arrived = True
+        elif distance > 2.0 * self.table_goal_tol:
+            self.table_arrived = False
+        command = Twist()
+        if not self.table_arrived:
+            if abs(toward) <= self.turn_in_place_rad:
+                if ahead is not None and ahead < self.obstacle_stop:
+                    self._stop()
+                    self.get_logger().error(
+                        "something is %.2f m ahead of the bumper while squaring up on the "
+                        "table" % ahead)
+                    self._enter(State.FAILED)
+                    return
+                speed = float(np.clip(0.6 * distance, 0.05, self.drive_speed))
+                command.linear.x = speed * max(0.0, math.cos(toward))
+            command.angular.z = float(np.clip(self.drive_turn_gain * toward,
+                                              -self.drive_turn_speed,
+                                              self.drive_turn_speed))
+        elif abs(heading) > self.table_heading_tol:
+            command.angular.z = float(np.clip(self.drive_turn_gain * heading,
+                                              -self.drive_turn_speed,
+                                              self.drive_turn_speed))
+        else:
+            self._stop()
+            self.get_logger().info(
+                "square in front of the bin: its centre %.2f m ahead and %+.0f mm to the "
+                "side, by the table's legs" % (centre[0], centre[1] * 1000))
+            self._enter(State.ABOVE)
+            self._plan_above(np.array([centre[0], centre[1], self.table_rim]), past_face=0.0)
+            return
+        self.pub_cmd.publish(command)
+        self.last_drive_cmd = (command.linear.x, command.angular.z)
+
+    def _plan_above(self, target, past_face: float = RELEASE_PAST_FACE_M) -> None:
         """Lift the book clear of the rim, then carry it across to over the bin.
 
         Up first, then across, not one diagonal. The carried book's foot rides about 50 mm
@@ -868,7 +998,7 @@ class DeliverNode(Node):
         # High enough that the foot of the book clears the rim on the way across, and past
         # the face perception measures to over the middle of the bin: RELEASE_PAST_FACE_M.
         lift_z = rim + BOOK_BELOW_GRIP + self.rim_clearance
-        release_x = min(float(target[0]) + RELEASE_PAST_FACE_M, RELEASE_REACH_M)
+        release_x = min(float(target[0]) + past_face, RELEASE_REACH_M)
         above = np.array([release_x, float(target[1]), lift_z])
         self.above_point = above
         self._start_holding()
