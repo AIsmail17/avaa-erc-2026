@@ -539,7 +539,12 @@ class GraspNode(Node):
         # How many postures that reach are compared before choosing one.
         self.declare_parameter("posture_choices", 4)
         # Seconds the posture search may spend before taking the best it has found.
-        self.declare_parameter("posture_search_budget_sec", 12.0)
+        # 40 s of wall clock. 12 s was tuned for a search during which the base coasted
+        # unheld; with the hold running through the search the time is affordable, and
+        # the eighth full run showed 12 s is too little to find one: three tries, all
+        # three in self-collision, and the grasp gave up in SCENE. The sixth run needed
+        # nine tries to find its posture.
+        self.declare_parameter("posture_search_budget_sec", 40.0)
         # How square to the shelf the base has to be before the grasp latches anything.
         #
         # Everything the grasp holds is measured in base_link at the moment the target is
@@ -996,7 +1001,20 @@ class GraspNode(Node):
         else:
             self.get_logger().info("move_group connected")
 
-        self.create_timer(0.2, self._tick)
+        # The state machine runs in its OWN callback group, not the node's default one.
+        #
+        # Its handlers block for tens of seconds -- the posture search is Python holding
+        # the GIL -- and the default group is mutually exclusive and also holds the /clock
+        # subscription that use_sim_time creates. So while _tick searched, /clock could
+        # not be processed, simulation time stopped for this node, and every timer that
+        # runs on it stopped with it: the base hold among them. Measured 2026-09-10 on the
+        # eighth full run: hold lines every two seconds up to 143.6 s, then none at all
+        # through the search from 145.6 to 158.2 s. On the sixth run the same freeze let
+        # the base coast 0.8 m during an 85 s search, and kept the search budget itself
+        # from ever expiring. With _tick elsewhere, /clock keeps time and the hold keeps
+        # the base while the search runs.
+        self.tick_group = MutuallyExclusiveCallbackGroup()
+        self.create_timer(0.2, self._tick, callback_group=self.tick_group)
         if self.hold_base:
             # The hold gets its own callback group, and the node is spun by a
             # MultiThreadedExecutor, because otherwise it does not run when it is most
@@ -1652,7 +1670,7 @@ class GraspNode(Node):
         if best is None:
             self.get_logger().error(
                 "no usable posture for the pre-grasp in %d tries: %d in collision, "
-                "%d beyond what the arm can hold" % (attempts, rejected, expensive))
+                "%d beyond what the arm can hold" % (attempt + 1, rejected, expensive))
             if rejected:
                 # Name what it hit. "12 in collision" has no next step in it, and the
                 # service already knows the answer: it is nearly always the other arm,
@@ -3209,7 +3227,9 @@ def main(args=None) -> None:
     # Two threads, not one: see the hold's callback group. One runs the state machine,
     # which blocks for tens of seconds at a time on planning; the other keeps the base
     # still while it does.
-    executor = MultiThreadedExecutor(num_threads=2)
+    # One thread each for the state machine, the hold, sensing and the default group
+    # (/clock among it). Two left the state machine and everything else sharing one.
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()
