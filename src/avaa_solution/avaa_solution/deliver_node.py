@@ -551,6 +551,17 @@ class DeliverNode(Node):
             self.get_logger().warn(
                 "could not fold the arm in for the drive (%s); carrying it out here"
                 % error_name(code))
+        # Forget any bin seen while the arm was still moving.
+        #
+        # The laptop run of 2026-09-10, with a red book, logged three bin candidates at
+        # 0.88 to 1.09 m during the carry -- one of them 952 x 255 mm -- while the real
+        # bin was 2.5 m away: most likely the book in the gripper, sized against whatever
+        # depth lay behind it. Under two seconds old, the first seek tick would have taken
+        # one for the bin and driven the book to a standoff from the shelf.
+        self.bin_points.clear()
+        self.bin_stamps.clear()
+        self.bin_point = None
+        self.bin_at = None
         self._enter(State.SEEK)
 
     def _do_seek(self) -> None:
