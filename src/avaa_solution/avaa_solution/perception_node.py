@@ -77,6 +77,32 @@ ROW_HEIGHTS_BASE = list(arena.ROW_HEIGHTS_BASE)
 BIN_RIM_BASE_Z = arena.BIN_RIM_BASE_Z
 BIN_DEPTH_M = 0.50
 
+# How big a red blob has to be, in METRES, before it may be the bin.
+#
+# The pixel gates in book_detector cannot tell a bin from a book lying flat: both are wide,
+# short and solidly red. Measured 2026-09-10: the grasp knocked the target book onto its
+# side, and delivery then reported "bin in view at 1.08 m, +390 mm to the side" while the
+# real bin stood more than three metres behind the robot, drove at the book, and failed.
+# The saved frame shows exactly that slab.
+#
+# Size separates them cleanly, because a book has only ONE dimension over 160 mm -- it is
+# 250 x 30 x 160 -- so however it lies it cannot be both wide and tall. The bin is 500 x
+# 310 x 210, so from any side it is at least 310 mm across and 210 mm tall. The thresholds
+# sit between the two with about 30 mm of margin on each.
+BIN_MIN_WIDTH_M = 0.28
+BIN_MIN_HEIGHT_M = 0.12
+
+
+def bin_sized(width_px: float, height_px: float, depth_m: float,
+              fx: float, fy: float) -> bool:
+    """Return whether a blob this many pixels across, this far away, is as big as the bin."""
+    if depth_m <= 0.0 or fx <= 0.0 or fy <= 0.0:
+        return False
+    width_m = float(width_px) * float(depth_m) / float(fx)
+    height_m = float(height_px) * float(depth_m) / float(fy)
+    return width_m >= BIN_MIN_WIDTH_M and height_m >= BIN_MIN_HEIGHT_M
+
+
 # How far above the truth a deprojected book height sits.
 #
 # This was 0.152 m, and almost all of it was not a bias at all: base_link was taken to
@@ -1012,6 +1038,16 @@ class PerceptionNode(Node):
             return
         point_optical = dl.locate(found.bbox, self.depth_image, self.intrinsics)
         if point_optical is None:
+            return
+        if not bin_sized(found.w, found.h, float(point_optical[2]),
+                         self.intrinsics.fx, self.intrinsics.fy):
+            self.get_logger().info(
+                "a red shape %d x %d px at %.2f m is %.0f x %.0f mm, too small to be the "
+                "bin; probably a book, not offering it"
+                % (found.w, found.h, float(point_optical[2]),
+                   found.w * float(point_optical[2]) / self.intrinsics.fx * 1000,
+                   found.h * float(point_optical[2]) / self.intrinsics.fy * 1000),
+                throttle_duration_sec=5.0)
             return
         try:
             tf = self.tf_buffer.lookup_transform(

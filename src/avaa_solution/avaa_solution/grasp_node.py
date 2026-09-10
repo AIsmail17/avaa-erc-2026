@@ -1941,7 +1941,28 @@ class GraspNode(Node):
         holding_the_book = self.state in (
             State.CLAMP, State.LIFT, State.WITHDRAW, State.STOW, State.DONE)
 
-        if fresh and self.hold_ref is not None and not holding_the_book:
+        # And not while the jaws go in, either.
+        #
+        # The servo owns the last few centimetres. It re-aims the hand at the book every
+        # 200 ms, in base_link, and the jaws open to 60.5 mm around a 30 mm book -- about
+        # 15 mm of clearance a side. A base hold translating the robot underneath it at
+        # the same time moves the whole arm, and does so on a fix perception can no
+        # longer refresh: at close range the book leaves the tracker, and a fix counts as
+        # fresh here for six seconds.
+        #
+        # Measured 2026-09-10, the second full run: perception reported no red book in
+        # view at close range 143.2 s into the grasp, the hold went on commanding the
+        # base forward at +24 mm/s on a fix 0.4 and then 1.1 s old, and when the jaws
+        # closed at 147.3 s the book was lying on its side 152 mm to the left -- with the
+        # gripper arriving within 24 mm of where the book had stood. The grasp reported
+        # its pads 1 mm off centre, because it measured against the same stale fix.
+        #
+        # So the linear channel stands down for the servo. The IMU yaw damper stays:
+        # it is measured continuously and needs no sight of the book.
+        final_approach = self.state is State.SERVO
+        linear_off = holding_the_book or final_approach
+
+        if fresh and self.hold_ref is not None and not linear_off:
             error = np.asarray(self.book, dtype=float)[:2] - self.hold_ref
             size = float(np.linalg.norm(error))
             # An error this large is not a base that has drifted, it is a bad look --
@@ -2030,6 +2051,13 @@ class GraspNode(Node):
         # Nothing measurable this tick. Keep correcting the coast rather than asking
         # the wheels for a zero they have no friction to enforce.
         if not fresh and self.hold_last is not None:
+            if linear_off:
+                # Replaying the last command would replay its LINEAR part too: a
+                # correction worked out before the servo started, for a base and a
+                # book that have both moved since. Keep only the turn.
+                replay = Twist()
+                replay.angular.z = self.hold_last.angular.z
+                return replay
             return self.hold_last
         return twist
 
