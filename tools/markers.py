@@ -20,13 +20,16 @@ import time
 
 import numpy as np
 import rclpy
+from builtin_interfaces.msg import Duration
 from sensor_msgs.msg import Image
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from rclpy.qos import (QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy,
                        QoSHistoryPolicy)
 
 sys.path.insert(0, "/opt/erc_ws/src/avaa_solution")
 from avaa_solution.vision import marker_reader as mr      # noqa: E402
 
+TILT = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
 TOPIC_RGB = "/head_front_camera/head_front_camera/color/image_raw"
 SENSOR_QOS = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                         durability=QoSDurabilityPolicy.VOLATILE,
@@ -82,6 +85,25 @@ def main():
     latest = {"rgb": None}
     node.create_subscription(Image, TOPIC_RGB,
                              lambda m: latest.__setitem__("rgb", m), SENSOR_QOS)
+
+    # Aim the head first. It is left wherever the last run pointed it, and a head tilted
+    # down onto the books cannot see plates mounted at 2.26 m -- which reads in the output
+    # as "no markers" and looks like the reader failing.
+    head = node.create_publisher(JointTrajectory, "/head_controller/joint_trajectory", 10)
+    traj = JointTrajectory()
+    traj.joint_names = ["head_1_joint", "head_2_joint"]
+    point = JointTrajectoryPoint()
+    point.positions = [0.0, TILT]
+    point.time_from_start = Duration(sec=2)
+    traj.points = [point]
+    for _ in range(6):
+        head.publish(traj)
+        rclpy.spin_once(node, timeout_sec=0.2)
+    settle = time.time() + 5.0
+    while time.time() < settle:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    latest["rgb"] = None
+
     deadline = time.time() + 12.0
     while time.time() < deadline and latest["rgb"] is None:
         rclpy.spin_once(node, timeout_sec=0.1)
