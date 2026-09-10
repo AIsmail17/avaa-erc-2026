@@ -601,6 +601,8 @@ class ApproachNode(Node):
         # different: turning does rotate the wheels, so the rate is real.
         self.create_subscription(Odometry, "/odom", self._on_odom, 10)
         self.pub_cmd = self.create_publisher(Twist, TOPIC_CMD, 10)
+        # Set once the approach has finished and handed the base back; see _tick.
+        self.released_base = False
         self.pub_state = self.create_publisher(String, TOPIC_STATE, 10)
         self.pub_arm_left = self.create_publisher(JointTrajectory, TOPIC_ARM_LEFT, 10)
         self.pub_arm_right = self.create_publisher(JointTrajectory, TOPIC_ARM_RIGHT, 10)
@@ -916,8 +918,21 @@ class ApproachNode(Node):
     def _tick(self) -> None:
         self._publish_state()
 
+        # Once finished, stop the base ONCE and then leave /cmd_vel alone.
+        #
+        # This used to call _stop() on every tick for as long as the node lived: a zero
+        # twist ten times a second, on the topic the grasp and the delivery drive the
+        # base with after it. The plugin obeys whichever message came last, so the
+        # delivery's turn-in-place at 5 Hz lost two ticks in three to it. Measured
+        # 2026-09-10, the third full run: 130 simulated seconds of seeking at a
+        # commanded 0.35 rad/s -- a full turn every eighteen seconds -- with the same
+        # fallen book in view the whole time and its range creeping from 1.10 to 1.36 m.
+        # The base was not turning. The grasp_node docstring for _my_turn already
+        # describes this node as one that stops publishing when it is done; it did not.
         if self.state in (State.DONE, State.FAILED):
-            self._stop()
+            if not self.released_base:
+                self.released_base = True
+                self._stop()
             return
 
         if self.state is State.WAITING:

@@ -1959,7 +1959,20 @@ class GraspNode(Node):
         #
         # So the linear channel stands down for the servo. The IMU yaw damper stays:
         # it is measured continuously and needs no sight of the book.
-        final_approach = self.state is State.SERVO
+        #
+        # The reach into the shelf counts as well, not only the servo after it.
+        #
+        # With the servo alone standing the hold down, the third full run (2026-09-10)
+        # knocked the book over one step earlier. The planned reach parks the hand 20 mm
+        # in front of the book face, and at 127.3 s -- one second before the servo took
+        # over -- the hold commanded the base FORWARD at +40 mm/s on a 28 mm error. The
+        # servo's first re-aim at 129.0 s then moved the target 48 mm, which is that
+        # lunge; the book ended 51 mm deeper in the shelf and on its side, and the jaws
+        # closed 149 mm from where it lay. Twenty millimetres of clearance does not
+        # survive a correction measured in centimetres. From the moment the arm starts
+        # into the shelf, the reach, its staging re-aim and the servo own the relative
+        # position; the hold keeps the base from turning and leaves the rest alone.
+        final_approach = self.state in (State.ADVANCE, State.SERVO)
         linear_off = holding_the_book or final_approach
 
         if fresh and self.hold_ref is not None and not linear_off:

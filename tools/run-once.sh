@@ -113,6 +113,39 @@ CLIENT=$!
       >/dev/null 2>&1
   fi ) &
 GUARD=$!
+# Stop when the MISSION stops, not when the clock runs out.
+#
+# The launch never exits on its own: when the mission reaches done or failed, every node
+# stays up waiting for a phase that will never come. So this used to sit on "wait $CLIENT"
+# for the whole of LAUNCH_TIMEOUT -- forty minutes after a run that ended in five. Measured
+# 2026-09-10: two finished runs were found still waiting, 36 and 20 minutes in, and each
+# would have finished with the pkill below and taken down whatever run was going by then.
+# That is the same trap as the orphaned drive_to in tools/in-sim, reached a different way.
+#
+# Watch the mission's own verdict instead, give the last lines ten seconds to land, and
+# stop. LAUNCH_TIMEOUT stays as the upper bound for a mission that never decides.
+while kill -0 "$CLIENT" 2>/dev/null; do
+  if sed 's/\x1b\[[0-9;]*m//g' /tmp/run_raw.log 2>/dev/null \
+       | grep -qE "avaa_mission.*phase [a-z]+ -> (done|failed)"; then
+    echo "=== the mission has finished; stopping the launch"
+    sleep 10
+    docker exec erc_sim bash -c 'pkill -f "ros2 launch avaa_solution solution.launch.py"' \
+      >/dev/null 2>&1
+    # And its nodes, by PID. Stopping the launch does not stop them: on 2026-09-10 all
+    # five were found alive twenty minutes after the launch was killed, and the client
+    # this script waits on never returned. Ten seconds for a clean exit, then no choice.
+    sleep 10
+    stragglers=$(docker exec erc_sim ps -eo pid=,args= \
+      | grep -E "avaa_solution/lib/avaa_solution/|ros2 launch avaa_solution" \
+      | grep -v " ps -eo" | awk '{print $1}' | tr '\n' ' ')
+    if [ -n "${stragglers// /}" ]; then
+      echo "=== nodes still up after the launch stopped; killing: $stragglers"
+      docker exec erc_sim kill -9 $stragglers >/dev/null 2>&1
+    fi
+    break
+  fi
+  sleep 15
+done
 wait "$CLIENT" 2>/dev/null || true
 kill "$GUARD" 2>/dev/null || true
 # Whatever ended the launch, leave nothing of it behind for the next run to trip over.

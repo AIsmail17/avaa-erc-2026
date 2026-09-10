@@ -91,16 +91,31 @@ BIN_DEPTH_M = 0.50
 # sit between the two with about 30 mm of margin on each.
 BIN_MIN_WIDTH_M = 0.28
 BIN_MIN_HEIGHT_M = 0.12
+#
+# And by AREA, because width alone was measured to be too close a call.
+#
+# On the third full run a book lying flat on the bottom shelf was rejected two dozen times
+# at 261 to 279 mm wide -- its top face is 250 x 160, and seen from above and at an angle
+# its box widens towards the 297 mm diagonal -- one millimetre short of the width gate on
+# its last reading. The red AREA of that face cannot exceed 0.040 square metres however it
+# lies, while the bin shows at least 0.31 x 0.21 of red from its narrowest side, about
+# 0.059 once its box is less than solid. Both gates must pass.
+BIN_MIN_AREA_M2 = 0.050
 
 
 def bin_sized(width_px: float, height_px: float, depth_m: float,
-              fx: float, fy: float) -> bool:
+              fx: float, fy: float, area_px: float = None) -> bool:
     """Return whether a blob this many pixels across, this far away, is as big as the bin."""
     if depth_m <= 0.0 or fx <= 0.0 or fy <= 0.0:
         return False
     width_m = float(width_px) * float(depth_m) / float(fx)
     height_m = float(height_px) * float(depth_m) / float(fy)
-    return width_m >= BIN_MIN_WIDTH_M and height_m >= BIN_MIN_HEIGHT_M
+    if width_m < BIN_MIN_WIDTH_M or height_m < BIN_MIN_HEIGHT_M:
+        return False
+    if area_px is None:
+        return True
+    area_m2 = float(area_px) * float(depth_m) ** 2 / (float(fx) * float(fy))
+    return area_m2 >= BIN_MIN_AREA_M2
 
 
 # How far above the truth a deprojected book height sits.
@@ -1039,16 +1054,23 @@ class PerceptionNode(Node):
         point_optical = dl.locate(found.bbox, self.depth_image, self.intrinsics)
         if point_optical is None:
             return
-        if not bin_sized(found.w, found.h, float(point_optical[2]),
-                         self.intrinsics.fx, self.intrinsics.fy):
+        depth_m = float(point_optical[2])
+        width_mm = found.w * depth_m / self.intrinsics.fx * 1000
+        height_mm = found.h * depth_m / self.intrinsics.fy * 1000
+        area_m2 = found.area * depth_m ** 2 / (self.intrinsics.fx * self.intrinsics.fy)
+        if not bin_sized(found.w, found.h, depth_m,
+                         self.intrinsics.fx, self.intrinsics.fy, found.area):
             self.get_logger().info(
-                "a red shape %d x %d px at %.2f m is %.0f x %.0f mm, too small to be the "
-                "bin; probably a book, not offering it"
-                % (found.w, found.h, float(point_optical[2]),
-                   found.w * float(point_optical[2]) / self.intrinsics.fx * 1000,
-                   found.h * float(point_optical[2]) / self.intrinsics.fy * 1000),
+                "a red shape %d x %d px at %.2f m is %.0f x %.0f mm and %.3f m2, too "
+                "small to be the bin; probably a book, not offering it"
+                % (found.w, found.h, depth_m, width_mm, height_mm, area_m2),
                 throttle_duration_sec=5.0)
             return
+        # Log what the real bin measures, so the gates above are checked against it
+        # rather than against arithmetic about it.
+        self.get_logger().info(
+            "bin candidate %.0f x %.0f mm and %.3f m2 at %.2f m"
+            % (width_mm, height_mm, area_m2, depth_m), throttle_duration_sec=5.0)
         try:
             tf = self.tf_buffer.lookup_transform(
                 GRASP_FRAME, self.depth_frame, rclpy.time.Time())
