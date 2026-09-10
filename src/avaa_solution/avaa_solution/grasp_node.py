@@ -228,13 +228,17 @@ TUCK_TORSO = 0.10
 # either side, and the base -- being pushed apart from the book every step -- turned at a
 # capped 0.04 rad/s whatever it was asked for (0.10 gave 19 per cent, 0.35 gave 11) and slid
 # 50 to 74 mm sideways as it turned. Delivery could not turn to the bin and lost it twice.
-# Delivery was meant to lift the book to its carry point first, but it tried a straight
-# line up from the tuck, through the robot, and that was refused on every run.
 #
-# This posture puts the gripper at (0.32, +0.12, 1.00) in base_link with the jaws facing
-# forward: arm no wider than 0.21 m either side, lowest arm link at 0.68 m, the book bottom
-# at 0.80 m, every joint at least 3 degrees inside its limits (tools/carrypose2.py).
-CARRY_POSTURE = [0.0514, 4.4561, -2.3589, 2.1834, -1.8739, -1.2281, -1.7124, -2.2395]
+# The first carry posture tried, found with kinematics alone, was refused by
+# /check_state_validity: head_2_link against arm_left_6_link, the wrist in front of the face.
+# This one came from tools/carrysearch.py, which asks MoveIt about every candidate, and
+# tools/carryhead.py checked it again at head pans of 0 and +-0.5 rad and every tilt from
+# -1.05 to +0.35 -- valid throughout, where the next best was refused with the head fully down.
+# Gripper at (0.38, +0.12, 0.90) in base_link, jaws facing forward, arm within 0.20 m either
+# side, lowest arm link at 0.70 m, the book bottom at 0.70 m, joints at least 3 degrees
+# inside their limits, and the shortest reach of the valid candidates -- the arm holds this
+# for the whole drive to the bin.
+CARRY_POSTURE = [0.0701, 4.6589, -2.1673, 2.2883, -2.3724, -1.2617, -1.6366, -1.9919]
 
 # The wrist, in base_link: reach along +x, close the fingers across y. Both come from the
 # URDF -- the fingers sit at y = +/-0.0288 offset +0.0756 along z in gripper_left_base_link,
