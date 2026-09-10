@@ -1,6 +1,6 @@
 # Team AVAA — project state
 
-**Read this first when resuming.** Written 2026-09-02, brought up to date 2026-09-07.
+**Read this first when resuming.** Written 2026-09-02, brought up to date 2026-09-10.
 Phase 1 deadline **2026-09-15**.
 
 Nothing important lives in a chat transcript. Everything is in this folder, in the repo, or
@@ -92,7 +92,7 @@ Use `tools/drift.py` (per simulated second, prints the RTF beside the answer) an
 
 | Piece | State |
 |---|---|
-| Environment | ✅ WSL + Docker, RTF ~0.5 on a fresh launch |
+| Environment | ✅ WSL + Docker, RTF ~0.5 headless; ~0.2 with the GUI and the view stack up |
 | Perception — column marker (1–5) | ✅ verified, 9 viewpoints, no misreads |
 | Perception — book colour and row | ✅ verified, 16/16 books, 0 false positives |
 | Perception — collection bin | ✅ new; found reliably, located to ~20 mm |
@@ -103,17 +103,169 @@ Use `tools/drift.py` (per simulated second, prints the RTF beside the answer) an
 | Approach — end to end | ✅ 2026-09-08: **three consecutive clean runs, 53.4 / 56.3 / 61.9 s** to hand-over |
 | Arm kinematics + IK | ✅ exact to 0.7 mm; holds all four rows to within 6 mm in open air |
 | Grasp — reach and servo | ✅ reaches into the shelf, clamps, lifts, hands over to delivery |
-| Grasp — actually holding it | ❌ **the jaws close on air**; see below |
+| Grasp — actually holding it | ⚠️ the jaws now close **on the book** — 2026-09-10, after the row heights were corrected. It is still not carried: the base drifts out of position first |
 | Place in bin | ⚠️ **written, never run with a book in the gripper** |
 | Video (D2) | ❌ not started |
 | Report (D3) | ❌ not started |
 
-**133 unit tests**, no simulator required:
+**159 unit tests**, no simulator required:
 
 ```bash
 sim shell
 cd /opt/erc_ws/src/avaa_solution && python3 -m pytest test/ -q
 ```
+
+---
+
+---
+
+## 2026-09-10 — the arm was aimed 110 mm low, at every row, all along
+
+`base_link` is **0.0762 m** above the floor. This project used **0.186** in eighteen
+places. `ROW_HEIGHTS_BASE` is world minus that constant, so every row was 110 mm low, and
+the grasp aims a further 45 mm below the book centre — so the gripper was sent 155 mm
+below the middle of a book 250 mm tall. That is 30 mm below its bottom edge, into the
+board it stands on.
+
+It is now one constant in `avaa_solution/arena.py`, and everything is derived from it.
+
+| | old | corrected |
+|---|---|---|
+| row 1 | 1.391 | **1.5008** |
+| row 2 | 1.061 | **1.1708** |
+| row 3 | 0.731 | **0.8408** |
+| row 4 | 0.401 | **0.5108** |
+| bin rim | 0.764 | **0.8738** |
+
+Three sources agree, none of them the URDF quoting itself: TF measures +0.0762 and puts
+`base_link` at the wheel axle height; Gazebo and TF agree on `torso_lift_link` to a tenth
+of a millimetre, which also settles that `base_footprint` is the floor (`tools/worldtf.py`);
+and every book fix through the camera lands within 6 mm of ground-truth-minus-0.0762 and
+115 mm above ground-truth-minus-0.186 (`tools/bookheight.py`).
+
+**Why nothing caught it, and the general lesson.** The tools that measured the miss
+converted ground truth into `base_link` with the same constant as the code that aimed the
+arm. Both sides moved together, the difference came out as zero, and a reach 110 mm low
+reported as perfect — "+24 mm in depth and −5 mm in height at the clamp" is in a comment
+in `tools/arenafeed.py` as evidence the arm was fine. **A constant on both sides of a
+comparison is never tested by that comparison.** `test_arena.py` now checks it against the
+URDF, which cannot move with it.
+
+Three things that were read as separate faults were this:
+
+* **Row 4 "unreachable"** — 0.401 is 110 mm below where that row is, and down there the
+  forearm meets the base.
+* **`DEPTH_HEIGHT_BIAS = 0.152`** — almost all of it was this. The real residual is +6 mm
+  with 9 mm of spread over four rows, three head tilts and 0.65–1.6 m. Rows are 330 mm
+  apart, so the measured height can now name a row outright, and `_cross_check_row` is
+  allowed to overrule the marker row by one, which it never was before.
+* **The shelf boards in the planning scene** were 110 mm low, so the planner avoided
+  boards that were not there and drove through ones that were.
+
+### What it bought
+
+First grasp after the fix, row 3, book fed from ground truth:
+
+```
+the grasping frame is +0 mm depth, +2 mm sideways, +1 mm height of its target,
+but the PADS are on the book: 80 mm into it, 8 mm off centre sideways, 42 mm in height
+the jaws stopped at 27.1 mm on a 30.0 mm book, so there is something between them
+```
+
+The jaws closed **on the book** for the first time. The book has still never been carried
+to the bin — see below.
+
+## 2026-09-10 — the yaw can be measured after all: the IMU
+
+STATE.md said above that uncommanded rotation is not reliably measured, and that the depth
+camera is the only instrument left. It is not: `/base_imu` publishes at 100 Hz and it is
+very good. Integrated over four ten-second windows, against Gazebo (`tools/imudrift.py`):
+
+| | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| IMU | −13.616 | −16.472 | −5.914 | −6.482 |
+| truth | −13.291 | −16.892 | −5.642 | −6.943 |
+| odom | −4.210 | −2.856 | −2.680 | −0.893 |
+
+Under half a degree, against odom seeing about a quarter of the turn.
+
+**Filter hard, and this is the part that matters.** The raw signal is a base that shakes:
+mean −0.74 deg/s, spread 4.70, range −18.27 to +17.16. The spread is six times the mean,
+and it is not sensor noise — the URDF gives the gyro a stddev of 2e-4 rad/s and the
+measured spread is 0.082, four hundred times it. Braking on the instantaneous rate
+saturates the command clip and halves the drift at best. Filtered at alpha 0.01 (about a
+second), gain 2 (`tools/yawbrake.py`):
+
+| gain | turned over 10 s | note |
+|---|---|---|
+| 0 | −8.391 deg | the control |
+| **2** | **−0.517 deg** | 94% removed, largest command 0.040 rad/s against a 0.15 clip |
+| 0 | −10.231 deg | the control again |
+| 4 | +4.997 deg | overshoot, it turned the base the other way |
+
+This is now `hold_imu_yaw_gain` in `grasp_node`. Measured in an arena grasp: the base
+finished **1.1 degrees** off square, against 19.4 before.
+
+Note why it works where `hold_base.py`'s damping term failed. That one differenced a pose
+over a 1.5 s loop and oscillated out to 503 mm — derivative feedback through a long delay
+doing exactly what that predicts. The IMU has no delay.
+
+## 2026-09-10 — what is left, and it is one thing
+
+**The base's linear coast.** ~3 to 8 mm per simulated second, on one heading, forever, and
+the arm makes no difference to it (`tools/holdwhilereaching.py`: 8.0 mm/s arm still,
+7.7 mm/s arm swinging — so it is not the arm's reaction, which had been the assumption).
+A grasp takes about 85 simulated seconds, so that is 250 to 680 mm.
+
+That is what now breaks a grasp, and the mechanism is exact. The base retreats until the
+book is **past the end of the arm**, and grasp_node then does the right thing and refuses
+the sighting:
+
+```
+ignoring a sighting 1240 mm from the shoulder; the arm reaches 1088 mm
+```
+
+having last aimed at where the book was 200 mm ago. It clamps there, on air. The clamp
+report on that run: −190 mm depth, +158 mm sideways.
+
+**The drive is not the problem, and a comment in `hold_base.py` saying otherwise is
+wrong.** It reads "commanded 0.02 m/s the base simply sits there", and the hold's gain,
+clip and deadband were all chosen around that belief. Measured (`tools/drivecurve.py`),
+each command paired with a silent control window so the base's own coast is subtracted
+rather than attributed to the command:
+
+| commanded m/s | 0.010 | 0.020 | 0.030 | 0.040 | 0.060 | 0.100 |
+|---|---|---|---|---|---|---|
+| arrived mm/s | 6.9 | 14.9 | 25.2 | 32.7 | 53.7 | 88.3 |
+| fraction | 0.69 | 0.75 | 0.84 | 0.82 | 0.89 | 0.88 |
+
+No floor anywhere: 10 mm/s commanded moves the base at 6.9. So the hold clipping at
+40 mm/s has 33 mm/s of real authority against a 3–8 mm/s drift, four times what it needs.
+
+Which leaves one explanation standing — **the hold was not commanding** — and that is a
+question about the run rather than about the arithmetic, so `tools/holdtrace.py` records
+what the hold asked for, what book point it was correcting from, and where the base truly
+was, one row a second, alongside a live grasp.
+
+The other direction is worth taking regardless: **take less time.** 85 simulated seconds
+against a 3–8 mm/s drift and roughly 150 mm of reach margin means the grasp has to fit in
+about 30 seconds for drift alone not to break it. Most of that time is MoveIt planning,
+not moving.
+
+### Two faults in the simulation grasp aid, both found by it refusing a good grasp
+
+* **One failed pick disabled it for the life of the process.** The "too far to hold from"
+  branch returned without clearing `attach_asked`, and the only thing that cleared it
+  needed something already held. It is launched once with the simulator and lives for
+  hours.
+* It composed the gripper's world height from Gazebo's base_footprint pose and TF's
+  base_link gripper without the 76 mm between them, and decided on a **cached base pose up
+  to three seconds old** against a live arm. Three seconds of this base is tens of
+  millimetres against a 90 mm tolerance.
+
+Both fixed. `tools/putback.py` stands books back on the shelf between attempts, with
+`--jitter` to restore the randomiser's sideways spread when perception is what is being
+tested.
 
 ---
 

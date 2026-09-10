@@ -233,7 +233,22 @@ def main():
             break
         if sim_now() - last_read[0] > 1.0 and "pad" not in at_clamp:
             last_read[0] = sim_now()
-            fresh = poses().get("tiago_pro")
+            # Re-read the BOOK as well as the robot.
+            #
+            # This read the book once at startup and never again, on the reasonable view
+            # that a book on a shelf does not move. It does: the arm pushes it. Measured
+            # across four runs, 148 to 207 mm sideways during the reach -- and while that
+            # was happening this tool went on feeding the grasp the book's original
+            # position and then reporting the miss against it, so a run that shoved the
+            # book across the shelf and closed on empty air came out as "2 mm sideways".
+            #
+            # Perception would see the book move, so this has to as well. It is the whole
+            # contract of the tool: supply what perception WOULD supply if it were right.
+            sample = poses()
+            fresh = sample.get("tiago_pro")
+            moved = sample.get(book_name)
+            if moved is not None and "px" in moved:
+                book.update(moved)
             if fresh is not None:
                 bx, by, bz = in_base(fresh)
                 face_x = bx - BOOK_DEPTH / 2.0
@@ -242,7 +257,13 @@ def main():
         point = PointStamped()
         point.header.frame_id = "base_link"
         point.header.stamp = node.get_clock().now().to_msg()
-        point.point.x, point.point.y, point.point.z = face_x, by, bz
+        # The height goes out in base_link like everything else on this topic.
+        #
+        # It went out as a height above the FLOOR, 76 mm too high, and got away with it
+        # because grasp_node takes only x and y from this message and the height from the
+        # row table. Perception publishes base_link here, so a harness that publishes
+        # something else is a trap set for whoever next believes the z.
+        point.point.x, point.point.y, point.point.z = face_x, by, bz - BASE_LINK_Z
         pub_point.publish(point)
         # The TRUE yaw error, not a zero.
         #

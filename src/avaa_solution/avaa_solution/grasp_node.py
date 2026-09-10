@@ -48,7 +48,8 @@ import numpy as np
 import rclpy
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Pose, PointStamped, Quaternion, Twist
-from rclpy.executors import ExternalShutdownException
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy)
@@ -462,7 +463,36 @@ class GraspNode(Node):
         # second even with the wheels given friction, which at arm's length is 3 mm/s
         # sideways, and the jaws have about 13 mm of clearance either side of the book.
         # That buys roughly four seconds between the last look and the jaws closing.
-        self.declare_parameter("final_approach_m", 0.035)
+        # How much of the reach is left to the servo rather than to the plan.
+        #
+        # This was 0.035, which put the staging point INSIDE the book. The grasp target
+        # is the book face plus grasp_depth_m, 110 mm, and the pads sit 30 mm behind the
+        # grasping frame -- so stopping 35 mm short left the pads 45 mm past the face
+        # with the lateral error not yet corrected. The jaws had already straddled the
+        # book before anything squared them up on it, and a jaw that arrives off centre
+        # does not miss, it pushes: measured, the book was shoved 148 to 207 mm sideways
+        # during the advance and then toppled, on runs where the pads finished 12 mm
+        # from the centre line of wherever it had been pushed to.
+        #
+        # 0.15 puts the staging point 40 mm in FRONT of the face, which is where the
+        # squaring up below happens. The servo covers it at 12 mm a tick, five ticks a
+        # second, so it costs about two seconds.
+        self.declare_parameter("final_approach_m", 0.15)
+        # How far off the book's centre line the jaws may be before going in.
+        #
+        # The jaws open to 68 mm on a book 30 mm thick, so there is 19 mm of clearance
+        # each side and a jaw that arrives outside that touches the book's face. The
+        # book is a free-standing slab 250 mm tall on a 30 mm base, so a third of a
+        # newton tips it -- see grasp_below_centre_m. 8 mm keeps a wide margin inside
+        # the clearance without asking the servo for an accuracy it does not have.
+        self.declare_parameter("entry_lateral_tolerance_m", 0.008)
+        self.declare_parameter("entry_height_tolerance_m", 0.012)
+        # How far in front of the book's face the planned reach stops.
+        #
+        # The grasping frame here, so the pads -- 30 mm behind it -- are 50 mm clear.
+        # Far enough that squaring up cannot touch the book, near enough that the servo
+        # only has 130 mm to cover at 60 mm/s.
+        self.declare_parameter("entry_clearance_m", 0.020)
         # How far below the middle of the book to grip it.
         #
         # The book is 250 mm tall and 30 mm thick, standing free on a shelf board it
@@ -482,6 +512,26 @@ class GraspNode(Node):
         self.declare_parameter("grasp_below_centre_m", 0.045)
         # How many postures that reach are compared before choosing one.
         self.declare_parameter("posture_choices", 4)
+        # Seconds the posture search may spend before taking the best it has found.
+        self.declare_parameter("posture_search_budget_sec", 12.0)
+        # How square to the shelf the base has to be before the grasp latches anything.
+        #
+        # Everything the grasp holds is measured in base_link at the moment the target is
+        # planned: the book's position, the reference the base hold keeps it at, the
+        # pre-grasp posture. If the base is crooked then, squaring it up afterwards
+        # SWINGS all of that -- a book 0.72 m out moves 90 mm through 7 degrees -- and
+        # the hold's two channels then fight each other, one restoring the angle and the
+        # other undoing the movement the angle correction caused.
+        #
+        # Observed exactly that. The base was 7 degrees off when the grasp began, the
+        # angle term commanded its full 0.15 rad/s, the book jumped 294 mm out of its
+        # latched position in two seconds, and the posture search then spent minutes on
+        # a pre-grasp that had moved out from under it.
+        #
+        # So square up first, then latch. It costs a few seconds and it makes the two
+        # channels agree for the rest of the grasp.
+        self.declare_parameter("square_tolerance_rad", 0.030)
+        self.declare_parameter("square_timeout_sec", 25.0)
         # The pre-grasp is a staging point 0.15 m in front of the book, not the
         # grasp. The Cartesian reach that follows targets the book in absolute
         # terms, so a centimetre of error here is corrected rather than carried,
@@ -565,8 +615,49 @@ class GraspNode(Node):
         self.declare_parameter("hold_imu_yaw_gain", 2.0)
         self.declare_parameter("hold_imu_yaw_deadband_rad_s", 0.004)
         self.declare_parameter("hold_imu_filter", 0.01)
+        # Samples before the filtered rate is worth acting on. At alpha 0.01 the filter
+        # is within a few per cent of the true mean after a couple of time constants,
+        # and the IMU runs at 100 Hz, so this is about two seconds -- spent standing
+        # still at the start of a grasp, which costs nothing.
+        self.declare_parameter("hold_imu_warmup_samples", 200)
+        # A separate, much tighter clip for the damper.
+        #
+        # The two angular terms want very different authority. The shelf-yaw term
+        # corrects a real angle and may need the full 0.15 rad/s to do it. The damper
+        # cancels a drift measured at 0.013 rad/s, so a 0.15 clip gives it eleven times
+        # the authority of the thing it is cancelling -- and the moment the filtered
+        # rate is wrong, that whole eleven-fold margin is spent turning the base.
+        #
+        # Observed: an early tick commanded +0.150 rad/s, which is 8.6 degrees a second,
+        # and the book jumped 294 mm out of position in one two-second step. Everything
+        # after that was the hold trying to recover from a kick it had delivered itself.
+        # A rate damper that ever needs more than a few times the drift rate is not
+        # damping, it is driving.
+        self.declare_parameter("hold_imu_max_rad_s", 0.05)
         # Beyond this the reading is disbelieved rather than driven on.
-        self.declare_parameter("hold_limit_m", 0.20)
+        #
+        # 0.20 was too tight, and the trace says so. The base was thrown 294 mm out of
+        # position by a single event -- the IMU damper's own startup transient, before it
+        # was made to warm up -- and the hold then sat with "OVER the 200 mm cap, not
+        # driving on it" for eight seconds, commanding nothing, while the base carried on.
+        # When the error happened to fall back under the cap the hold pulled it from 294
+        # to 53 mm in half a minute at its clip. So the loop works; the cap was what
+        # stopped it working exactly when it was needed.
+        #
+        # What the cap is for is a look on the WRONG BOOK, and the nearest wrong book is
+        # a column away -- 1 m. 0.45 clears every base excursion measured here and still
+        # refuses that by a wide margin. It is also not the only guard: the point driven
+        # on is a median of fifteen sightings, so a single bad frame cannot move it at
+        # all, and perception now refuses a fix more than half a row from the identified
+        # row's height.
+        #
+        # Note what is NOT being changed. An earlier attempt replaced the cap with a
+        # bound on how fast the error CHANGES, which admits an arbitrarily large error
+        # so long as it arrived slowly, and the base ran away two metres. A bigger cap is
+        # still a cap; the command it produces is still clipped at 40 mm/s; and the place
+        # it drives back to is where the robot was standing when the target was set,
+        # which was a safe place to stand.
+        self.declare_parameter("hold_limit_m", 0.45)
         self.declare_parameter("reaim_allowance_m", 0.06)
         # Per second since the target was set. The base coasts at 7.7 mm a simulated
         # second (tools/coast.py, eight windows, heading agreement 0.98), so this is
@@ -704,6 +795,18 @@ class GraspNode(Node):
         self.tol_height = float(self.get_parameter("arrival_tol_height_m").value)
         self.reach_attempts = int(self.get_parameter("reach_attempts").value)
         self.final_approach = float(self.get_parameter("final_approach_m").value)
+        self.posture_search_budget = float(
+            self.get_parameter("posture_search_budget_sec").value)
+        self.square_tolerance = float(
+            self.get_parameter("square_tolerance_rad").value)
+        self.square_timeout = float(self.get_parameter("square_timeout_sec").value)
+        self.squaring_since = None
+        self.entry_lateral = float(
+            self.get_parameter("entry_lateral_tolerance_m").value)
+        self.entry_height = float(
+            self.get_parameter("entry_height_tolerance_m").value)
+        self.entry_clearance = float(
+            self.get_parameter("entry_clearance_m").value)
         self.below_centre = float(
             self.get_parameter("grasp_below_centre_m").value)
         self.posture_choices = int(
@@ -726,12 +829,17 @@ class GraspNode(Node):
         self.hold_imu_yaw_deadband = float(
             self.get_parameter("hold_imu_yaw_deadband_rad_s").value)
         self.hold_imu_filter = float(self.get_parameter("hold_imu_filter").value)
+        self.hold_imu_warmup = int(
+            self.get_parameter("hold_imu_warmup_samples").value)
+        self.hold_imu_max = float(self.get_parameter("hold_imu_max_rad_s").value)
         self.hold_limit = float(self.get_parameter("hold_limit_m").value)
         self.hold_ref = None
         self.hold_last = None
-        # The base's own yaw rate, from the IMU, and when it last arrived.
+        # The base's own yaw rate, from the IMU, when it last arrived, and how many
+        # samples have gone into it. The filter needs a run-up; see _on_imu.
         self.imu_yaw_rate = None
         self.imu_yaw_at = None
+        self.imu_samples = 0
         self.shelf_yaw = None
         self.shelf_yaw_at = None
         self.reaim_allowance = float(
@@ -820,10 +928,17 @@ class GraspNode(Node):
         self.motion_result = None
         self.motion_label = ""
 
+        # The hold's own inputs get their own callback group, so they keep arriving
+        # while the state machine blocks on planning. A hold that runs on a stale book
+        # point and a stale yaw rate is not a hold. Declared before the subscriptions
+        # that use it, which is the whole of what went wrong the first time.
+        self.sensing_group = MutuallyExclusiveCallbackGroup()
+
         self.create_subscription(Int32, TOPIC_TARGET_ROW, self._on_row, 10)
         self.create_subscription(
             String, "/avaa/mission/phase", self._on_phase, 10)
-        self.create_subscription(PointStamped, TOPIC_BOOK_POINT, self._on_book, 10)
+        self.create_subscription(PointStamped, TOPIC_BOOK_POINT, self._on_book, 10,
+                                 callback_group=self.sensing_group)
         self.create_subscription(
             Float32, TOPIC_SHELF_YAW, self._on_shelf_yaw, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joints, 10)
@@ -832,7 +947,8 @@ class GraspNode(Node):
             Imu, "/base_imu", self._on_imu,
             QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                        durability=QoSDurabilityPolicy.VOLATILE,
-                       history=QoSHistoryPolicy.KEEP_LAST, depth=10))
+                       history=QoSHistoryPolicy.KEEP_LAST, depth=10),
+            callback_group=self.sensing_group)
         self.pub_gripper = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
         self.pub_arm = self.create_publisher(JointTrajectory, ARM_TOPIC, 10)
         self.pub_arm_right = self.create_publisher(
@@ -852,7 +968,27 @@ class GraspNode(Node):
 
         self.create_timer(0.2, self._tick)
         if self.hold_base:
-            self.create_timer(1.0 / max(self.hold_base_hz, 1.0), self._hold_base)
+            # The hold gets its own callback group, and the node is spun by a
+            # MultiThreadedExecutor, because otherwise it does not run when it is most
+            # needed.
+            #
+            # _tick calls the state handlers, and two of them block for a long time on
+            # purpose: the posture search costs a Cartesian plan and a validity check per
+            # candidate, twenty four candidates, and the reaches wait on MoveIt. On one
+            # executor thread that starves every other callback, so the base hold -- a
+            # 20 Hz timer -- publishes nothing for the whole of it.
+            #
+            # Measured on the run that found this: the log carries exactly one "hold:"
+            # line, at the moment the search began, and the base was 500 mm out of
+            # position by the time it ended. Worse, that is self-reinforcing: the further
+            # the base slides the further the pre-grasp gets, and the search then spends
+            # its whole IK budget on a target that has gone out of reach, which takes
+            # longer, which lets the base slide further. Six minutes at 100 per cent of a
+            # core, for a search that takes nineteen seconds when the target is where it
+            # was put.
+            self.hold_group = MutuallyExclusiveCallbackGroup()
+            self.create_timer(1.0 / max(self.hold_base_hz, 1.0), self._hold_base,
+                              callback_group=self.hold_group)
         self.get_logger().info(
             "grasp ready — rows top-down, heights %s" % self.row_heights)
 
@@ -1365,11 +1501,53 @@ class GraspNode(Node):
         found a single posture that reached in twelve tries, and the one it found was
         the one that failed.
         """
+        # Do not search for a posture that reaches somewhere the arm cannot reach.
+        #
+        # Every attempt costs an IK solve with restarts, and when the target is beyond
+        # the arm every restart runs its full budget before failing. Twenty four of
+        # those is minutes of a saturated core, during which the state machine is
+        # blocked and -- before the hold was given its own thread -- the base was free
+        # to slide further away, which made the next attempt worse. Measured: six
+        # minutes at 100 per cent of a core for a search that takes nineteen seconds
+        # when the target is where it was put.
+        #
+        # It is also the more useful failure. "The base has drifted 500 mm and the book
+        # is past the end of the arm" is something a mission can act on; "no posture
+        # reaches the pre-grasp" after six minutes is not.
+        if not self._within_reach(self.pre_target):
+            self.get_logger().error(
+                "the pre-grasp is %.0f mm from the shoulder and the arm reaches %.0f. "
+                "The base is not where the grasp was planned from; not searching for a "
+                "posture that cannot exist."
+                % (self._from_shoulder(self.pre_target) * 1000,
+                   ARM_MAX_REACH * 1000))
+            return None
+
         best = None
         usable = None
         candidates = []
         rejected = 0
         expensive = 0
+        # A wall-clock budget, because an attempt count is not a time bound.
+        #
+        # Each attempt costs an IK solve with restarts, and when solutions are scarce
+        # every restart runs its full budget before failing. The same twenty four
+        # attempts took nineteen seconds on one run and had not finished after seven
+        # minutes on another, at 100 per cent of a core throughout -- and the whole of
+        # that is time the base spends drifting away from the pose the grasp was planned
+        # from, which makes the next attempt harder still.
+        #
+        # Threads do not fix this. The hold was given its own callback group and the node
+        # a MultiThreadedExecutor, which does keep it running while the state machine
+        # waits on MoveIt -- that wait is a sleep and releases the GIL -- but this search
+        # is Python holding the GIL, and no other callback runs during it whatever the
+        # executor is told. The only answer is to take less of it.
+        #
+        # A budget is also the honest structure. The search already keeps the best
+        # candidate it has seen; stopping early means taking that instead of a better one
+        # that might have turned up, which is a much smaller loss than arriving at the
+        # right posture for a base that has since moved half a metre.
+        search_until = self._now() + self.posture_search_budget
         # The first attempt is seeded from where the arm already is. Close to the shelf
         # most solutions for the pre-grasp fold the arm back towards the body and are in
         # collision, so an unbiased search spends its budget on postures that were never
@@ -1377,6 +1555,12 @@ class GraspNode(Node):
         # seeded walk through the same reach was clear at every step.
         seed = self._current_joints()
         for attempt in range(attempts):
+            if attempt and self._now() > search_until:
+                self.get_logger().warn(
+                    "the posture search has used its %.0f s after %d tries; going with "
+                    "the best of what it has rather than letting the base drift further"
+                    % (self.posture_search_budget, attempt))
+                break
             solution = self.chain.ik(
                 self.pre_target, seed=seed if attempt == 0 else None,
                 approach=GRASP_APPROACH, closing=GRASP_CLOSING,
@@ -1650,12 +1834,21 @@ class GraspNode(Node):
         Heavily, and see hold_imu_filter for why: this base shakes six times harder than
         it drifts, and the drift is the part worth cancelling.
         """
+        # Start the filter at zero, not at the first sample.
+        #
+        # A single sample of this signal is worth nothing -- the raw rate ranges over
+        # plus and minus 0.3 rad/s while the drift under it is 0.013 -- so seeding with
+        # one puts the filter twenty times too high and it takes a second to decay. A
+        # second of that is a command at the 0.15 rad/s clip, which is eight degrees of
+        # turn the base did not have, and this base keeps whatever turn it is given.
+        # Zero is the honest starting belief: correct nothing until something is known.
+        alpha = self.hold_imu_filter
         rate = float(msg.angular_velocity.z)
         if self.imu_yaw_rate is None:
-            self.imu_yaw_rate = rate
-        else:
-            alpha = self.hold_imu_filter
-            self.imu_yaw_rate = (1.0 - alpha) * self.imu_yaw_rate + alpha * rate
+            self.imu_yaw_rate = 0.0
+            self.imu_samples = 0
+        self.imu_yaw_rate = (1.0 - alpha) * self.imu_yaw_rate + alpha * rate
+        self.imu_samples += 1
         self.imu_yaw_at = self._now()
 
     def _on_shelf_yaw(self, msg: Float32) -> None:
@@ -1706,7 +1899,22 @@ class GraspNode(Node):
                  and (self.get_clock().now() - self.book_at).nanoseconds / 1e9
                  <= self.book_fresh)
 
-        if fresh and self.hold_ref is not None:
+        # Once the book is in the jaws it moves with the robot, so holding the base
+        # against it is a loop chasing itself.
+        #
+        # The point of the linear channel is to keep the book still in base_link while
+        # the arm goes to meet it. After the clamp the book IS in base_link, carried by
+        # the arm, and every millimetre the base moves takes the book with it -- so the
+        # error never closes and the hold drives on it forever. Observed after the first
+        # successful pick-up: "book 206 mm off where it was latched" repeating with the
+        # command pinned at the clip, while the book sat in the gripper.
+        #
+        # The yaw damper stays on. A base that turns during a withdraw drags the book
+        # along the shelf edge, and the IMU does not care whether anything is held.
+        holding_the_book = self.state in (
+            State.CLAMP, State.LIFT, State.WITHDRAW, State.STOW, State.DONE)
+
+        if fresh and self.hold_ref is not None and not holding_the_book:
             error = np.asarray(self.book, dtype=float)[:2] - self.hold_ref
             size = float(np.linalg.norm(error))
             # An error this large is not a base that has drifted, it is a bad look --
@@ -1758,12 +1966,36 @@ class GraspNode(Node):
                 and abs(self.shelf_yaw) > self.hold_yaw_deadband):
             angular -= self.hold_yaw_gain * self.shelf_yaw
         if (self.imu_yaw_rate is not None and self.imu_yaw_at is not None
+                and self.imu_samples >= self.hold_imu_warmup
                 and (self._now() - self.imu_yaw_at) <= self.book_fresh
                 and abs(self.imu_yaw_rate) > self.hold_imu_yaw_deadband):
-            angular -= self.hold_imu_yaw_gain * self.imu_yaw_rate
+            angular -= float(np.clip(self.hold_imu_yaw_gain * self.imu_yaw_rate,
+                                     -self.hold_imu_max, self.hold_imu_max))
         if angular:
             twist.angular.z = float(np.clip(
                 angular, -self.hold_max_yaw, self.hold_max_yaw))
+
+        # Say what the hold is doing, every couple of seconds.
+        #
+        # It is the one loop in this node with no visible output, and a run where the
+        # base finishes 400 mm out of position looks identical from the log to a run
+        # where it finishes 20 mm out. Whether the hold was commanding, what error it
+        # saw, and whether that error was over the cap it refuses to drive on are the
+        # three things needed to tell "not correcting" from "correcting and losing".
+        if (self.hold_ref is not None and self.book is not None
+                and not holding_the_book):
+            error = np.asarray(self.book, dtype=float)[:2] - self.hold_ref
+            size = float(np.linalg.norm(error))
+            self.get_logger().info(
+                "hold: book %.0f mm off where it was latched%s, age %.1f s, "
+                "commanding %+.3f %+.3f m/s and %+.3f rad/s"
+                % (size * 1000,
+                   " (OVER the %.0f mm cap, not driving on it)"
+                   % (self.hold_limit * 1000) if size > self.hold_limit else "",
+                   (self.get_clock().now() - self.book_at).nanoseconds * 1e-9
+                   if self.book_at is not None else float("nan"),
+                   twist.linear.x, twist.linear.y, twist.angular.z),
+                throttle_duration_sec=2.0)
 
         if twist.linear.x or twist.linear.y or twist.angular.z:
             self.hold_last = twist
@@ -1818,10 +2050,55 @@ class GraspNode(Node):
             return
         if self.row is None or self.book is None:
             return
+        if not self._square_to_the_shelf():
+            return
         if not self._plan_targets():
             self._enter(State.FAILED)
             return
         self._enter(State.SCENE)
+
+    def _square_to_the_shelf(self) -> bool:
+        """Turn the base square before the grasp measures anything against it.
+
+        True when it is square enough to go on, or when there is nothing to square
+        against. See square_tolerance_rad for why this happens here and not later.
+        """
+        fresh = (self.shelf_yaw is not None and self.shelf_yaw_at is not None
+                 and (self._now() - self.shelf_yaw_at) <= self.book_fresh)
+        if not fresh:
+            # No measurement of the angle is not a reason to refuse to grasp. The base
+            # hold still damps the rate from the IMU, and the arm re-aims from
+            # perception, so a crooked base costs accuracy rather than the attempt.
+            return True
+
+        if abs(self.shelf_yaw) <= self.square_tolerance:
+            if self.squaring_since is not None:
+                self.get_logger().info(
+                    "square to the shelf at %+.1f deg after %.1f s"
+                    % (math.degrees(self.shelf_yaw),
+                       self._now() - self.squaring_since))
+                self.squaring_since = None
+            return True
+
+        if self.squaring_since is None:
+            self.squaring_since = self._now()
+            self.get_logger().info(
+                "the base is %+.1f deg off square; turning before planning the grasp, "
+                "so that nothing is latched in a frame that is about to move"
+                % math.degrees(self.shelf_yaw))
+        elif self._now() - self.squaring_since > self.square_timeout:
+            self.get_logger().warn(
+                "still %+.1f deg off square after %.0f s; going ahead crooked rather "
+                "than spending the run on it"
+                % (math.degrees(self.shelf_yaw), self.square_timeout))
+            self.squaring_since = None
+            return True
+
+        twist = Twist()
+        twist.angular.z = float(np.clip(-self.hold_yaw_gain * self.shelf_yaw,
+                                        -self.hold_max_yaw, self.hold_max_yaw))
+        self.pub_cmd.publish(twist)
+        return False
 
     def _stow_right_arm(self) -> None:
         """Get the unused arm out of the shelf before planning anything.
@@ -2182,8 +2459,27 @@ class GraspNode(Node):
                 self.get_logger().error("cannot see the arm to aim the last stretch")
                 self._enter(State.FAILED)
                 return
-            remaining = float(np.linalg.norm(np.asarray(self.grasp_target) - here))
-            final = self._straight_path(start, here, self.grasp_target, steps=4)
+            # The planned reach stops IN FRONT OF the book. The servo goes in.
+            #
+            # It used to plan all the way to the grasp point, which is the book face plus
+            # 110 mm, and only then hand over -- so the servo's first correction happened
+            # with the jaws already straddling the book. That is too late to be a
+            # correction. A parallel gripper closes about its own centre line, so a jaw
+            # that arrives off centre does not miss the book, it pushes it: measured
+            # across four runs the book was shoved 148, 163, 202 and 207 mm sideways
+            # during the reach and toppled, on runs where the servo then reported itself
+            # 2 mm from the centre of wherever it had ended up.
+            #
+            # Stopping 20 mm short of the face leaves the pads 50 mm clear of it. The
+            # servo squares up there -- see _do_servo -- and only then goes in, along
+            # the one line that was always going to be safe, because it is the line the
+            # grasp is.
+            approach_end = np.asarray(self.grasp_target, dtype=float).copy()
+            if self.face_x is not None:
+                approach_end[0] = min(float(approach_end[0]),
+                                      float(self.face_x) - self.entry_clearance)
+            remaining = float(np.linalg.norm(approach_end - here))
+            final = self._straight_path(start, here, approach_end, steps=4)
             if final is None:
                 self.get_logger().error(
                     "no clear line for the last %.0f mm" % (remaining * 1000))
@@ -2193,7 +2489,11 @@ class GraspNode(Node):
             self.reach_path = final
             self.get_logger().info(
                 "at the staging point; the book moved %.0f mm while I reached, "
-                "closing the last %.0f mm" % (drifted * 1000, remaining * 1000))
+                "closing %.0f mm to a point %.0f mm in front of the book's face and "
+                "leaving the rest to the servo"
+                % (drifted * 1000, remaining * 1000,
+                   (float(self.face_x) - float(approach_end[0])) * 1000
+                   if self.face_x is not None else 0.0))
             self._start("reach", lambda: self.moveit.execute_path(CHAIN_JOINTS, final))
             return
 
@@ -2315,6 +2615,26 @@ class GraspNode(Node):
             self._report_boards()
             self._enter(State.FAILED)
             return
+
+        # Square up in front of the book before going into it.
+        #
+        # The servo used to drive straight at the target, which means it corrected
+        # sideways and forwards at the same time -- so a jaw that started off centre
+        # swept across the book's face on its way in and pushed it over. The book does
+        # not need much: 250 mm tall on a 30 mm base, a third of a newton tips it.
+        #
+        # So while the grasping frame is still in front of the face, spend the error
+        # across the shelf first and hold station in depth. Once it is inside the jaw
+        # clearance, go in. Nothing is given up by waiting: the servo re-aims from
+        # perception every tick, so time spent squaring up is time spent on a fresher
+        # fix of where the book is.
+        if (self.face_x is not None and float(here[0]) < self.face_x
+                and (abs(float(error[1])) > self.entry_lateral
+                     or abs(float(error[2])) > self.entry_height)):
+            error = np.array([0.0, float(error[1]), float(error[2])])
+            self.get_logger().info(
+                "squaring up %.0f mm sideways and %.0f mm in height before going in"
+                % (error[1] * 1000, error[2] * 1000), throttle_duration_sec=2.0)
 
         self._servo_step(target, here, error)
 
@@ -2744,8 +3064,13 @@ class GraspNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = GraspNode()
+    # Two threads, not one: see the hold's callback group. One runs the state machine,
+    # which blocks for tens of seconds at a time on planning; the other keeps the base
+    # still while it does.
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:

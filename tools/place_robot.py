@@ -17,6 +17,44 @@ import sys
 import time
 
 
+def stop_the_base():
+    """Cancel any standing cmd_vel before handing the robot to the next experiment.
+
+    A node killed with SIGKILL never publishes a stop, and the mecanum plugin keeps
+    applying the last velocity it was given -- there is no friction here to shed it. So a
+    fixture that teleports the base and says nothing about velocity hands the next run a
+    robot that is already turning. Measured: a grasp opened with the base 107 degrees off
+    square, forty seconds after being placed at yaw zero.
+
+    This does not stop a coast, which is a different thing and needs a measurement to
+    cancel (tools/stopcoast.py). It cancels a COMMAND, which is what a killed node leaves.
+    """
+    try:
+        import rclpy
+        from geometry_msgs.msg import Twist
+    except ImportError:
+        return
+    started = False
+    try:
+        rclpy.init()
+        started = True
+        node = rclpy.create_node("place_robot_stop")
+        pub = node.create_publisher(Twist, "/cmd_vel", 10)
+        for _ in range(30):
+            pub.publish(Twist())
+            rclpy.spin_once(node, timeout_sec=0.01)
+            time.sleep(0.03)
+        node.destroy_node()
+    except Exception:  # noqa: BLE001 - a fixture must not fail on its tidy-up
+        pass
+    finally:
+        if started:
+            try:
+                rclpy.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def gz(*args, timeout=25):
     return subprocess.run(["gz", *args], capture_output=True, text=True,
                           timeout=timeout).stdout
@@ -84,6 +122,8 @@ def main():
              "--timeout", "3000", "--req", request)
     print("placing in front of %s at [%.3f, %.3f], yaw 0" % (name, x, y))
     print("set_pose said: %s" % out.strip())
+
+    stop_the_base()
 
     after, rpy = pose("tiago_pro")
     if after:
