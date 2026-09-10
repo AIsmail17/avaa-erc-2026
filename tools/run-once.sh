@@ -74,6 +74,13 @@ for i in $(seq 1 12); do
   n=$(docker exec erc_sim /entrypoint.sh bash -c 'source /opt/erc_ws/install/setup.bash && timeout 10 ros2 topic hz /head_front_camera/head_front_camera/color/image_raw 2>&1 | grep -c "average rate"')
   echo "  colour frames flowing: $n"
   if [ "$n" -gt 0 ]; then ok=1; break; fi
+  # A server that has died is not going to start streaming, so say so now rather than
+  # after the rest of the tries. On 2026-09-10 the laptop's aborted 15 s in and this
+  # waited out all twelve, three and a half minutes, to report a blind simulator.
+  if ! docker exec erc_sim bash -c 'ps -eo args | grep "gz sim" | grep -qvE "^(bash|grep)"'; then
+    echo "the Gazebo server is not running; see /tmp/sim.log in the container"
+    break
+  fi
 done
 if [ "$ok" -eq 0 ]; then echo "the simulator came up blind; not launching"; exit 1; fi
 if [ "$ERC_GRASP_FIX" = "1" ] && ! docker exec erc_sim bash -c 'ps -eo args | grep -v grep | grep -q "sim_grasp_fix.py"'; then

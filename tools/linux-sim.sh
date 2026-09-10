@@ -43,7 +43,22 @@ export DISPLAY="$DISP"
 stop_all() {
     docker exec "$CONTAINER" bash -c \
         'pkill -f "[r]os2 launch erc_bringup" 2>/dev/null; pkill -f "[g]z sim" 2>/dev/null; true'
-    sleep 3
+    # Then everything else the launch started, by name, once it has had time to go --
+    # what tools/sim's stop_orphans does under WSL, and this script was not doing.
+    #
+    # Stopping only the launch and Gazebo left the rest running. On 2026-09-10 a restart
+    # on the laptop came up beside the previous simulator's three bridges, two gripper
+    # command clamps from simulators before that, and its grasp aid, which had last
+    # attached a book to the gripper. The new server aborted in DART's constraint solver
+    # within fifteen seconds of starting (a contact matrix entry at -3.3e11), leaving
+    # run-once waiting on a camera nothing fed. That the old aid caused it is likely but
+    # not shown; a restart that keeps any of it is wrong either way.
+    sleep 5
+    docker exec "$CONTAINER" bash -c '
+        ps -eo pid=,args= \
+          | grep -E "ros2 launch erc_bringup|gz sim|erc_bringup/lib/erc_bringup/|ros_gz_bridge/parameter_bridge|robot_state_publisher/robot_state_publisher" \
+          | grep -v -E "grep|bash -c" | awk "{print \$1}" | xargs -r kill -9 2>/dev/null; true'
+    sleep 1
 }
 
 ensure_container() {
