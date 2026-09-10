@@ -102,9 +102,83 @@ BOOK_ABOVE_GRIP = 0.125 + 0.045
 # points 0.72 to 0.88 m ahead and 60 mm either side, and all 25 were clear.
 RELEASE_PAST_FACE_M = 0.20
 
-# The stowed arm sits in the LiDAR plane, so returns closer than this to the base are
-# the robot seeing itself.
-SELF_FILTER_RADIUS = 0.45
+# How far forward and to the side tools/placeprobe.py has walked the placement clear, up
+# and across and down and out: 0.10 m either side from 0.72 to 1.05 m ahead, and as far
+# as 0.25 m left from 0.85 m on. Right of that the left arm reaches across the body:
+# 0.15 m right was refused at 0.85 m ahead for arm_left_3_link against torso_lift_link,
+# and 0.20 and 0.25 m right found no IK at 1.05. A release nearer the face than
+# RELEASE_MIN_PAST_FACE_M is over the wall.
+RELEASE_REACH_M = 1.05
+RELEASE_LEFT_M = 0.25
+RELEASE_RIGHT_M = 0.10
+RELEASE_MIN_PAST_FACE_M = 0.10
+
+# The front laser as mounted: base_front_laser_joint puts it at the base's front-right
+# corner, rolled half a turn and turned 45 degrees to the right. See scan_points_in_base.
+FRONT_LASER_XY = (0.27512, -0.18297)
+FRONT_LASER_YAW = -math.pi / 4.0
+
+# Half the length and width of the base's collision box in the laser plane (the URDF's
+# 0.717 x 0.497 m). A return inside it is the robot seeing itself.
+BASE_HALF_LENGTH = 0.3585
+BASE_HALF_WIDTH = 0.2485
+
+
+def scan_points_in_base(ranges, angle_min, angle_increment):
+    """Return the front laser's returns as (x, y) in base_link, leaving out the robot.
+
+    The laser does not look ahead. base_front_laser_joint puts it at the base's front-
+    right corner, rolled half a turn and turned 45 degrees right, so scan angle zero
+    points front-right and the roll mirrors the direction angles run in. The drive read
+    scan angles as bearings, so its "ahead" was a cone 28 to 62 degrees to the front
+    right, and anything within 0.45 m of the base centre was dropped as the robot seeing
+    itself. The eighteenth full run stalled for six minutes with the base's front corner
+    against a leg of the bin's table -- Gazebo put the contact on the leg's face, and the
+    laser return was 8 mm outside the base box, 47 degrees to the right -- while its log
+    read a steady 0.75 m ahead. Transforming every return, and leaving out only what
+    falls inside the base's own collision box, keeps that leg.
+    """
+    c, s = math.cos(FRONT_LASER_YAW), math.sin(FRONT_LASER_YAW)
+    points = []
+    for index, distance in enumerate(ranges):
+        if not math.isfinite(distance) or distance <= 0.0:
+            continue
+        angle = angle_min + index * angle_increment
+        # The roll turns the laser upside down, which mirrors its y.
+        lx, ly = distance * math.cos(angle), -distance * math.sin(angle)
+        x = FRONT_LASER_XY[0] + c * lx - s * ly
+        y = FRONT_LASER_XY[1] + s * lx + c * ly
+        if abs(x) <= BASE_HALF_LENGTH and abs(y) <= BASE_HALF_WIDTH:
+            continue
+        points.append((x, y))
+    return points
+
+
+def base_gap(x, y):
+    """Return how far a point in base_link lies outside the base's collision box."""
+    return math.hypot(max(0.0, abs(x) - BASE_HALF_LENGTH), max(0.0, abs(y) - BASE_HALF_WIDTH))
+
+
+def front_clearance(points):
+    """Return (room ahead of the bumper, nearest gap to the front half of the base).
+
+    The first is how far the base can drive straight on before its front face meets
+    something in its path; the second is the smallest gap from the base box to anything
+    ahead of its centre line, beside a front corner included, which is what a base that
+    is also turning runs into. Either is None when nothing of that kind is in view.
+    """
+    ahead = None
+    nearest = None
+    for x, y in points:
+        if x <= 0.0:
+            continue
+        if abs(y) <= BASE_HALF_WIDTH and x > BASE_HALF_LENGTH:
+            room = x - BASE_HALF_LENGTH
+            ahead = room if ahead is None else min(ahead, room)
+        gap = base_gap(x, y)
+        nearest = gap if nearest is None else min(nearest, gap)
+    return ahead, nearest
+
 
 SENSOR_QOS = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                         durability=QoSDurabilityPolicy.VOLATILE,
@@ -134,7 +208,12 @@ class DeliverNode(Node):
         # only lateral control is turning, and turning can only put a target dead ahead.
         # The arm crosses the 159 mm to the shoulder centre line instead, which is what
         # it already does for a book centred on the base.
-        self.declare_parameter("standoff_m", 0.60)
+        # The bin's measured face this far ahead. It was 0.60, and from there the base's
+        # front corners reach the legs of the bin's table on any approach that is not
+        # square to it (see scan_points_in_base). The placement reaches 1.05 m
+        # (RELEASE_REACH_M), so standing 0.15 m further back still puts the book
+        # RELEASE_PAST_FACE_M past the face.
+        self.declare_parameter("standoff_m", 0.75)
         self.declare_parameter("standoff_tol_m", 0.05)
         self.declare_parameter("bearing_tol_rad", 0.05)
         # Beyond this the drive turns in place; inside it, it drives and steers at once.
@@ -157,7 +236,10 @@ class DeliverNode(Node):
         self.declare_parameter("bin_fresh_sec", 2.0)
         self.declare_parameter("seek_timeout_sec", 90.0)
         self.declare_parameter("drive_timeout_sec", 180.0)
-        self.declare_parameter("obstacle_stop_m", 0.30)
+        # Stop driving forward with this little room ahead of the bumper, or this little
+        # beside the base's front half. Both measured from the base's collision box.
+        self.declare_parameter("obstacle_stop_m", 0.10)
+        self.declare_parameter("corner_stop_m", 0.08)
         self.declare_parameter("auto_start", True)
         # Empty means start as soon as the joints are known, which is how
         # the delivery is exercised on its own. The mission sets it to
@@ -206,6 +288,7 @@ class DeliverNode(Node):
         self.seek_timeout = float(self.get_parameter("seek_timeout_sec").value)
         self.drive_timeout = float(self.get_parameter("drive_timeout_sec").value)
         self.obstacle_stop = float(self.get_parameter("obstacle_stop_m").value)
+        self.corner_stop = float(self.get_parameter("corner_stop_m").value)
         self.search_tilt = float(self.get_parameter("search_tilt_rad").value)
         self.hold_base_hz = float(self.get_parameter("hold_base_hz").value)
         self.start_phase = str(self.get_parameter("start_phase").value)
@@ -336,20 +419,12 @@ class DeliverNode(Node):
         values = self._current_joints()
         return None if values is None else self.chain.position(values)
 
-    def _range_ahead(self) -> Optional[float]:
-        """Find the nearest return in a narrow cone ahead, ignoring the robot itself."""
+    def _front_clearance(self):
+        """Give (room ahead of the bumper, nearest gap beside the base), or Nones."""
         if not self.scan_ranges:
-            return None
-        nearest = None
-        for index, distance in enumerate(self.scan_ranges):
-            if not math.isfinite(distance) or distance < SELF_FILTER_RADIUS:
-                continue
-            angle = self.scan_angle_min + index * self.scan_angle_inc
-            if abs(angle) > 0.30:
-                continue
-            if nearest is None or distance < nearest:
-                nearest = distance
-        return nearest
+            return None, None
+        return front_clearance(scan_points_in_base(
+            self.scan_ranges, self.scan_angle_min, self.scan_angle_inc))
 
     def _aim_head(self, tilt: float, period: float = 1.0) -> None:
         """Point the head down at the bin, re-asserted slowly rather than every tick."""
@@ -665,13 +740,15 @@ class DeliverNode(Node):
         # steady -29 degree bearing through four drives, turned towards nothing, and
         # ended beside the shelf's end -- and the log could not say whether a turn was
         # being commanded, or commanded and blocked.
-        ahead_now = self._range_ahead()
+        ahead_now, nearest_now = self._front_clearance()
         self.get_logger().info(
             "driving: bin %.2f m ahead, %+.0f mm aside (bearing %+.1f deg), %d fresh "
-            "sighting(s); last command vx %+.3f wz %+.3f; %s ahead"
+            "sighting(s); last command vx %+.3f wz %+.3f; room ahead of the bumper %s, "
+            "nearest thing beside the base %s"
             % (float(target[0]), float(target[1]) * 1000, math.degrees(bearing),
                len(self.bin_points), self.last_drive_cmd[0], self.last_drive_cmd[1],
-               "%.2f m" % ahead_now if ahead_now is not None else "nothing"),
+               "%.2f m" % ahead_now if ahead_now is not None else "clear",
+               "%.2f m" % nearest_now if nearest_now is not None else "clear"),
             throttle_duration_sec=2.0)
 
         # Steer and drive together while roughly lined up; turn in place only when far off.
@@ -704,12 +781,30 @@ class DeliverNode(Node):
             self.last_drive_cmd = (command.linear.x, command.angular.z)
             return
         if abs(range_error) > self.standoff_tol:
-            ahead = self._range_ahead()
-            if range_error > 0 and ahead is not None and ahead < self.obstacle_stop:
-                self.get_logger().warn(
-                    "something is %.2f m ahead, closer than the bin at %.2f m; "
-                    "stopping here" % (ahead, target[0]))
+            ahead, nearest = self._front_clearance()
+            blocked = ((ahead is not None and ahead < self.obstacle_stop)
+                       or (nearest is not None and nearest < self.corner_stop))
+            if range_error > 0 and blocked:
+                # Pushing on does nothing but hold the base against it: the eighteenth
+                # full run spent six minutes like that. Place from here if the placement
+                # reaches (RELEASE_REACH_M, RELEASE_LEFT_M, RELEASE_RIGHT_M), and say so
+                # if it does not.
                 self._stop()
+                reachable = (float(target[0]) + RELEASE_MIN_PAST_FACE_M <= RELEASE_REACH_M
+                             and -RELEASE_RIGHT_M <= float(target[1]) <= RELEASE_LEFT_M)
+                room = ("%s ahead of the bumper and %s beside the base" % (
+                    "%.2f m" % ahead if ahead is not None else "nothing",
+                    "%.2f m" % nearest if nearest is not None else "nothing"))
+                if not reachable:
+                    self.get_logger().error(
+                        "blocked with %s, and the bin at %.2f m, %+.0f mm aside, is out of "
+                        "the placement's reach from here"
+                        % (room, target[0], target[1] * 1000))
+                    self._enter(State.FAILED)
+                    return
+                self.get_logger().warn(
+                    "blocked with %s, short of the standoff; placing from here with the "
+                    "bin at %.2f m, %+.0f mm aside" % (room, target[0], target[1] * 1000))
                 self._enter(State.ABOVE)
                 self._plan_above(target)
                 return
@@ -758,7 +853,8 @@ class DeliverNode(Node):
         # High enough that the foot of the book clears the rim on the way across, and past
         # the face perception measures to over the middle of the bin: RELEASE_PAST_FACE_M.
         lift_z = rim + BOOK_BELOW_GRIP + self.rim_clearance
-        above = np.array([float(target[0]) + RELEASE_PAST_FACE_M, float(target[1]), lift_z])
+        release_x = min(float(target[0]) + RELEASE_PAST_FACE_M, RELEASE_REACH_M)
+        above = np.array([release_x, float(target[1]), lift_z])
         self.above_point = above
         self._start_holding()
         up = np.array([float(here[0]), float(here[1]), lift_z])
