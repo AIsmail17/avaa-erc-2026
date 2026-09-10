@@ -5,7 +5,8 @@ import math
 import pytest
 
 from avaa_solution.deliver_node import (BASE_HALF_LENGTH, BASE_HALF_WIDTH, FRONT_LASER_XY,
-                                        base_gap, front_clearance, scan_points_in_base)
+                                        base_gap, blocked_by, front_clearance,
+                                        scan_points_in_base)
 
 START = math.radians(-134.0)
 STEP = math.radians(1.0)
@@ -56,3 +57,21 @@ def test_what_is_behind_the_base_is_not_in_its_way():
 def test_base_gap_is_zero_inside_and_straight_line_off_a_corner():
     assert base_gap(0.0, 0.0) == 0.0
     assert base_gap(BASE_HALF_LENGTH + 0.03, BASE_HALF_WIDTH + 0.04) == pytest.approx(0.05)
+
+
+def test_something_beside_the_base_far_from_the_bin_does_not_stop_it():
+    # The nineteenth full run: 1.40 m clear ahead, 0.08 m beside, the bin 1.00 m away.
+    assert not blocked_by(1.40, 0.075, 1.00, 0.10, 0.08)
+
+
+def test_a_table_leg_beside_the_corner_near_the_bin_stops_it():
+    # The eighteenth full run: the leg 8 mm beside the front corner, the bin 0.76 m away.
+    assert blocked_by(None, 0.008, 0.76, 0.10, 0.08)
+
+
+def test_something_in_the_path_stops_it_anywhere():
+    assert blocked_by(0.05, 0.05, 2.50, 0.10, 0.08)
+
+
+def test_nothing_in_view_does_not_stop_it():
+    assert not blocked_by(None, None, 0.80, 0.10, 0.08)

@@ -180,6 +180,21 @@ def front_clearance(points):
     return ahead, nearest
 
 
+def blocked_by(ahead, nearest, face_x, obstacle_stop, corner_stop):
+    """Return whether the drive to the bin should stop going forward.
+
+    Something in the base's path stops it anywhere. Something beside a front corner
+    stops it only once the bin is close enough to place from, where that something is
+    the legs of the bin's table (see scan_points_in_base). Further out, driving on takes
+    the base past whatever is beside it: the nineteenth full run, leaving the shelf after
+    its grasp, found something 0.08 m beside the base with 1.40 m clear ahead and the bin
+    1.00 m off, and gave up on the spot.
+    """
+    near_bin = face_x + RELEASE_MIN_PAST_FACE_M <= RELEASE_REACH_M
+    return bool((ahead is not None and ahead < obstacle_stop)
+                or (near_bin and nearest is not None and nearest < corner_stop))
+
+
 SENSOR_QOS = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                         durability=QoSDurabilityPolicy.VOLATILE,
                         history=QoSHistoryPolicy.KEEP_LAST, depth=1)
@@ -782,8 +797,8 @@ class DeliverNode(Node):
             return
         if abs(range_error) > self.standoff_tol:
             ahead, nearest = self._front_clearance()
-            blocked = ((ahead is not None and ahead < self.obstacle_stop)
-                       or (nearest is not None and nearest < self.corner_stop))
+            blocked = blocked_by(ahead, nearest, float(target[0]),
+                                 self.obstacle_stop, self.corner_stop)
             if range_error > 0 and blocked:
                 # Pushing on does nothing but hold the base against it: the eighteenth
                 # full run spent six minutes like that. Place from here if the placement
