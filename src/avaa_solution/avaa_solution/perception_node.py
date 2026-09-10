@@ -1106,6 +1106,22 @@ class PerceptionNode(Node):
         self.height_rejects = 0
 
         msg.point.x, msg.point.y, msg.point.z = (float(v) for v in point)
+        # At close range, say what the box looked like as well as where it put the book.
+        #
+        # The seventh and ninth full runs both ended with the jaws closing a hundred
+        # millimetres beside a book that had been pushed 57 to 58 mm deeper into the
+        # shelf, after a servo whose last sightings moved the target only ten or so
+        # millimetres. One explanation is the gripper covering part of the book as it
+        # closes in, so the visible red box -- and its centre -- slides sideways and the
+        # servo follows it. If so, the box narrows and its centre moves as the range
+        # falls, and this line will show it.
+        if float(point[0]) < 1.0:
+            self.get_logger().info(
+                "close fix: box x %d w %d h %d px, centre %.0f px; book at x %.3f y %+.3f "
+                "z %.3f in base_link"
+                % (target.x, target.w, target.h, target.cx,
+                   float(point[0]), float(point[1]), float(point[2])),
+                throttle_duration_sec=0.5)
         self.pub_book_point.publish(msg)
         self.last_book_range = float(point[0])
         return True

@@ -127,6 +127,9 @@ class DeliverNode(Node):
         self.declare_parameter("bearing_tol_rad", 0.05)
         # Beyond this the drive turns in place; inside it, it drives and steers at once.
         self.declare_parameter("turn_in_place_rad", 0.35)
+        # Bearing gain and top turn rate while driving to the bin. See _do_drive.
+        self.declare_parameter("drive_turn_gain", 0.8)
+        self.declare_parameter("drive_turn_speed", 0.18)
         self.declare_parameter("drive_speed", 0.12)
         self.declare_parameter("turn_speed", 0.35)
         self.declare_parameter("seek_speed", 0.35)
@@ -174,6 +177,8 @@ class DeliverNode(Node):
         self.bearing_tol = float(self.get_parameter("bearing_tol_rad").value)
         self.turn_in_place_rad = float(
             self.get_parameter("turn_in_place_rad").value)
+        self.drive_turn_gain = float(self.get_parameter("drive_turn_gain").value)
+        self.drive_turn_speed = float(self.get_parameter("drive_turn_speed").value)
         self.drive_speed = float(self.get_parameter("drive_speed").value)
         self.turn_speed = float(self.get_parameter("turn_speed").value)
         self.seek_speed = float(self.get_parameter("seek_speed").value)
@@ -208,6 +213,8 @@ class DeliverNode(Node):
         self.bin_stamps = deque(maxlen=9)
         # How many times the drive has lost the bin and gone back to looking for it.
         self.reseeks = 0
+        # The last command _do_drive published, for its own log line.
+        self.last_drive_cmd = (0.0, 0.0)
         self.bin_point: Optional[np.ndarray] = None
         self.bin_at = None
 
@@ -613,10 +620,17 @@ class DeliverNode(Node):
         # What the drive is working from, every two seconds. It logged nothing between
         # entering and leaving DRIVE, so the seventh full run lost the bin four times and
         # left no record of the bearing, the range or the command at any point.
+        # The command sent and the forward clearance, because the ninth full run held a
+        # steady -29 degree bearing through four drives, turned towards nothing, and
+        # ended beside the shelf's end -- and the log could not say whether a turn was
+        # being commanded, or commanded and blocked.
+        ahead_now = self._range_ahead()
         self.get_logger().info(
             "driving: bin %.2f m ahead, %+.0f mm aside (bearing %+.1f deg), %d fresh "
-            "sighting(s)" % (float(target[0]), float(target[1]) * 1000,
-                             math.degrees(bearing), len(self.bin_points)),
+            "sighting(s); last command vx %+.3f wz %+.3f; %s ahead"
+            % (float(target[0]), float(target[1]) * 1000, math.degrees(bearing),
+               len(self.bin_points), self.last_drive_cmd[0], self.last_drive_cmd[1],
+               "%.2f m" % ahead_now if ahead_now is not None else "nothing"),
             throttle_duration_sec=2.0)
 
         # Steer and drive together while roughly lined up; turn in place only when far off.
@@ -630,11 +644,23 @@ class DeliverNode(Node):
         # the side to 1.64 m and 0.36 m before the drive timed out. Driving with a
         # proportional turn converges instead of oscillating; the tight bearing is still
         # required before settling at the standoff.
+        # Turned gently, because turning hard made it oscillate.
+        #
+        # The drive used a gain of 2 on the bearing, clipped at 0.35 rad/s. Beyond the
+        # 20 degree turn-in-place threshold that is always the clip, and with sightings
+        # arriving a second or two apart and a base that keeps turning when told to
+        # stop, it swung past the bin every time. Measured 2026-09-10, the ninth full run:
+        # the bearing alternated +22, -20, +22, -20, +23 degrees about every eight seconds
+        # at a steady 3.1 m, every sighting the same 580 x 260 mm object, and the range
+        # never closed. A gain under one and a lower clip turn it at a rate the sightings
+        # can keep up with.
         if abs(bearing) > self.turn_in_place_rad:
             command = Twist()
-            command.angular.z = float(np.clip(2.0 * bearing,
-                                              -self.turn_speed, self.turn_speed))
+            command.angular.z = float(np.clip(self.drive_turn_gain * bearing,
+                                              -self.drive_turn_speed,
+                                              self.drive_turn_speed))
             self.pub_cmd.publish(command)
+            self.last_drive_cmd = (command.linear.x, command.angular.z)
             return
         if abs(range_error) > self.standoff_tol:
             ahead = self._range_ahead()
@@ -649,15 +675,19 @@ class DeliverNode(Node):
             command = Twist()
             speed = float(np.clip(0.6 * range_error, -self.drive_speed, self.drive_speed))
             command.linear.x = speed * max(0.0, math.cos(bearing))
-            command.angular.z = float(np.clip(2.0 * bearing,
-                                              -self.turn_speed, self.turn_speed))
+            command.angular.z = float(np.clip(self.drive_turn_gain * bearing,
+                                              -self.drive_turn_speed,
+                                              self.drive_turn_speed))
             self.pub_cmd.publish(command)
+            self.last_drive_cmd = (command.linear.x, command.angular.z)
             return
         if abs(bearing) > self.bearing_tol:
             command = Twist()
-            command.angular.z = float(np.clip(2.0 * bearing,
-                                              -self.turn_speed, self.turn_speed))
+            command.angular.z = float(np.clip(self.drive_turn_gain * bearing,
+                                              -self.drive_turn_speed,
+                                              self.drive_turn_speed))
             self.pub_cmd.publish(command)
+            self.last_drive_cmd = (command.linear.x, command.angular.z)
             return
 
         self._stop()
