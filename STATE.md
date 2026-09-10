@@ -103,7 +103,7 @@ Use `tools/drift.py` (per simulated second, prints the RTF beside the answer) an
 | Approach — end to end | ✅ 2026-09-08: **three consecutive clean runs, 53.4 / 56.3 / 61.9 s** to hand-over |
 | Arm kinematics + IK | ✅ exact to 0.7 mm; holds all four rows to within 6 mm in open air |
 | Grasp — reach and servo | ✅ reaches into the shelf, clamps, lifts, hands over to delivery |
-| Grasp — actually holding it | ⚠️ the jaws now close **on the book** — 2026-09-10, after the row heights were corrected. It is still not carried: the base drifts out of position first |
+| Grasp — actually holding it | ✅ **2026-09-10: the book comes off the shelf.** Two runs in a row, the servo arriving 1 and 2 mm off the book's centre line and the grasp aid taking it at 65 and 84 mm. Carried 1.27 m and stowed |
 | Place in bin | ⚠️ **written, never run with a book in the gripper** |
 | Video (D2) | ❌ not started |
 | Report (D3) | ❌ not started |
@@ -210,7 +210,57 @@ Note why it works where `hold_base.py`'s damping term failed. That one differenc
 over a 1.5 s loop and oscillated out to 503 mm — derivative feedback through a long delay
 doing exactly what that predicts. The IMU has no delay.
 
-## 2026-09-10 — what is left, and it is one thing
+## 2026-09-10 — the book comes off the shelf
+
+Two runs in a row, end to end, `idle` through `done`:
+
+```
+square to the shelf at -1.2 deg after 2.2 s
+at the staging point; ... closing to a point 20 mm in front of the book's face
+    and leaving the rest to the servo
+squaring up 65 mm sideways and 2 mm in height before going in
+servo is on the book (-0 mm depth, +2 mm sideways, +0 mm height) after 3.8 s; clamping
+sim_grasp_fix: picked up book_col_3_row_4_blue, 84 mm from the grasping link
+...
+the book moved 1271 mm during the run
+```
+
+What it took, beyond the 110 mm row-height correction above, is in the commit
+`f628166` and summarised here because three of the four are traps rather than tuning:
+
+* **A killed node leaves a standing `cmd_vel`.** Nothing damps this base, so every run
+  inherited whatever the last one was doing when it was killed — one grasp opened with
+  the base 107.4 degrees off square, forty seconds after being teleported to yaw zero.
+  `tools/stopbase.py`, and `place_robot.py` now does it as part of placing.
+* **Square the base BEFORE latching the target.** Everything the grasp holds is measured
+  in base_link at the moment the target is planned, so squaring up afterwards swings all
+  of it — 90 mm for a book 0.72 m out through 7 degrees — and the hold's angular and
+  linear channels then fight each other.
+* **The reach used to stop *inside* the book.** It planned all the way to the face plus
+  110 mm and only then handed to the servo, so the first lateral correction happened with
+  the jaws already straddling the book. A parallel gripper closes about its own centre
+  line: a jaw that arrives off centre does not miss, it pushes. Measured across four runs
+  the book was shoved 148, 163, 202 and 207 mm sideways and toppled. It now stops 20 mm
+  in front of the face and the servo squares up there before advancing in depth at all.
+* **The base hold was starved by its own executor.** `_tick` blocks for tens of seconds
+  on planning, so on one thread the 20 Hz hold timer never fired — one `hold:` line in a
+  whole posture search, and the base 500 mm out by the end of it. The hold and its inputs
+  now have their own callback groups under a `MultiThreadedExecutor`. That works for the
+  waits, which are sleeps; it cannot work for the posture search, which is Python holding
+  the GIL, so that gets a wall-clock budget instead.
+
+### Still to do on it
+
+* The place into the bin has never run with a book in the gripper. It is written, and the
+  bin rim was 110 mm low until today.
+* The whole grasp takes about 85 simulated seconds, most of it MoveIt planning rather
+  than moving. Against a 3–8 mm/s drift that is the margin being spent.
+* Perception has not been re-run since the height cross-check was allowed to overrule the
+  marker row. Every grasp above was fed from ground truth by `tools/arenafeed.py`.
+
+---
+
+## 2026-09-10 — what was left, and it was one thing
 
 **The base's linear coast.** ~3 to 8 mm per simulated second, on one heading, forever, and
 the arm makes no difference to it (`tools/holdwhilereaching.py`: 8.0 mm/s arm still,

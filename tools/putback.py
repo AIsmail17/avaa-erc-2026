@@ -36,6 +36,59 @@ PITCH = math.pi / 2.0
 JITTER = 0.25
 
 
+def release_whatever_is_held():
+    """Tell the simulation grasp aid to let go before anything is teleported.
+
+    sim_grasp_fix holds a picked-up book by setting its pose to follow the gripper, at
+    5 Hz, until it sees an OPEN gripper command. It is launched once with the simulator
+    and outlives every run, so after a successful pick the book stays welded to the arm
+    across runs -- and a teleport into it is overwritten a fifth of a second later.
+
+    That is exactly what happened on the first run after the first successful pick: this
+    tool reported the book placed, and the next grasp then failed in its posture search
+    because the book it was aiming at was 1.6 m away, riding on the gripper.
+
+    The aid takes anything above 0.040 as opening. It listens on both the public topic
+    and the raw one, so publishing to either is enough; publishing to both costs nothing
+    and does not depend on which one the solution happens to use this week.
+    """
+    try:
+        import rclpy
+        from builtin_interfaces.msg import Duration
+        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    except ImportError:
+        return
+    started = False
+    try:
+        rclpy.init()
+        started = True
+        node = rclpy.create_node("putback_release")
+        pubs = [node.create_publisher(JointTrajectory, topic, 10) for topic in (
+            "/gripper_left_controller/joint_trajectory",
+            "/gripper_left_controller_raw/joint_trajectory")]
+        traj = JointTrajectory()
+        traj.joint_names = ["gripper_left_finger_joint"]
+        point = JointTrajectoryPoint()
+        point.positions = [0.052]
+        point.time_from_start = Duration(sec=1)
+        traj.points = [point]
+        for _ in range(12):
+            for pub in pubs:
+                pub.publish(traj)
+            rclpy.spin_once(node, timeout_sec=0.01)
+            time.sleep(0.05)
+        node.destroy_node()
+        print("asked the grasp aid to let go of anything it is holding")
+    except Exception as exc:  # noqa: BLE001 - a fixture must not fail on its tidy-up
+        print("could not send the release (%s)" % exc)
+    finally:
+        if started:
+            try:
+                rclpy.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def gz(*args, timeout=20):
     try:
         return subprocess.run(["gz", *args], capture_output=True, text=True,
@@ -107,6 +160,9 @@ def main():
         plan[name] = where
     if not plan:
         return 1
+
+    release_whatever_is_held()
+    time.sleep(1.0)
 
     print("standing %d book(s) back up%s"
           % (len(plan), ", with fresh sideways jitter" if jitter else ""))
