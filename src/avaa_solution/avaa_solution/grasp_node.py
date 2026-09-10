@@ -276,6 +276,45 @@ BOOK_SCENE_PAD_M = 0.020
 # the chain: arm_left_1 sits at z = 0.677 + torso.
 SHOULDER_BASE_Z = 0.677
 
+# The torso height each row is reached into with, keyed by the row's pre-grasp height in
+# base_link (the row height less grasp_below_centre_m). Measured, not derived: no formula
+# in the target height fits it, because what refuses a posture is the upper arm folding
+# into the torso column, and that depends on the torso and the target together.
+#
+# What this replaced aimed the shoulder 0.25 m above the target, clipped to the torso's
+# 0.35 m of travel, while the posture cost pulled towards the shoulder LEVEL with it. The
+# top two rows clip to 0.35 either way and are fine there. Row 3 was the one row where the
+# two disagreed -- 0.35 +/- 0.10 against 0.119 -- and tools/torsotest.py accepted 0 of 6
+# postures asked for the way the node asked. The thirteenth full run's six tries for row 3
+# were all refused for torso_base_link against arm_left_3_link and arm_left_4_link.
+#
+# tools/torsomap.py (the robot alone) and tools/shelftorso.py (with _add_shelf's boxes in
+# the scene, at book faces of 0.705 and 0.741) make the posture search's IK call at each
+# row's pre-grasp and 30 mm either side, put every answer to /check_state_validity, and
+# walk each accepted one into the shelf as _reach_clearance does. Torsos accepted and
+# walked all the way in, in every cell measured:
+#
+#     row  pre-grasp z  accepted everywhere            was pinned   now
+#      1     1.456      0.25 to 0.35 (robot alone)     0.35         0.35
+#      2     1.126      0.00 to 0.35 (robot alone)     0.35         0.35
+#      3     0.796      0.00 and 0.05                  0.35         0.02
+#      4     0.466      0.25 to 0.35                   0.01-0.07    0.30
+#
+# Row 4 at the torsos nearest its old pin had nothing accepted in four of the six cells
+# with the shelf in.
+TORSO_FOR_HEIGHT = ((1.456, 0.35), (1.126, 0.35), (0.796, 0.02), (0.466, 0.30))
+
+# How far the solver may move the torso from the table. The maps were made at 0.03. The
+# old 0.10 would let row 3 wander up to 0.12, past 0.10, which was already refused in half
+# the cells with the shelf in.
+TORSO_SLACK = 0.03
+
+
+def torso_for_height(height: float) -> float:
+    """Return the measured torso for the row whose pre-grasp height is nearest this one."""
+    return min(TORSO_FOR_HEIGHT, key=lambda entry: abs(entry[0] - height))[1]
+
+
 # The greatest distance the gripper can get from the shoulder, in metres. Measured
 # rather than derived -- the link offsets are not collinear, so the sum of the link
 # lengths is an upper bound the arm cannot attain -- by sampling four thousand postures
@@ -1715,53 +1754,31 @@ class GraspNode(Node):
         return best[1]
 
     def _torso_for(self, height: float) -> dict:
-        """Pin the torso so the shoulder sits level with the target.
+        """Pin the torso to the height measured for the row being reached into.
 
-        The torso lift is rated 2000 N and the arm joints 26 Nm, so every centimetre of
-        height the arm provides instead of the torso is bought at the wrong end of the
-        robot. Reaching for a book at z=1.061 with the torso left free, the solver chose
-        0.10 and stretched the arm up nearly a metre; the arm then sagged half a metre
-        short with arm_left_3 over a radian out.
+        See TORSO_FOR_HEIGHT for the measurements. Everything that solves along one reach
+        comes here -- the raise before it, the posture search, the re-aim and the
+        straight-line walks -- and it has to be one answer for all of them: a walk pinned
+        somewhere other than where its posture was found starts with the torso jumping
+        away from it.
 
-        The shoulder is aimed ABOVE the target rather than level with it, so the arm
-        reaches down. Level was the first guess and it is wrong twice over: with the
-        wrist held to reach into a shelf there is often no level solution at all, and
-        where there is one the arm is holding its own weight out horizontally. Reaching
-        down puts gravity on the same side as the motion. Asked freely, the solver picks
-        exactly this: for a row at z=0.731 it settles on a torso of 0.304, a quarter of a
-        metre above the book.
-
-        The slack lets it trade a little height for reach, without handing the whole job
-        back to the arm.
-
-        On the top two rows none of that applies, and it is worth being plain about it
-        rather than leaving the paragraph above to imply otherwise. The torso tops out
-        at 0.35 m, which puts the shoulder at 1.027; row 2 sits at 1.061 and row 1 at
-        1.391, so the clip binds and the arm reaches UP by 34 mm and 319 mm rather than
-        down. There is nothing to be done about that -- it is the length of the torso --
-        and it is not the disaster it sounds: measured with tools/sagcheck.py, the arm
-        holds a 0.935 m reach to the top row within 3 mm, and 0.97 m within 1 mm.
+        The torso lift is rated 2000 N and the arm joints 26 Nm, which is why there is a
+        pin at all: left free, reaching for a book at z=1.061, the solver chose 0.10 and
+        stretched the arm up nearly a metre, and the arm then sagged half a metre short.
         """
-        ideal = float(np.clip(height - SHOULDER_BASE_Z + 0.25, 0.0, 0.35))
-        return {"torso_lift_joint": (ideal, 0.10)}
+        return {"torso_lift_joint": (torso_for_height(height), TORSO_SLACK)}
 
     def _posture_cost(self, height: float):
-        """Prefer postures that get their height from the torso, not from the arm.
+        """Prefer the pinned torso, and joints kept off their stops.
 
-        The torso lift is rated 2000 N and the arm joints 26 Nm, so every centimetre of
-        height the arm provides instead of the torso is bought at the wrong end of the
-        robot. Nothing was expressing that: solving for a book at z=1.061 the IK picked a
-        torso of 0.10 and stretched the arm up nearly a metre, and the arm then sagged
-        half a metre short of the target with arm_left_3 over a radian out.
-
-        The ideal torso puts the shoulder level with the target, so the arm reaches
-        horizontally and holds almost nothing. Where that is outside the torso range the
-        cost simply pulls as far that way as it goes.
+        The torso term used to pull towards the shoulder level with the target while the
+        pin held it higher. On row 3 that was 0.119 against 0.35 +/- 0.10, and the maps
+        refuse row 3 almost everywhere from 0.10 up. It now pulls to the pin's own torso.
         """
-        ideal = float(np.clip(height - SHOULDER_BASE_Z, 0.0, 0.35))
+        ideal = torso_for_height(height)
 
         def cost(values):
-            # Dominant: use the strong joint for height.
+            # Dominant: stay at the torso measured for this row.
             torso = abs(float(values[0]) - ideal)
             # Mild: keep the elbow off its stops, which is where it sags onto.
             crowding = sum(max(0.0, 0.20 - min(v - lo, hi - v))
