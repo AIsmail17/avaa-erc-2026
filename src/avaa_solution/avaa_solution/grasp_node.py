@@ -247,6 +247,10 @@ PADS_BEHIND_GRASP_M = 0.030
 # then seven. A book 30 x 160 mm turned seven degrees is 49 mm across the jaws' 65.
 WRIST_GOING_IN = (0.07, 0.12)
 
+# How much to pad the book's box in the planning scene during the pre-grasp motion. The
+# pre-grasp sits 150 mm in front of the face, so 20 mm leaves it well clear.
+BOOK_SCENE_PAD_M = 0.020
+
 # Height of the left shoulder above base_link when the torso is fully down, measured from
 # the chain: arm_left_1 sits at z = 0.677 + torso.
 SHOULDER_BASE_Z = 0.677
@@ -2441,6 +2445,7 @@ class GraspNode(Node):
                 "the re-aimed pre-grasp is not collision free; keeping the planned one")
 
         self._enter(State.PREGRASP)
+        self._add_book_to_scene()
         self._start("pre-grasp", lambda: self.moveit.move_to_joints(
             CHAIN_JOINTS, self.pre_solution, timeout=240.0))
 
@@ -2480,7 +2485,46 @@ class GraspNode(Node):
             "at the pre-grasp (%s); opening the gripper" % self._miss(self.pre_target))
         self._send_gripper(GRIPPER_OPEN)
         self.open_at = self.get_clock().now()
+        self._remove_book_from_scene()
         self._enter(State.OPEN)
+
+    def _add_book_to_scene(self) -> None:
+        """Put the target book in the planning scene, padded, for the pre-grasp motion.
+
+        The shelf boards are in the scene; the book never was, because the grasp has to
+        touch it and MoveIt refuses a goal in collision. That is right for the reach in
+        and wrong for the swing out to the pre-grasp, which the planner was then free to
+        route straight through the book. Measured 2026-09-10, the eleventh full run, on
+        the bottom row: the pre-grasp motion ran from 209.3 to 247.8 s, perception lost
+        the upright book at about 235 s, and at 242.4 s it saw a 264 x 153 mm red slab
+        at 0.91 m -- the book lying flat -- before the jaws had even opened.
+
+        Only for that motion. The posture search walks each candidate straight in to
+        the grasp target and checks the path against the scene, which would refuse every
+        posture with the book in it; and the reach in removes the shelf anyway.
+        """
+        if self.row is None or self.face_x is None or self.grasp_target is None:
+            return
+        height = row_to_height(self.row, self.row_heights, self.rows_top_down)
+        if height is None:
+            return
+        pad = BOOK_SCENE_PAD_M
+        centre = (float(self.face_x) + arena.BOOK_DEPTH / 2.0,
+                  float(self.grasp_target[1]), float(height))
+        size = (arena.BOOK_DEPTH + 2.0 * pad, arena.BOOK_WIDTH + 2.0 * pad,
+                arena.BOOK_HEIGHT + 2.0 * pad)
+        if self.moveit.add_box("target_book", "base_link", centre, size):
+            self.get_logger().info(
+                "the book is in the planning scene at %s for the pre-grasp motion"
+                % np.round(centre, 3).tolist())
+        else:
+            self.get_logger().warn(
+                "could not put the book in the planning scene; the pre-grasp motion is "
+                "not protected from it")
+
+    def _remove_book_from_scene(self) -> None:
+        """Take the target book back out of the planning scene."""
+        self.moveit.remove_object("target_book")
 
     def _clear_shelf(self) -> None:
         """Take the shelf out of the planning scene, now that the arm is at the opening.
@@ -2508,6 +2552,7 @@ class GraspNode(Node):
         for index in range(len(self.row_heights)):
             self.moveit.remove_object("shelf_board_%d" % index)
         self.moveit.remove_object("shelf_back")
+        self._remove_book_from_scene()
         self.get_logger().info(
             "shelf removed from the planning scene; the reach in is checked waypoint by "
             "waypoint from here")
@@ -2804,16 +2849,23 @@ class GraspNode(Node):
         # entry_finger_margin short of the face. If they still need to move sideways once
         # they are closer than that, but before the pads have reached the face, they back
         # straight out in depth first -- never sideways with a finger against the book.
-        off_line = (abs(float(error[1])) > self.entry_lateral
-                    or abs(float(error[2])) > self.entry_height)
-        if self.face_x is not None and off_line:
+        off_line = abs(float(error[1])) > self.entry_lateral
+        off_height = abs(float(error[2])) > self.entry_height
+        if self.face_x is not None and (off_line or off_height):
             clear_line = float(self.face_x) - self.entry_finger_margin
             if float(here[0]) < clear_line:
                 error = np.array([0.0, float(error[1]), float(error[2])])
                 self.get_logger().info(
                     "squaring up %.0f mm sideways and %.0f mm in height before going in"
                     % (error[1] * 1000, error[2] * 1000), throttle_duration_sec=2.0)
-            elif float(here[0]) < float(self.face_x) + PADS_BEHIND_GRASP_M:
+            elif off_line and float(here[0]) < float(self.face_x) + PADS_BEHIND_GRASP_M:
+                # Back out only for SIDEWAYS error. It is a finger moving across the book
+                # that pushes it over; a finger moving up or down the face of a book 250 mm
+                # tall does not. This backed out for height as well, and on the bottom row
+                # the arm sags as it extends, so the eleventh full run (2026-09-10) went
+                # round and round for 90 s -- squaring up 17, 14, 18, 12, 23 and 43 mm in
+                # height, never more than 7 mm sideways, backing out each time -- until the
+                # servo timed out. Height is now corrected on the way in.
                 error = np.array([clear_line - float(here[0]), 0.0, 0.0])
                 self.get_logger().warn(
                     "%.0f mm off the book's line with the fingers at its face; backing "
