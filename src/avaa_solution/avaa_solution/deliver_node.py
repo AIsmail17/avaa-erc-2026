@@ -90,6 +90,18 @@ GRIPPER_RELEASE = 0.052
 BOOK_BELOW_GRIP = 0.125 - 0.045
 BOOK_ABOVE_GRIP = 0.125 + 0.045
 
+# How far past the bin's face to put the book down.
+#
+# Perception places the bin at the centre of its red box, at the median depth of the
+# middle of that box -- which, seen from outside, is mostly the near face. The fifteenth
+# full run stopped with the bin "0.63 m ahead" as the laser met the table at 0.55 to 0.6,
+# and the bin's near wall stands 94 mm inside the table's edge. From the shelf the robot
+# meets the bin end on, and it runs 0.57 m back from that face (0.32 across, if it is ever
+# seen side on). A point "above the bin" at the face is a point above its near wall.
+# tools/placeprobe.py walked the whole placement -- up, across, down, out -- for release
+# points 0.72 to 0.88 m ahead and 60 mm either side, and all 25 were clear.
+RELEASE_PAST_FACE_M = 0.20
+
 # The stowed arm sits in the LiDAR plane, so returns closer than this to the base are
 # the robot seeing itself.
 SELF_FILTER_RADIUS = 0.45
@@ -415,13 +427,18 @@ class DeliverNode(Node):
     def _clear(self, solution) -> bool:
         return self.moveit.state_valid(CHAIN_JOINTS, list(solution)) is not False
 
-    def _straight(self, start_solution, start_point, end_point, steps: int = 6):
+    def _straight(self, start_solution, start_point, end_point, steps: int = 6,
+                  what: str = "the line"):
         """Joint waypoints tracing a straight line in space, each one checked.
 
         The same shape as the grasp controller's reach: seed each solve from the last so
         consecutive postures are neighbours and the elbow cannot flip halfway along, and
         put every one to /check_state_validity before it goes near the arm. None means
         the line cannot be walked, which is a real answer and not a failure to try.
+
+        It says where and why. The fifteenth full run logged "no clear line to a point
+        above the bin" and nothing more, and tools/aboveprobe.py had to walk the line
+        again to find it refused at step 4 of 6 with the left elbow in the torso.
         """
         start_point = np.asarray(start_point, dtype=float)
         end_point = np.asarray(end_point, dtype=float)
@@ -431,7 +448,16 @@ class DeliverNode(Node):
             point = start_point + (step / float(steps)) * (end_point - start_point)
             solution = self.chain.ik(point, seed=seed, approach=CARRY_APPROACH,
                                      closing=CARRY_CLOSING)
-            if solution is None or not self._clear(solution):
+            if solution is None:
+                self.get_logger().warn(
+                    "%s: no posture reaches step %d of %d, %s"
+                    % (what, step, steps, np.round(point, 3).tolist()))
+                return None
+            if not self._clear(solution):
+                self.get_logger().warn(
+                    "%s: step %d of %d, %s, is blocked by %s"
+                    % (what, step, steps, np.round(point, 3).tolist(),
+                       self.moveit.why_invalid()))
                 return None
             waypoints.append(list(solution))
             seed = list(solution)
@@ -531,7 +557,8 @@ class DeliverNode(Node):
         self._enter(State.CARRY)
         start = self._current_joints()
         here = self._gripper_now()
-        path = self._straight(start, here, self.carry_point, steps=6)
+        path = self._straight(start, here, self.carry_point, steps=6,
+                              what="folding the arm to carry")
         if path is None:
             self.get_logger().warn(
                 "no clear line to the carry posture; driving with the arm as it is")
@@ -712,27 +739,45 @@ class DeliverNode(Node):
         self._plan_above(target)
 
     def _plan_above(self, target) -> None:
-        """Lift the book over the rim, directly above the middle of the bin."""
+        """Lift the book clear of the rim, then carry it across to over the bin.
+
+        Up first, then across, not one diagonal. The carried book's foot rides about 50 mm
+        below the rim, so a line that climbs as it moves forward drags the book into the
+        bin's wall, and the diagonal ended close in, where the left arm folds into the
+        torso: the fifteenth full run's line to [0.627, -0.027, 1.014] was refused at step
+        4 of 6 for arm_left_3_link against torso_lift_link and arm_left_4_link against
+        arm_right_1_link. tools/placeprobe.py found up-then-across clear for every release
+        point it tried.
+        """
         start = self._current_joints()
         here = self._gripper_now()
         if start is None or here is None:
             self._enter(State.FAILED)
             return
         rim = float(target[2])
-        # High enough that the foot of the book clears the rim on the way across.
-        above = np.array([float(target[0]), float(target[1]),
-                          rim + BOOK_BELOW_GRIP + self.rim_clearance])
+        # High enough that the foot of the book clears the rim on the way across, and past
+        # the face perception measures to over the middle of the bin: RELEASE_PAST_FACE_M.
+        lift_z = rim + BOOK_BELOW_GRIP + self.rim_clearance
+        above = np.array([float(target[0]) + RELEASE_PAST_FACE_M, float(target[1]), lift_z])
         self.above_point = above
         self._start_holding()
-        path = self._straight(start, here, above, steps=6)
-        if path is None:
+        up = np.array([float(here[0]), float(here[1]), lift_z])
+        rise = self._straight(start, here, up, steps=3,
+                              what="lifting the book clear of the rim")
+        across = None
+        if rise is not None:
+            across = self._straight(rise[-1], up, above, steps=6,
+                                    what="carrying it across to over the bin")
+        if across is None:
             self.get_logger().error(
-                "no clear line to a point above the bin %s"
+                "no clear way to a point above the bin %s"
                 % np.round(above, 3).tolist())
             self._enter(State.FAILED)
             return
+        path = rise + across[1:]
         self.get_logger().info(
-            "lifting the book over the rim to %s" % np.round(above, 3).tolist())
+            "lifting the book clear of the rim and across to %s"
+            % np.round(above, 3).tolist())
         self._start("above", lambda: self.moveit.execute_path(CHAIN_JOINTS, path))
 
     def _do_above(self) -> None:
@@ -745,15 +790,11 @@ class DeliverNode(Node):
             self._enter(State.FAILED)
             return
 
-        target = self._bin_now()
-        if target is None:
-            self.get_logger().warn(
-                "the bin is out of view from over it, as expected; lowering onto the "
-                "position measured on the way in")
-            target = self.above_point
-            rim = float(target[2]) - BOOK_BELOW_GRIP - self.rim_clearance
-        else:
-            rim = float(target[2])
+        # Down where the book already is, over the middle of the bin, and not onto a fresh
+        # sighting: a sighting from here is of the near face again (RELEASE_PAST_FACE_M),
+        # and lowering onto it would stand the book on the wall.
+        target = self.above_point
+        rim = float(target[2]) - BOOK_BELOW_GRIP - self.rim_clearance
 
         start = self._current_joints()
         here = self._gripper_now()
@@ -761,7 +802,7 @@ class DeliverNode(Node):
         floor = rim - self.bin_depth
         low = np.array([float(target[0]), float(target[1]),
                         floor + self.release_gap + BOOK_BELOW_GRIP])
-        path = self._straight(start, here, low, steps=5)
+        path = self._straight(start, here, low, steps=5, what="lowering into the bin")
         if path is None:
             self.get_logger().warn(
                 "no clear line down into the bin; releasing from above the rim, which "
@@ -803,7 +844,7 @@ class DeliverNode(Node):
         # Straight up, along the way it came in. Anything else drags the pads across a
         # book that is now standing free in the bin.
         out = np.array([here[0], here[1], float(self.above_point[2])])
-        path = self._straight(start, here, out, steps=4)
+        path = self._straight(start, here, out, steps=4, what="lifting out of the bin")
         self._enter(State.RETREAT)
         if path is None:
             self.get_logger().warn("no clear lift out of the bin; leaving the arm here")
