@@ -103,6 +103,45 @@ CAMERA_HALF_V = math.radians(28.1)
 # reader going from every frame to none across a few degrees.
 MARKER_EDGE_MARGIN = math.radians(8.0)
 
+# A book stands this far above and below its row's height, being 250 mm tall.
+BOOK_HALF_HEIGHT = 0.125
+
+# Keep the foot of the bottom row's book this far inside the lower edge of the frame. A
+# book cut by the edge is a short blob, and short blobs fail the detector's shape gates.
+BOOK_EDGE_MARGIN = math.radians(2.0)
+
+
+def column_framing_tilt(camera_z: float, distance: float, marker_z: float,
+                        bottom_z: float) -> tuple:
+    """Return a head tilt that frames a whole shelf column, and whether one exists.
+
+    The row is read only from a frame holding all four of the column's books and at
+    least two markers, and nothing aims the head for that before the row is known:
+    CENTRE keeps whatever tilt SEARCH left, which is aimed at the markers alone and
+    puts them in the middle of the frame. The sixteenth full run's last search had the
+    head 18 degrees up at 3.09 m, which frames -10 to +46 degrees; the foot of the
+    bottom book, about 13 degrees down, was under the lower edge, as the saved column
+    image shows. The row took 131 s to read, and the approach gave up 14 s before it
+    arrived.
+
+    Each end of the column gives a bound: the marker has to stay MARKER_EDGE_MARGIN
+    inside the top of the frame to be read, and the bottom book BOOK_EDGE_MARGIN inside
+    the bottom. The middle of what lies between is taken. Where nothing does -- too
+    close for the column to fit, inside about 2.1 m -- the marker's bound is returned
+    with False, because a column with no readable marker cannot be read at all.
+
+    Heights are above the floor, the distance is along the floor, and the tilt is
+    head_2_joint's: positive up, clamped to its limits.
+    """
+    marker_angle = math.atan2(marker_z - camera_z, distance)
+    bottom_angle = math.atan2(bottom_z - camera_z, distance)
+    lowest = marker_angle - (CAMERA_HALF_V - MARKER_EDGE_MARGIN)
+    highest = bottom_angle + (CAMERA_HALF_V - BOOK_EDGE_MARGIN)
+    fits = lowest <= highest
+    tilt = 0.5 * (lowest + highest) if fits else lowest
+    return max(HEAD_TILT_MIN, min(HEAD_TILT_MAX, tilt)), fits
+
+
 # Reversing during a search: the same speed RETREAT uses, a clearance that leaves room
 # to stop, and a total allowance a little over the 1.0 m the geometry can ever ask for.
 SEARCH_BACK_SPEED = 0.12
@@ -1088,6 +1127,33 @@ class ApproachNode(Node):
         top = desired + CAMERA_HALF_V - MARKER_EDGE_MARGIN
         return rise / math.tan(top) if top > 0.05 else float("inf")
 
+    def _aim_head_at_column(self) -> None:
+        """Tilt the head so the whole target column is in frame while its row is read.
+
+        See column_framing_tilt. Measured the same way as _aim_head_at_markers, so the
+        two agree about where the camera is and how far away the shelf is.
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                BASE_FRAME, CAMERA_FRAME, rclpy.time.Time())
+        except Exception:  # noqa: BLE001 - the transform may not be published yet
+            return
+        distance = self._range_ahead()
+        if distance is None or distance < 0.3:
+            return
+        bottom_z = BASE_LINK_Z + min(self.row_heights) - BOOK_HALF_HEIGHT
+        tilt, fits = column_framing_tilt(
+            tf.transform.translation.z, distance, MARKER_Z, bottom_z)
+        if not fits:
+            self.get_logger().warn(
+                "the whole column does not fit in frame from %.2f m; keeping the markers "
+                "readable instead" % distance, throttle_duration_sec=10.0)
+        if self.head_tilt is None or abs(tilt - self.head_tilt) >= 0.05:
+            self.get_logger().info(
+                "framing the whole column to read the row: head %.0f deg %s at %.2f m"
+                % (abs(math.degrees(tilt)), "up" if tilt >= 0 else "down", distance))
+        self._send_head_tilt(tilt)
+
     def _do_search(self) -> None:
         """Rotate on the spot until the target column's marker comes into view.
 
@@ -1971,6 +2037,10 @@ class ApproachNode(Node):
             # Hold here until the row has been read. This is the last point at which the
             # whole column is in frame; drive closer and the chance is gone.
             if not self.row_seen:
+                # And frame the whole column while waiting. Nothing else aims the head
+                # before the row is known, so this state would otherwise keep SEARCH's
+                # tilt, aimed at the markers alone. See column_framing_tilt.
+                self._aim_head_at_column()
                 self.get_logger().info(
                     "centred; waiting for the row before closing in",
                     throttle_duration_sec=5.0,
