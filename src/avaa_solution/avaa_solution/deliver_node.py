@@ -201,6 +201,43 @@ def front_clearance(points):
     return ahead, nearest
 
 
+# From the bin's centre to its near wall, and to the near edge of its table, along the
+# robot's heading when it stands square on the table's long side: the bin mesh spans
+# 0.566 m along the table's normal, and its centre is 0.377 m in from the table's edge.
+BIN_HALF_LENGTH = 0.283
+BIN_TO_TABLE_EDGE = 0.377
+# How far forward the gripper may move before it lifts, however much room there is.
+LIFT_FORWARD_MAX = 0.55
+
+
+def lift_routes(here, above, bin_x, rim, bin_depth):
+    """Return the ways to carry the book from where it is to over the bin, best first.
+
+    Each is (label, points). Straight up and then across is preferred. The laptop run of
+    2026-09-14 (marker 2, blue) had that lift refused with head_2_link against
+    arm_left_6_link once BOOK_BELOW_GRIP raised the lift to 1.079 m, so there are two
+    more: forward first, as far as the book's foot clears what it passes over (the bin's
+    near wall if the foot is above the table top, the table's edge if not), then up and
+    across; or most of the way up, then up and across together.
+    """
+    hx, hy, hz = (float(v) for v in here)
+    lift_z = float(above[2])
+    routes = [("up, then across", [np.array([hx, hy, lift_z]), np.asarray(above)])]
+    foot = hz - BOOK_BELOW_GRIP
+    table_top = rim - bin_depth
+    limit = bin_x - (BIN_HALF_LENGTH if foot > table_top + 0.02 else BIN_TO_TABLE_EDGE) - 0.05
+    forward = min(LIFT_FORWARD_MAX, limit)
+    if forward > hx + 0.03:
+        routes.append(("forward, up, then across",
+                       [np.array([forward, hy, hz]), np.array([forward, hy, lift_z]),
+                        np.asarray(above)]))
+    part = max(hz, lift_z - 0.07)
+    if part > hz + 0.01:
+        routes.append(("part way up, then up and across together",
+                       [np.array([hx, hy, part]), np.asarray(above)]))
+    return routes
+
+
 def blocked_by(ahead, nearest, face_x, obstacle_stop, corner_stop):
     """Return whether the drive to the bin should stop going forward.
 
@@ -666,6 +703,21 @@ class DeliverNode(Node):
             return self.hold_last
         return twist
 
+    def _walk(self, start_solution, start_point, points, label: str):
+        """Chain straight lines through points; the joint path, or None if any leg fails."""
+        path = [start_solution]
+        at = np.asarray(start_point, dtype=float)
+        for leg, point in enumerate(points, start=1):
+            distance = float(np.linalg.norm(np.asarray(point, dtype=float) - at))
+            steps = max(3, int(math.ceil(distance / 0.06)))
+            line = self._straight(path[-1], at, point, steps=steps,
+                                  what="%s, leg %d of %d" % (label, leg, len(points)))
+            if line is None:
+                return None
+            path += line[1:]
+            at = np.asarray(point, dtype=float)
+        return path
+
     def _start_holding(self) -> None:
         """Remember where the bin was, so the base can be held against it."""
         target = self._bin_now()
@@ -1079,20 +1131,18 @@ class DeliverNode(Node):
         above = np.array([release_x, float(target[1]), lift_z])
         self.above_point = above
         self._start_holding()
-        up = np.array([float(here[0]), float(here[1]), lift_z])
-        rise = self._straight(start, here, up, steps=3,
-                              what="lifting the book clear of the rim")
-        across = None
-        if rise is not None:
-            across = self._straight(rise[-1], up, above, steps=6,
-                                    what="carrying it across to over the bin")
-        if across is None:
+        path = None
+        for label, points in lift_routes(here, above, float(target[0]), rim, self.bin_depth):
+            path = self._walk(start, here, points, label)
+            if path is not None:
+                self.get_logger().info("over the bin by way of: %s" % label)
+                break
+        if path is None:
             self.get_logger().error(
                 "no clear way to a point above the bin %s"
                 % np.round(above, 3).tolist())
             self._enter(State.FAILED)
             return
-        path = rise + across[1:]
         self.get_logger().info(
             "lifting the book clear of the rim and across to %s"
             % np.round(above, 3).tolist())
