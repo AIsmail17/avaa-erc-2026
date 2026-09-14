@@ -118,6 +118,54 @@ def bin_sized(width_px: float, height_px: float, depth_m: float,
     return area_m2 >= BIN_MIN_AREA_M2
 
 
+# How far a detection's box may depart, as a fraction, from the width the book has
+# measured all along at this range, and still be that book.
+#
+# A book does not change size. Its apparent width moves only as 1/range, so the product
+# width x range is a constant of the camera and the book, and any fix of the book keeps
+# it. Measured on the run of 2026-09-11 that ended with the jaws closing 84 mm beside
+# the book: the box held 22-23 px for four seconds at 0.75-0.77 m -- and then, in the
+# second the open gripper came between the lens and the book, read 39, 47, 56 and 67 px
+# while the range held, the blob's centre sliding 80 mm to the side with the hand.
+# Every one of those was published as the target, the servo re-aimed onto its own
+# gripper during the close, and the grasp came up empty. The band below refuses every
+# one of them: 39 px against a constant that says 21 is 85 per cent over, and the worst
+# was three times the book.
+#
+# The band is deliberately wide rather than narrow, because a gate that refuses the
+# truth costs more than one that lets a lie through occasionally: the box width carries
+# a pixel of quantisation at any range, the base moves 0.22 m between frames on the
+# approach -- nine per cent of the range at half a metre, and the width moves with it as
+# 1/range, which this gate computes rather than assumes away -- and a fix refused here
+# leaves the controllers holding their last good target, which is exactly what they
+# already do through every occlusion. Forty per cent either side has margin for all of
+# that and still separates the gripper's box from the book's by a factor of two.
+BOX_SIZE_BAND = 0.4
+
+
+def box_size_matches(width_px: float, range_m: float, samples,
+                     band: float = BOX_SIZE_BAND):
+    """Whether a detection is the width the book has always been at this range.
+
+    ``samples`` is recent accepted fixes, as (range in metres, box width in pixels).
+    Returns ``(matches, expected_width_px)``, the second for the caller to say what it
+    refused. With no samples, or no usable range, nothing is known yet and the answer
+    is to accept: this gate exists to catch a box that contradicts the history, not to
+    manufacture one.
+    """
+    if range_m <= 0.05 or width_px <= 0:
+        return True, None
+    constants = [float(w) * float(r) for r, w in samples if r > 0.05 and w > 0]
+    if not constants:
+        return True, None
+    expected = float(np.median(constants)) / float(range_m)
+    if expected <= 0.0:
+        return True, None
+    if abs(float(width_px) - expected) <= band * expected:
+        return True, expected
+    return False, expected
+
+
 # How far above the truth a deprojected book height sits.
 #
 # This was 0.152 m, and almost all of it was not a bias at all: base_link was taken to
@@ -325,6 +373,11 @@ class PerceptionNode(Node):
         # order_from_windows.
         self.shelf_windows: Counter = Counter()
         self.last_book_range: Optional[float] = None
+        # Recent accepted book fixes, as (range in metres, box width in pixels), for
+        # the box-size gate in _publish_book_point. Only fixes that were PUBLISHED
+        # enter it, so a run of the gripper's own image cannot poison the constant:
+        # every refused box leaves the expected width standing at the book's.
+        self.box_samples: deque = deque(maxlen=6)
         # Half the image width, and how far off centre a marker may be and still have
         # its digit believed.
         #
@@ -1104,6 +1157,28 @@ class PerceptionNode(Node):
                     self.last_book_yaw = None
                 return False
         self.height_rejects = 0
+
+        # Refuse a fix whose box is not the size the book has always been at this range.
+        #
+        # The height gate above catches a different book on a different shelf. This one
+        # catches the open gripper: once the hand is between the lens and the book, the
+        # blue blob is hand-and-book together, and its box -- and with it the published
+        # target -- walks wherever the arm goes. The run of 2026-09-11 measured its box
+        # tripling in width at a steady range while the grasp was closing, the servo
+        # re-aiming 80 mm onto its own gripper, and the jaws closing 84 mm beside the
+        # book. The tracker's cx is only remembered when a fix is published, so refusing
+        # here also keeps the tracker anchored to the book it had.
+        ok, expected = box_size_matches(
+            int(target.w), float(point[0]), self.box_samples)
+        if not ok:
+            self.get_logger().warn(
+                "a %s blob %d px wide at %.2f m, where the book's box has been %.0f px "
+                "at that range all along. That is not the book changing size; it is the "
+                "gripper in front of the lens. Not publishing this fix."
+                % (self.book_colour, int(target.w), float(point[0]), expected),
+                throttle_duration_sec=2.0)
+            return False
+        self.box_samples.append((float(point[0]), int(target.w)))
 
         msg.point.x, msg.point.y, msg.point.z = (float(v) for v in point)
         # At close range, say what the box looked like as well as where it put the book.

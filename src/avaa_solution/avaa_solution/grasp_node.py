@@ -767,6 +767,7 @@ class GraspNode(Node):
         # about three times the slide. Measured at 0.0048 rad/s on a robot that had
         # never moved; this is set above that because a driven one is worse.
         self.declare_parameter("reaim_yaw_rate_rad_per_s", 0.010)
+        self.declare_parameter("reaim_max_budget_m", 0.28)
         # How much of the arm's measured maximum reach a target may sit at. Only a
         # sanity bound -- the arm holds 88 per cent of it to a millimetre -- so this is
         # set where the kinematics genuinely run out rather than where the torque does.
@@ -950,6 +951,8 @@ class GraspNode(Node):
         self.reaim_rate = float(self.get_parameter("reaim_rate_m_per_s").value)
         self.reaim_yaw_rate = float(
             self.get_parameter("reaim_yaw_rate_rad_per_s").value)
+        self.reaim_max_budget = float(
+            self.get_parameter("reaim_max_budget_m").value)
         self.reach_margin = float(self.get_parameter("reach_margin").value)
         self.target_set_at = None
         self.reaches = 0
@@ -1392,8 +1395,9 @@ class GraspNode(Node):
         if self.grasp_target is not None:
             radius = float(np.linalg.norm(np.asarray(
                 self.grasp_target, dtype=float)[:2]))
-        return reaim_budget(self.reaim_allowance, self.reaim_rate, since,
-                            self.reaim_yaw_rate, radius)
+        budget = reaim_budget(self.reaim_allowance, self.reaim_rate, since,
+                              self.reaim_yaw_rate, radius)
+        return min(budget, self.reaim_max_budget)
 
     def _from_shoulder(self, point) -> float:
         """How far a point is from the shoulder, which is what the arm has to span."""
@@ -2461,6 +2465,11 @@ class GraspNode(Node):
         # That is not a theory: watched against ground truth, the book was standing when
         # this move began and lying down when it finished, knocked over by the arm on
         # its way to a pre-grasp that had gone stale.
+        prev_pre_target = (None if self.pre_target is None
+                           else np.array(self.pre_target, copy=True))
+        prev_grasp_target = (None if self.grasp_target is None
+                             else np.array(self.grasp_target, copy=True))
+        prev_face_x = self.face_x
         self._refresh_targets()
         moved = self.chain.ik(
             self.pre_target, seed=list(self.pre_solution),
@@ -2478,9 +2487,17 @@ class GraspNode(Node):
         elif moved is None:
             self.get_logger().warn(
                 "could not re-aim the pre-grasp; going to the one planned earlier")
+            if prev_pre_target is not None:
+                self.pre_target = prev_pre_target
+                self.grasp_target = prev_grasp_target
+                self.face_x = prev_face_x
         else:
             self.get_logger().warn(
                 "the re-aimed pre-grasp is not collision free; keeping the planned one")
+            if prev_pre_target is not None:
+                self.pre_target = prev_pre_target
+                self.grasp_target = prev_grasp_target
+                self.face_x = prev_face_x
 
         self._enter(State.PREGRASP)
         self._add_book_to_scene()
@@ -3222,11 +3239,20 @@ class GraspNode(Node):
         # This stops before contact. Once the pads are near the book, an arm still
         # correcting sideways pushes the book over rather than centring on it, and a
         # book on a shelf tips at about a third of a newton.
+        #
+        # And it never re-aims once the servo has frozen the target. The servo freezes
+        # the target the moment the fingers cross the face, because from there "the
+        # gripper covers the book, and a fix of it only gets worse" -- and this state
+        # used to unfreeze exactly that. On the run of 2026-09-11 the open gripper's
+        # image was being read as the book at a steady range, the clamp re-aimed 80 mm
+        # onto it one tick after entering, and the jaws closed 84 mm beside the book
+        # with an empty hand and a delivery that worked. The freeze means freeze.
         if self.servo_track:
             finger = self.joints.get("gripper_left_finger_joint")
             span = None if finger is None else 0.0271 + (finger + 0.001) * 0.8146
             if span is not None and span > self.servo_release_span:
-                self._refresh_targets()
+                if not self.servo_target_frozen:
+                    self._refresh_targets()
                 target = np.asarray(self.grasp_target, dtype=float)
                 here = self._gripper_now()
                 if here is not None:

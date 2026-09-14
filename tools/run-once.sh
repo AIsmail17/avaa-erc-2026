@@ -26,6 +26,27 @@ if docker exec erc_sim bash -c 'ps -eo args | grep -v grep | grep -q "[r]os2 lau
   exit 2
 fi
 
+# Kill any ROS nodes left over from a PREVIOUS run before this one starts.
+#
+# The check above catches only a launch that is still running. It says nothing about
+# the nodes of one that ended badly: a Gazebo crash or a Ctrl-C that skipped the
+# cleanup at the end of this script leaves the controllers alive inside the container,
+# frozen at whatever state they finished in and publishing it every tick. Every
+# controller keeps publishing 'done' after it is done -- it is a topic, not a one-shot
+# -- so on 2026-09-11 two laptop trials had their missions jump "approach -> grasp at
+# 0.2 s" and deliver around an empty hand while the real approach was still searching.
+# The mission node now refuses a 'done' from a controller it has not seen alive, and
+# this removes the ghosts themselves: same pattern as the straggler sweep at the end,
+# run at the start where it is worth something.
+stragglers=$(docker exec erc_sim ps -eo pid=,args= \
+  | grep -E "avaa_solution/lib/avaa_solution/|ros2 launch avaa_solution|moveit_ros_move_group/move_group" \
+  | grep -v " ps -eo" | awk '{print $1}' | tr '\n' ' ')
+if [ -n "${stragglers// /}" ]; then
+  echo "=== nodes left over from a previous run; killing: $stragglers"
+  docker exec erc_sim kill -9 $stragglers >/dev/null 2>&1 || true
+  sleep 2
+fi
+
 # Headless, and not as an optimisation.
 #
 # Started with the GUI, this launch intermittently comes up with Gazebo never

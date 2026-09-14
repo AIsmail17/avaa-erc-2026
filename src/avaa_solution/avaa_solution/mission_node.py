@@ -64,6 +64,25 @@ TOPIC_PHASE = "/avaa/mission/phase"
 
 VALID_COLOURS = ("red", "blue", "green", "yellow")
 
+# The states that end a controller's work.
+TERMINAL_STATES = ("done", "failed")
+
+
+def terminal_from_a_ghost(value: str, seen_alive: bool) -> bool:
+    """Whether a terminal state is a leftover node's echo and must be ignored.
+
+    Every controller publishes its state on a timer from the moment it starts, and
+    none of them reaches a terminal state in under a minute, so the first state this
+    mission can ever hear from a controller that belongs to THIS trial cannot be
+    'done' or 'failed'. A node left over from a previous run -- alive in the container
+    after a launch was interrupted or a crashed run skipped the cleanup -- sits frozen
+    at 'done' and publishes it every tick, forever. On 2026-09-11 that made two laptop
+    trials jump "approach -> grasp at 0.2 s" and drive a delivery around with no book,
+    while the real approach was still searching the arena for its marker.
+    """
+    return value in TERMINAL_STATES and not seen_alive
+
+
 SENSOR_QOS = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
                         durability=QoSDurabilityPolicy.VOLATILE,
                         history=QoSHistoryPolicy.KEEP_LAST, depth=1)
@@ -127,6 +146,20 @@ class MissionNode(Node):
         self.approach_state = ""
         self.grasp_state = ""
         self.deliver_state = ""
+        # Whether each controller has been heard from ALIVE in this trial.
+        #
+        # Every controller publishes its state on a timer from the moment it starts,
+        # and none of them reaches 'done' in under a minute, so the first state this
+        # mission ever hears from a controller that belongs to THIS run cannot be
+        # 'done'. A leftover node from a previous run -- alive in the container after a
+        # launch was interrupted or a crashed run skipped the cleanup -- sits frozen at
+        # 'done' and publishes it every tick, forever. On 2026-09-11 that made two laptop
+        # trials jump "approach -> grasp at 0.2 s" and deliver around with no book,
+        # while the real approach was still searching. A terminal state from a
+        # controller that never said anything else is not a verdict, it is an echo.
+        self.approach_alive = False
+        self.grasp_alive = False
+        self.deliver_alive = False
         self.bin_touched_at: Optional[float] = None
 
         self.phase = Phase.STARTING
@@ -196,13 +229,41 @@ class MissionNode(Node):
                 % (value, self.row_agreed, self._elapsed()))
 
     def _on_approach(self, msg: String) -> None:
-        self.approach_state = msg.data
+        self._on_controller_state(
+            "approach", msg.data,
+            lambda value: setattr(self, "approach_state", value),
+            lambda: setattr(self, "approach_alive", True))
 
     def _on_grasp(self, msg: String) -> None:
-        self.grasp_state = msg.data
+        self._on_controller_state(
+            "grasp", msg.data,
+            lambda value: setattr(self, "grasp_state", value),
+            lambda: setattr(self, "grasp_alive", True))
 
     def _on_deliver(self, msg: String) -> None:
-        self.deliver_state = msg.data
+        self._on_controller_state(
+            "deliver", msg.data,
+            lambda value: setattr(self, "deliver_state", value),
+            lambda: setattr(self, "deliver_alive", True))
+
+    def _on_controller_state(self, controller: str, value: str,
+                             store, mark_alive) -> None:
+        """Take a controller's state, refusing a verdict from one never seen alive.
+
+        See ``terminal_from_a_ghost`` for why. A state that is not terminal marks the
+        controller alive; a terminal one from a controller still believed dead is
+        dropped -- and said so, because the alternative is a run that quietly waits
+        forever for an approach that a ghost already reported finished.
+        """
+        if terminal_from_a_ghost(value, getattr(self, controller + "_alive")):
+            self.get_logger().error(
+                "the %s reported '%s' before this trial ever saw it alive; that is a "
+                "node left over from a previous run, and it is being ignored"
+                % (controller, value), throttle_duration_sec=10.0)
+            return
+        store(value)
+        if value not in TERMINAL_STATES:
+            mark_alive()
 
     def _on_bin_contact(self, msg) -> None:
         """Stop the trial clock when a BOOK touches the bin, not when anything does.
