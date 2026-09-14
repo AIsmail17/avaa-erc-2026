@@ -115,6 +115,9 @@ RELEASE_PAST_FACE_M = 0.20
 # and 0.20 and 0.25 m right found no IK at 1.05. A release nearer the face than
 # RELEASE_MIN_PAST_FACE_M is over the wall.
 RELEASE_REACH_M = 1.05
+# Furthest any joint may be from the end of the path over the bin for the arm to be folded
+# back along it after the release.
+FOLD_JUMP_MAX_RAD = 0.35
 RELEASE_LEFT_M = 0.25
 RELEASE_RIGHT_M = 0.10
 RELEASE_MIN_PAST_FACE_M = 0.10
@@ -268,6 +271,7 @@ class State(Enum):
     LOWER = "lowering"
     RELEASE = "releasing"
     RETREAT = "retreating"
+    STOW = "stowing"
     DONE = "done"
     FAILED = "failed"
 
@@ -424,6 +428,7 @@ class DeliverNode(Node):
         self.head_aimed_at = None
         self.released_at = None
         self.above_point = None
+        self.above_path = None
 
         self.create_subscription(PointStamped, TOPIC_BIN_POINT, self._on_bin, 10)
         self.create_subscription(
@@ -699,7 +704,10 @@ class DeliverNode(Node):
             return twist
         # A coast is a constant velocity, so when the arm is over the bin and in the
         # way of the camera, the last correction for it is still the right one.
-        if target is None and self.hold_last is not None:
+        # Never once the work is over, though. A coast held after DONE is a constant drive
+        # with nothing left to end it: on the laptop the finished robot wandered off.
+        if (target is None and self.hold_last is not None
+                and self.state not in (State.DONE, State.FAILED)):
             return self.hold_last
         return twist
 
@@ -740,6 +748,7 @@ class DeliverNode(Node):
             State.LOWER: self._do_lower,
             State.RELEASE: self._do_release,
             State.RETREAT: self._do_retreat,
+            State.STOW: self._do_stow,
         }.get(self.state)
         if handler:
             handler()
@@ -1146,6 +1155,7 @@ class DeliverNode(Node):
         self.get_logger().info(
             "lifting the book clear of the rim and across to %s"
             % np.round(above, 3).tolist())
+        self.above_path = path
         self._start("above", lambda: self.moveit.execute_path(CHAIN_JOINTS, path))
 
     def _do_above(self) -> None:
@@ -1212,10 +1222,14 @@ class DeliverNode(Node):
         # Straight up, along the way it came in. Anything else drags the pads across a
         # book that is now standing free in the bin.
         out = np.array([here[0], here[1], float(self.above_point[2])])
-        path = self._straight(start, here, out, steps=4, what="lifting out of the bin")
+        # A waypoint every 3 cm, not four in all: between waypoints the arm moves in joint
+        # space, and on the laptop on 2026-09-14 the hand bowed enough to nudge the bin.
+        steps = max(4, int(math.ceil(abs(float(out[2]) - float(here[2])) / 0.03)))
+        path = self._straight(start, here, out, steps=steps, what="lifting out of the bin")
         self._enter(State.RETREAT)
         if path is None:
             self.get_logger().warn("no clear lift out of the bin; leaving the arm here")
+            self.above_path = None  # and not folding it: that would drag the hand out
             self.motion_result = (1, 1.0)
             return
         self._start("retreat", lambda: self.moveit.execute_path(CHAIN_JOINTS, path))
@@ -1225,6 +1239,40 @@ class DeliverNode(Node):
         if done is None:
             return
         self.get_logger().info("book delivered")
+        self._fold_arm()
+
+    def _fold_arm(self) -> None:
+        """Bring the empty arm back in, along the way it went out over the bin.
+
+        That path was checked waypoint by waypoint against the whole robot from where the
+        base still stands, and the lift out of the bin ends where it ended, so run backwards
+        it is an already checked way back to the carry posture that stays above the rim.
+        If the arm is not where the path ended, it is left out rather than jerked there.
+        """
+        start = self._current_joints()
+        if start is None or not self.above_path:
+            self._enter(State.DONE)
+            return
+        back = [list(point) for point in reversed(self.above_path)]
+        jump = max(abs(a - b) for a, b in zip(start, back[0]))
+        if jump > FOLD_JUMP_MAX_RAD:
+            self.get_logger().warn(
+                "the arm is %.2f rad from where it went over the bin; leaving it out" % jump)
+            self._enter(State.DONE)
+            return
+        back[0] = list(start)
+        self._enter(State.STOW)
+        self._start("fold", lambda: self.moveit.execute_path(CHAIN_JOINTS, back))
+
+    def _do_stow(self) -> None:
+        done = self._finished()
+        if done is None:
+            return
+        code, _ = done
+        if code != 1:
+            self.get_logger().warn("the arm did not fold all the way in (%s)" % error_name(code))
+        else:
+            self.get_logger().info("arm folded in")
         self._enter(State.DONE)
 
 

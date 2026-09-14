@@ -2325,7 +2325,11 @@ class GraspNode(Node):
         """
         traj = JointTrajectory()
         traj.joint_names = ["arm_right_%d_joint" % i for i in range(1, 8)]
-        for pose, at in right_tuck_points(6.0):
+        # Already tucked by the approach: go straight there. The full stow swings the arm
+        # out to the side first, which in front of the shelf is the last place to do it.
+        points = ([(list(RIGHT_TUCK), 2.0)] if self._right_arm_stowed()
+                  else right_tuck_points(6.0))
+        for pose, at in points:
             point = JointTrajectoryPoint()
             point.positions = [float(v) for v in pose]
             point.time_from_start = duration_msg(at)

@@ -1,4 +1,4 @@
-"""The right arm stows inside the base, by way of the posture it used to stow in."""
+"""The right arm stows in PAL's home tuck, by way of PAL's side posture."""
 
 import pytest
 

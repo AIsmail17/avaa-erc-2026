@@ -298,15 +298,29 @@ TUCK_TORSO = 0.10
 # between 0.43 and 0.92 m up. tools/righttuckcheck.py found it valid for the whole robot
 # with the left arm in both tucks and the carry posture, and the straight joint line from
 # the old posture clear -- but not the line from all zeros, which passes arm_right_3 and
-# arm_right_4 through base_link. So the stow goes by way of the old posture.
-RIGHT_TUCK_VIA = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
-RIGHT_TUCK = [-0.1641, -1.6339, -0.1826, 1.1345, 1.6524, 2.1592, 1.9100]
+# arm_right_4 through base_link. So the stow went by way of the old posture.
+#
+# Watched on the laptop on 2026-09-14, that posture folded the arm behind the torso and,
+# since Gazebo does not collide the robot with itself, visibly through it. So the tuck is
+# back to PAL's own "home" motion (tiago_pro_bringup/config/motions/
+# tiago_pro_motions_general_spherical-wrist.yaml), the mirror of the left TUCK_POSE, with
+# the shoulder lifted 0.13 rad: arm_right_2 -1.70 instead of -1.83. That one change is what
+# clears arm_right_6_link from base_link with the torso down. tools/hometuck_search.py
+# found it valid for the whole robot at torso 0.0, 0.05, 0.10, 0.15 and 0.35 with the left
+# arm in both tucks and the carry posture; closest to home of 19 clear variants out of 72.
+#
+# The arm gets there the way PAL's motion takes it: out to the side first, then in.
+# tools/tuckpath_check.py found the lines from all zeros and from the old via to that
+# side posture, and from it to the tuck, clear at torso 0.10 and 0.02. Going straight in
+# from zeros or from the old via is not: it passes arm_right_4 to 6 through base_link.
+RIGHT_TUCK_VIA = [-1.8614, -1.6008, -0.34892, -1.9818, 0.10153, -1.5829, 0.0]
+RIGHT_TUCK = [-0.36, -1.70, -0.47, -2.35, 0.0, -1.2, 0.0]
 # Of the stow's duration, the part spent reaching RIGHT_TUCK_VIA.
 RIGHT_TUCK_VIA_SHARE = 0.6
 
 
 def right_tuck_points(duration: float) -> List[Tuple[List[float], float]]:
-    """Return the right arm's stow as (positions, seconds from start), by way of the old tuck."""
+    """Return the right arm's stow as (positions, seconds from start), out to the side first."""
     return [(list(RIGHT_TUCK_VIA), RIGHT_TUCK_VIA_SHARE * duration),
             (list(RIGHT_TUCK), float(duration))]
 
