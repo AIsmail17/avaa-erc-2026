@@ -66,7 +66,7 @@ from avaa_solution.moveit_client import MoveItClient, error_name
 # goes. They did once: the fixture tucked to one pose while the solution
 # used another, and every grasp after that was measured from a posture the
 # robot never actually drives in.
-from avaa_solution.approach_node import RIGHT_TUCK, _wrap
+from avaa_solution.approach_node import RIGHT_TUCK, _wrap, duration_msg, right_tuck_points
 
 TOPIC_TARGET_ROW = "/avaa/perception/target_row"
 TOPIC_BOOK_POINT = "/avaa/perception/target_book_point"
@@ -2325,10 +2325,11 @@ class GraspNode(Node):
         """
         traj = JointTrajectory()
         traj.joint_names = ["arm_right_%d_joint" % i for i in range(1, 8)]
-        point = JointTrajectoryPoint()
-        point.positions = [float(v) for v in RIGHT_TUCK]
-        point.time_from_start = Duration(sec=6, nanosec=0)
-        traj.points = [point]
+        for pose, at in right_tuck_points(6.0):
+            point = JointTrajectoryPoint()
+            point.positions = [float(v) for v in pose]
+            point.time_from_start = duration_msg(at)
+            traj.points.append(point)
         self.pub_arm_right.publish(traj)
         self.get_logger().info("stowing the right arm clear of the shelf")
 

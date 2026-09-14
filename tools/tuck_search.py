@@ -33,10 +33,16 @@ sys.path.insert(0, "/opt/erc_ws/src/avaa_solution")
 from avaa_solution.kinematics.arm_chain import ArmChain      # noqa: E402
 from avaa_solution.moveit_client import MoveItClient         # noqa: E402
 
-HALF = 0.27
+# The base's collision box, 0.717 x 0.497 m. A square of 0.27 held the arm 90 mm inside
+# the front and back for no reason and let it out past the sides.
+HALF_X = 0.3585
+HALF_Y = 0.2485
 MARGIN = 0.02
 MIN_Z = 0.35
 TORSO = 0.15
+# Every height the torso is at while this posture is held: down for the stow, 0.15 for
+# driving, 0.35 for the top rows. A posture valid at one of them is not valid at all.
+TORSO_HEIGHTS = (0.0, 0.15, 0.35)
 
 CURRENT = {
     "left": [2.1521, 0.3824, 1.2785, -2.1517, 0.8325, 0.1926, 1.3944],
@@ -61,8 +67,8 @@ def overhang(chain, values):
         for t in (0.0, 0.25, 0.5, 0.75, 1.0):
             p = a + t * (b - a)
             worst = max(worst,
-                        abs(p[0]) - (HALF - MARGIN),
-                        abs(p[1]) - (HALF - MARGIN))
+                        abs(p[0]) - (HALF_X - MARGIN),
+                        abs(p[1]) - (HALF_Y - MARGIN))
             if p[2] < MIN_Z:
                 worst += (MIN_Z - p[2])
     return max(worst, 0.0)
@@ -91,7 +97,13 @@ def main():
         return out
 
     def valid(values):
-        return client.state_valid(names, list(values), group=group) is not False
+        for height in TORSO_HEIGHTS:
+            at = list(values)
+            for i in torso_at:
+                at[i] = height
+            if client.state_valid(names, at, group=group) is False:
+                return False
+        return True
 
     best = fix(([TORSO] if torso_at else []) + list(CURRENT[side]))
     if not valid(best):

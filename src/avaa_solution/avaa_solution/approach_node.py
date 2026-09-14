@@ -289,7 +289,32 @@ TUCK_TORSO = 0.10
 #
 # This one comes from the same search with 0.0 added to the heights it checks: 400
 # samples, folded to 0.204 m forward and 0.331 m sideways, valid at 0.0, 0.15 and 0.35.
-RIGHT_TUCK = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
+#
+# That posture reached 274 mm outside the base, its lower arm and gripper trailing
+# behind-right at about table height: watched on the laptop on 2026-09-11, the extended
+# right arm looked set to catch the bin's table. This one is inside the base's
+# 0.717 x 0.497 m box (tools/tuck_search.py right, hill-climbed from the old value with the
+# real box and valid at torso 0.0, 0.15 and 0.35), furthest joint at x -0.291, y -0.086,
+# between 0.43 and 0.92 m up. tools/righttuckcheck.py found it valid for the whole robot
+# with the left arm in both tucks and the carry posture, and the straight joint line from
+# the old posture clear -- but not the line from all zeros, which passes arm_right_3 and
+# arm_right_4 through base_link. So the stow goes by way of the old posture.
+RIGHT_TUCK_VIA = [-0.7194, -2.2867, -0.5064, 0.5221, 2.3399, 1.0503, 1.9772]
+RIGHT_TUCK = [-0.1641, -1.6339, -0.1826, 1.1345, 1.6524, 2.1592, 1.9100]
+# Of the stow's duration, the part spent reaching RIGHT_TUCK_VIA.
+RIGHT_TUCK_VIA_SHARE = 0.6
+
+
+def right_tuck_points(duration: float) -> List[Tuple[List[float], float]]:
+    """Return the right arm's stow as (positions, seconds from start), by way of the old tuck."""
+    return [(list(RIGHT_TUCK_VIA), RIGHT_TUCK_VIA_SHARE * duration),
+            (list(RIGHT_TUCK), float(duration))]
+
+
+def duration_msg(seconds: float) -> Duration:
+    """Return a Duration message for a time that need not be whole seconds."""
+    whole = int(seconds)
+    return Duration(sec=whole, nanosec=int(round((seconds - whole) * 1e9)))
 
 
 def _wrap(angle: float) -> float:
@@ -1067,11 +1092,15 @@ class ApproachNode(Node):
         for pub, side in ((self.pub_arm_left, "left"), (self.pub_arm_right, "right")):
             traj = JointTrajectory()
             traj.joint_names = [f"arm_{side}_{i}_joint" for i in range(1, 8)]
-            point = JointTrajectoryPoint()
-            pose = list(RIGHT_TUCK) if side == "right" else list(TUCK_POSE)
-            point.positions = [float(v) for v in pose]
-            point.time_from_start = Duration(sec=int(self.tuck_time), nanosec=0)
-            traj.points = [point]
+            if side == "right":
+                points = right_tuck_points(self.tuck_time)
+            else:
+                points = [(list(TUCK_POSE), float(self.tuck_time))]
+            for pose, at in points:
+                point = JointTrajectoryPoint()
+                point.positions = [float(v) for v in pose]
+                point.time_from_start = duration_msg(at)
+                traj.points.append(point)
             pub.publish(traj)
 
         # And the torso with them, or the folded arm sits inside the base.
