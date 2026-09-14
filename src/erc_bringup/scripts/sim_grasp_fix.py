@@ -47,12 +47,31 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from trajectory_msgs.msg import JointTrajectory
+
+# The Gazebo transport bindings, when the image has them.
+#
+# Every teleport used to be one gz CLI process, five a second, and between them the book is
+# a free body: tools/holdprobe.py measured a book held in the air falling 106 mm at the
+# median and 172 mm at worst between 5 Hz teleports -- the drop and snap back watched on the
+# laptop, and on 2026-09-14 enough to carry a book into the bin's wall and out onto the
+# table. Through the bindings, at 50 Hz with an 8 ms reply timeout, the same probe measured
+# 28 mm at the median. Poses also arrive by subscription instead of a CLI call every three
+# seconds, so the base's pose used to place the book is current rather than up to three
+# seconds old while the robot drives.
+try:
+    from gz.msgs10.boolean_pb2 import Boolean
+    from gz.msgs10.pose_pb2 import Pose
+    from gz.msgs10.pose_v_pb2 import Pose_V
+    from gz.transport13 import Node as GzNode
+except ImportError:  # pragma: no cover - older images
+    GzNode = None
 
 WORLD = "erc_world"
 # BOTH topics, and that distinction cost most of a day.
@@ -121,7 +140,7 @@ class GraspFix(Node):
         super().__init__("sim_grasp_fix")
         self.declare_parameter("reach_m", 0.09)
         self.declare_parameter("world", WORLD)
-        self.declare_parameter("follow_hz", 5.0)
+        self.declare_parameter("follow_hz", 50.0 if GzNode is not None else 5.0)
         self.reach = float(self.get_parameter("reach_m").value)
         self.world = str(self.get_parameter("world").value)
         follow_hz = float(self.get_parameter("follow_hz").value)
@@ -150,8 +169,20 @@ class GraspFix(Node):
         self.worker = threading.Thread(target=self._serve, daemon=True)
         self.worker.start()
 
-        self.create_timer(3.0, lambda: self._ask("poses"))
-        self.create_timer(1.0 / max(follow_hz, 0.5), lambda: self._ask("follow"))
+        self.pose_lock = threading.Lock()
+        self.gz_node = None
+        if GzNode is not None:
+            self.gz_node = GzNode()
+            self.gz_node.subscribe(Pose_V, "/world/%s/dynamic_pose/info" % self.world,
+                                   self._on_poses)
+            self.follow_period = 1.0 / max(follow_hz, 0.5)
+            threading.Thread(target=self._follow_loop, daemon=True).start()
+        else:
+            self.get_logger().warn(
+                "no Gazebo transport bindings; falling back to the gz CLI at %.0f Hz"
+                % follow_hz)
+            self.create_timer(3.0, lambda: self._ask("poses"))
+            self.create_timer(1.0 / max(follow_hz, 0.5), lambda: self._ask("follow"))
         self.create_timer(1.0, self._report)
         self.get_logger().info(
             "simulation grasp fix up: a close within %.0f mm of a book picks it up, and "
@@ -177,9 +208,49 @@ class GraspFix(Node):
             except Exception as exc:  # noqa: BLE001 - a worker must not die quietly
                 self.get_logger().error("grasp fix worker: %s" % exc)
 
+    def _follow_loop(self):
+        """Teleport the held book at follow_hz, on its own thread, through the bindings."""
+        while True:
+            began = time.monotonic()
+            try:
+                self._follow()
+            except Exception as exc:  # noqa: BLE001 - this thread must not die quietly
+                self.get_logger().error("grasp fix follow: %s" % exc,
+                                        throttle_duration_sec=5.0)
+            time.sleep(max(0.0, self.follow_period - (time.monotonic() - began)))
+
     # ------------------------------------------------------------------ world state
+    def _on_poses(self, msg):
+        """Take every book's pose and the robot's from Gazebo's dynamic pose stream."""
+        books, quats, robot = {}, {}, None
+        for p in msg.pose:
+            position = (p.position.x, p.position.y, p.position.z)
+            quat = (p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w)
+            if p.name.startswith("book_col_") and p.name not in books:
+                books[p.name], quats[p.name] = position, quat
+            elif p.name == "tiago_pro" and robot is None:
+                robot = (position, quat)
+        with self.pose_lock:
+            self._store_poses(books, quats, robot)
+
+    def _store_poses(self, books, quats, robot):
+        """Keep the latest book and robot poses, and each book's first pose."""
+        if books:
+            self.books = books
+        if quats:
+            self.book_quats = quats
+        for name, q in quats.items():
+            if name in books and name not in self.initial:
+                self.initial[name] = (books[name], q)
+        if robot is not None:
+            (px, py, pz), (qx, qy, qz, qw) = robot
+            yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy ** 2 + qz ** 2))
+            self.robot_pose = (px, py, pz, yaw)
+
     def _read_poses(self):
         """Read every book pose and the robot's, from the simulator. Worker only."""
+        if self.gz_node is not None:
+            return  # kept current by _on_poses
         raw = gz("topic", "-e", "-t", "/world/%s/dynamic_pose/info" % self.world, "-n", "1")
         if not raw:
             return
@@ -215,23 +286,18 @@ class GraspFix(Node):
         if name and "px" in fields:
             poses[name] = dict(fields)
 
+        # book_col_ and not book_: each book's link is listed too, as book_base_link.
         books = {k: (v["px"], v["py"], v["pz"]) for k, v in poses.items()
-                 if k.startswith("book_") and {"px", "py", "pz"} <= set(v)}
-        if books:
-            self.books = books
+                 if k.startswith("book_col_") and {"px", "py", "pz"} <= set(v)}
         quats = {k: (v["qx"], v["qy"], v["qz"], v["qw"]) for k, v in poses.items()
-                 if k.startswith("book_") and {"qx", "qy", "qz", "qw"} <= set(v)}
-        if quats:
-            self.book_quats = quats
-        for name, q in quats.items():
-            if name in books and name not in self.initial:
-                self.initial[name] = (books[name], q)
+                 if k.startswith("book_col_") and {"qx", "qy", "qz", "qw"} <= set(v)}
         robot = poses.get("tiago_pro")
+        robot_pose = None
         if robot and {"px", "py", "pz", "qx", "qy", "qz", "qw"} <= set(robot):
-            yaw = math.atan2(
-                2.0 * (robot["qw"] * robot["qz"] + robot["qx"] * robot["qy"]),
-                1.0 - 2.0 * (robot["qy"] ** 2 + robot["qz"] ** 2))
-            self.robot_pose = (robot["px"], robot["py"], robot["pz"], yaw)
+            robot_pose = ((robot["px"], robot["py"], robot["pz"]),
+                          (robot["qx"], robot["qy"], robot["qz"], robot["qw"]))
+        with self.pose_lock:
+            self._store_poses(books, quats, robot_pose)
 
     def _grasp_link_world(self):
         """Where the grasping link is, in world coordinates, and the base heading.
@@ -425,6 +491,16 @@ class GraspFix(Node):
         y = link_position[1] + shift[1]
         z = link_position[2] + shift[2]
         q = quat_mul(link_quat, self.rel_quat)
+        if self.gz_node is not None:
+            request = Pose()
+            request.name = self.held
+            request.position.x, request.position.y, request.position.z = x, y, z
+            (request.orientation.x, request.orientation.y,
+             request.orientation.z, request.orientation.w) = q
+            # A short timeout: the reply is often late, and a late reply does not mean the
+            # pose was not set. Waiting for it held 20 Hz down to 4 in tools/holdprobe.py.
+            self.gz_node.request("/world/%s/set_pose" % self.world, request, Pose, Boolean, 8)
+            return
         gz("service", "-s", "/world/%s/set_pose" % self.world,
            "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean",
            "--timeout", "800",

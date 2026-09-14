@@ -87,10 +87,14 @@ CARRY_CLOSING = [0.0, 1.0, 0.0]
 # The jaws, from grasp_node's measured span curve: span = 0.0271 + 0.8146 * joint.
 GRIPPER_RELEASE = 0.052
 
-# A book is 250 mm tall and is gripped 45 mm below its centre, so it hangs this far
-# below the gripper and stands this far above it.
-BOOK_BELOW_GRIP = 0.125 - 0.045
-BOOK_ABOVE_GRIP = 0.125 + 0.045
+# A book is 250 mm tall. The grasp aims 45 mm below its centre, but the pads close about
+# 25 mm above that aim (every clamp report: "+21", "+24", "+25 in height"), so it hangs
+# 105 mm below the gripper, not 80. In simulation it also sags between the grasp aid's
+# teleports: 40 mm is allowed for that. The laptop run of 2026-09-14 (marker 2, blue)
+# carried its book across into the bin's wall with the old 80 mm, and it landed on the
+# table beside the bin.
+BOOK_BELOW_GRIP = 0.125 - 0.020 + 0.040
+BOOK_ABOVE_GRIP = 0.125 + 0.020
 
 # How far past the bin's face to put the book down.
 #
