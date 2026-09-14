@@ -83,8 +83,8 @@ BASE_LINK_Z = 0.0762
 # 0.000 shut to 0.069 open, so this sits well clear of both.
 CLOSING_BELOW = 0.020
 OPENING_ABOVE = 0.040
-# A book counts as standing while its up axis is within 20 degrees of vertical.
-UPRIGHT = math.cos(math.radians(20.0))
+# A book this far from where it was first seen has been disturbed.
+MOVED_M = 0.03
 
 
 def gz(*args, timeout=15):
@@ -132,7 +132,7 @@ class GraspFix(Node):
         self.book_quats = {}
         self.rel_quat = None        # the book's orientation in the gripper's frame, at pick-up
         self.books = {}
-        self.upright = {}           # each book's last pose standing up: (position, quaternion)
+        self.initial = {}           # each book's pose when first seen: (position, quaternion)
         self.robot_pose = None
         self.attach_asked = False
 
@@ -224,9 +224,8 @@ class GraspFix(Node):
         if quats:
             self.book_quats = quats
         for name, q in quats.items():
-            standing = 1.0 - 2.0 * (q[0] ** 2 + q[1] ** 2) > UPRIGHT
-            if name in books and name != self.held and standing:
-                self.upright[name] = (books[name], q)
+            if name in books and name not in self.initial:
+                self.initial[name] = (books[name], q)
         robot = poses.get("tiago_pro")
         if robot and {"px", "py", "pz", "qx", "qy", "qz", "qw"} <= set(robot):
             yaw = math.atan2(
@@ -348,17 +347,21 @@ class GraspFix(Node):
             # that book lying flat on the shelf -- centre 110 mm lower and 144 mm to the
             # side -- and refused a grasp whose gripper was 20 mm from where the book had
             # stood. The simulator's position-driven fingers tip a book with the lightest
-            # touch; the real ones do not. So a book that stood within reach and is now
-            # lying down is the one that was being taken, and it is taken as it stood.
-            fallen = [(math.dist(here, stood[0]), name)
-                      for name, stood in self.upright.items()
-                      if name in self.book_quats
-                      and 1.0 - 2.0 * (self.book_quats[name][0] ** 2
-                                       + self.book_quats[name][1] ** 2) <= UPRIGHT]
-            fallen = [entry for entry in fallen if entry[0] <= self.reach]
-            if fallen:
-                best_gap, best = min(fallen)
-                book, book_quat = self.upright[best]
+            # touch; the real ones do not. So a book that stood within reach and has since
+            # moved is the one that was being taken, and it is taken as it stood.
+            #
+            # "Stood" is the pose it was first seen in, not an orientation test: the books
+            # are spawned turned so that their own z axis is horizontal, standing or fallen,
+            # and a test on it never counted any book as standing (the next laptop run,
+            # same day, refused a knocked-over book 188 mm away with this in place).
+            moved = [(math.dist(here, start[0]), name)
+                     for name, start in self.initial.items()
+                     if name in self.books
+                     and math.dist(self.books[name], start[0]) > MOVED_M]
+            moved = [entry for entry in moved if entry[0] <= self.reach]
+            if moved:
+                best_gap, best = min(moved)
+                book, book_quat = self.initial[best]
                 knocked = ", knocked over as the jaws came in and taken as it stood"
         if best_gap > self.reach:
             # Show the working, not just the verdict.
