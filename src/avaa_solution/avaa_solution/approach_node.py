@@ -156,6 +156,22 @@ DEFAULT_ROW_HEIGHTS = list(arena.ROW_HEIGHTS_BASE)
 # outside that.
 SELF_FILTER_RADIUS = 0.45
 
+# Close enough to the acquire pose to hand over to the final drive, which strafes out
+# a sideways offset at up to max_lateral without turning. The pose controller cannot:
+# a goal 80 mm to the side and nothing ahead is a bearing of 90 degrees, and on the
+# laptop run of 2026-09-14 (marker 3, green, row 4) chasing it swung the base far enough
+# to lose the book, latch on to another column's and reverse 1.8 m away from the shelf.
+ACQUIRE_AHEAD_OK = 0.10
+ACQUIRE_ACROSS_OK = 0.15
+
+
+def acquire_arrived(ahead: float, across: float, tolerance: float) -> bool:
+    """Say whether the acquire pose is reached, leaving small sideways errors to the strafe."""
+    if math.hypot(ahead, across) <= tolerance:
+        return True
+    return abs(ahead) <= ACQUIRE_AHEAD_OK and abs(across) <= ACQUIRE_ACROSS_OK
+
+
 # How far the book faces sit BEHIND the shelf's own front edge.
 #
 # Measured from the supplied mesh rather than assumed: erc_base_shelf.STL spans 0.35 m
@@ -1878,7 +1894,7 @@ class ApproachNode(Node):
         self.nofix_since = None
         gx, gy = goal
         rho = math.hypot(gx, gy)
-        if rho > self.acquire_pose_tol:
+        if not acquire_arrived(gx, gy, self.acquire_pose_tol):
             ahead = self._min_range_ahead()
             if gx > 0 and ahead is not None and ahead < self.min_safe:
                 self.get_logger().warn(
