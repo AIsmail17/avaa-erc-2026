@@ -83,6 +83,8 @@ BASE_LINK_Z = 0.0762
 # 0.000 shut to 0.069 open, so this sits well clear of both.
 CLOSING_BELOW = 0.020
 OPENING_ABOVE = 0.040
+# A book counts as standing while its up axis is within 20 degrees of vertical.
+UPRIGHT = math.cos(math.radians(20.0))
 
 
 def gz(*args, timeout=15):
@@ -130,6 +132,7 @@ class GraspFix(Node):
         self.book_quats = {}
         self.rel_quat = None        # the book's orientation in the gripper's frame, at pick-up
         self.books = {}
+        self.upright = {}           # each book's last pose standing up: (position, quaternion)
         self.robot_pose = None
         self.attach_asked = False
 
@@ -220,6 +223,10 @@ class GraspFix(Node):
                  if k.startswith("book_") and {"qx", "qy", "qz", "qw"} <= set(v)}
         if quats:
             self.book_quats = quats
+        for name, q in quats.items():
+            standing = 1.0 - 2.0 * (q[0] ** 2 + q[1] ** 2) > UPRIGHT
+            if name in books and name != self.held and standing:
+                self.upright[name] = (books[name], q)
         robot = poses.get("tiago_pro")
         if robot and {"px", "py", "pz", "qx", "qy", "qz", "qw"} <= set(robot):
             yaw = math.atan2(
@@ -330,6 +337,29 @@ class GraspFix(Node):
                 "jaws closed and no book poses are known, so nothing can be picked up")
             self.attach_asked = False
             return
+        book = self.books[best]
+        book_quat = self.book_quats.get(best)
+        knocked = ""
+        if best_gap > self.reach:
+            # The book the jaws were closing on may have been knocked over on the way in.
+            #
+            # On the laptop run of 2026-09-14 the grasp controller put its pads 3 mm off
+            # the centre line of the green book and clamped; this node, 0.1 s later, found
+            # that book lying flat on the shelf -- centre 110 mm lower and 144 mm to the
+            # side -- and refused a grasp whose gripper was 20 mm from where the book had
+            # stood. The simulator's position-driven fingers tip a book with the lightest
+            # touch; the real ones do not. So a book that stood within reach and is now
+            # lying down is the one that was being taken, and it is taken as it stood.
+            fallen = [(math.dist(here, stood[0]), name)
+                      for name, stood in self.upright.items()
+                      if name in self.book_quats
+                      and 1.0 - 2.0 * (self.book_quats[name][0] ** 2
+                                       + self.book_quats[name][1] ** 2) <= UPRIGHT]
+            fallen = [entry for entry in fallen if entry[0] <= self.reach]
+            if fallen:
+                best_gap, best = min(fallen)
+                book, book_quat = self.upright[best]
+                knocked = ", knocked over as the jaws came in and taken as it stood"
         if best_gap > self.reach:
             # Show the working, not just the verdict.
             #
@@ -365,9 +395,7 @@ class GraspFix(Node):
         # 28 s into the stow after a grasp (ODE INTERNAL ERROR 1: assertion
         # d[i] != dReal(0.0) failed), most likely from the book being teleported through
         # the arm as it folded.
-        book = self.books[best]
         link_position, link_quat = self._grasp_link_world_pose()
-        book_quat = self.book_quats.get(best)
         if link_position is None or book_quat is None:
             self.get_logger().warn(
                 "no full pose for %s or %s, so it is not picked up" % (GRASP_LINK, best))
@@ -380,7 +408,7 @@ class GraspFix(Node):
         self.rel_quat = quat_mul(inverse, book_quat)
         self.held = best
         self.get_logger().info(
-            "picked up %s, %.0f mm from the grasping link" % (best, best_gap * 1000))
+            "picked up %s, %.0f mm from the grasping link%s" % (best, best_gap * 1000, knocked))
 
     def _follow(self):
         """Keep the held book in the hand, placed and turned as it was picked up. Worker only."""

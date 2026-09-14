@@ -115,6 +115,12 @@ RELEASE_LEFT_M = 0.25
 RELEASE_RIGHT_M = 0.10
 RELEASE_MIN_PAST_FACE_M = 0.10
 
+# Blocked while squaring up on the table: back off this long at this speed (about 0.3 m),
+# measure the legs again, and try again, at most this many times before failing.
+TABLE_BACKOFFS = 2
+TABLE_BACKOFF_SEC = 2.5
+TABLE_BACKOFF_SPEED = 0.12
+
 # The front laser as mounted: base_front_laser_joint puts it at the base's front-right
 # corner, rolled half a turn and turned 45 degrees to the right. See scan_points_in_base.
 FRONT_LASER_XY = (0.27512, -0.18297)
@@ -306,6 +312,8 @@ class DeliverNode(Node):
         # The bin as the table's legs place it, while squaring up. See _do_table.
         self.table_centre = None
         self.table_seen_at = None
+        self.table_backoffs = 0
+        self.table_backing_until = None
         self.table_rim = None
         self.table_arrived = False
         self.hold_last = None
@@ -940,6 +948,15 @@ class DeliverNode(Node):
         the normal, and places the book at the centre: straight ahead, square to the table,
         with the legs out beside the base. Anything in the base's path still stops it.
         """
+        if self.table_backing_until is not None:
+            if self._now() < self.table_backing_until:
+                command = Twist()
+                command.linear.x = -TABLE_BACKOFF_SPEED
+                self.pub_cmd.publish(command)
+                self.last_drive_cmd = (command.linear.x, 0.0)
+                return
+            self.table_backing_until = None
+            self._stop()
         # Which legs are the bin's is asked of perception whenever it can see the bin, and
         # of the last answer only when it cannot. Asking only the last answer let one bad
         # pairing stand: the twenty-first full run's estimate moved 0.33 m sideways in two
@@ -996,10 +1013,23 @@ class DeliverNode(Node):
             if abs(toward) <= self.turn_in_place_rad:
                 if ahead is not None and ahead < self.obstacle_stop:
                     self._stop()
-                    self.get_logger().error(
+                    if self.table_backoffs >= TABLE_BACKOFFS:
+                        self.get_logger().error(
+                            "something is %.2f m ahead of the bumper while squaring up on "
+                            "the table, after backing off %d times"
+                            % (ahead, self.table_backoffs))
+                        self._enter(State.FAILED)
+                        return
+                    # Back off and look again rather than give up with the book in hand:
+                    # the legs are measured afresh from further out, and the pair chosen
+                    # can change.
+                    self.table_backoffs += 1
+                    self.table_backing_until = self._now() + TABLE_BACKOFF_SEC
+                    self.table_arrived = False
+                    self.get_logger().warn(
                         "something is %.2f m ahead of the bumper while squaring up on the "
-                        "table" % ahead)
-                    self._enter(State.FAILED)
+                        "table; backing off and trying again (%d of %d)"
+                        % (ahead, self.table_backoffs, TABLE_BACKOFFS))
                     return
                 speed = float(np.clip(0.6 * distance, 0.05, self.drive_speed))
                 command.linear.x = speed * max(0.0, math.cos(toward))

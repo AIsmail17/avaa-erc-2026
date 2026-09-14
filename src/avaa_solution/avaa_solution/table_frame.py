@@ -75,6 +75,12 @@ def bin_from_legs(legs, near=None, near_limit=0.6):
     pointing into it and away from the robot. ``near`` -- perception's sighting of the bin --
     rules out any pair that would put the bin further than ``near_limit`` from it, so a pair
     made of a leg and something else that happens to stand 1.33 m away is not believed.
+
+    A pair along the table is preferred to a nearer pair across its end. Squaring up on an
+    end pair puts the standoff only 0.16 m outside those legs, facing down the table's length
+    with a leg beside each corner of the base: on the laptop run of 2026-09-14 the robot
+    switched to the end pair while turning near the table's corner and drove its bumper to
+    0.10 m of a leg. From the long side the standoff is 0.48 m clear of the legs.
     """
     best = None
     for i in range(len(legs)):
@@ -82,9 +88,9 @@ def bin_from_legs(legs, near=None, near_limit=0.6):
             a, b = legs[i], legs[j]
             spacing = math.hypot(b[0] - a[0], b[1] - a[1])
             if abs(spacing - LEG_PAIR_LONG) <= PAIR_TOLERANCE:
-                behind = BIN_BEHIND_LONG_PAIR
+                behind, rank = BIN_BEHIND_LONG_PAIR, 0
             elif abs(spacing - LEG_PAIR_SHORT) <= PAIR_TOLERANCE:
-                behind = BIN_BEHIND_SHORT_PAIR
+                behind, rank = BIN_BEHIND_SHORT_PAIR, 1
             else:
                 continue
             mid = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
@@ -96,8 +102,8 @@ def bin_from_legs(legs, near=None, near_limit=0.6):
                                                centre[1] - near[1]) > near_limit:
                 continue
             reach = math.hypot(mid[0], mid[1])
-            if best is None or reach < best[0]:
-                best = (reach, centre, (nx, ny))
+            if best is None or (rank, reach) < best[0]:
+                best = ((rank, reach), centre, (nx, ny))
     if best is None:
         return None
     return best[1], best[2]

@@ -46,6 +46,18 @@ def test_square_on_the_bin_is_straight_ahead_behind_the_legs():
     assert normal == pytest.approx((1.0, 0.0))
 
 
+def test_a_pair_along_the_table_is_preferred_to_a_nearer_end_pair():
+    # The laptop run of 2026-09-14, near the table's corner: the end pair [0.8, 0.27] and
+    # [1.5, 0.08] was nearer than the long side's, and squaring on it ran into a leg.
+    end = [(0.8, 0.27), (1.5, 0.08)]
+    long_side = [(1.5, 0.08), (1.86, 1.36)]
+    centre, normal = bin_from_legs(end + long_side[1:])
+    along = math.hypot(long_side[1][0] - long_side[0][0], long_side[1][1] - long_side[0][1])
+    assert along == pytest.approx(1.33, abs=0.02)
+    mid = ((long_side[0][0] + long_side[1][0]) / 2, (long_side[0][1] + long_side[1][1]) / 2)
+    assert math.hypot(centre[0] - mid[0], centre[1] - mid[1]) == pytest.approx(0.342, abs=1e-6)
+
+
 def test_a_pair_that_disagrees_with_the_sighting_is_not_believed():
     # Two things 1.33 m apart but nowhere near where perception sees the bin.
     assert bin_from_legs([(1.2, 0.665), (1.2, -0.665)], near=(3.0, 2.0)) is None
