@@ -439,17 +439,29 @@ class GraspFix(Node):
             # whose frame is only world-aligned if the robot spawned at yaw zero, and
             # reported 667 mm with the jaws closed around a book.
             book = self.books.get(best)
+            # And where the nearby books started. Laptop trial 6 on 2026-09-14 missed a
+            # row 1 book by 131 mm, and with only its current pose there was no telling
+            # whether perception had aimed wrong or the reach had pushed the book aside.
+            started = []
+            for name, start in sorted(self.initial.items()):
+                if name in self.books and math.dist(here, start[0]) < 0.35:
+                    s, now = start[0], self.books[name]
+                    started.append("    %s started at (%.3f, %.3f, %.3f), %.0f mm from "
+                                   "the gripper, and has moved %.0f mm"
+                                   % (name, s[0], s[1], s[2], math.dist(here, s) * 1000,
+                                      math.dist(s, now) * 1000))
             self.get_logger().info(
                 "jaws closed with the nearest book (%s) %.0f mm away, further than the "
                 "%.0f mm this will hold from. Letting the grasp fail honestly.\n"
                 "    gripper composed at (%.3f, %.3f, %.3f), base yaw %+.1f deg\n"
                 "    base at (%.3f, %.3f, %.3f), %d book poses known\n"
-                "    %s at (%.3f, %.3f, %.3f)"
+                "    %s at (%.3f, %.3f, %.3f)%s"
                 % (best, best_gap * 1000, self.reach * 1000,
                    here[0], here[1], here[2], math.degrees(yaw),
                    self.robot_pose[0], self.robot_pose[1], self.robot_pose[2],
                    len(self.books),
-                   best, book[0], book[1], book[2]))
+                   best, book[0], book[1], book[2],
+                   "".join("\n" + line for line in started)))
             # Ready for the next clamp. This is a verdict on one close, not on the run.
             self.attach_asked = False
             return
