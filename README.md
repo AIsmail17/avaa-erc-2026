@@ -1,3 +1,89 @@
+# Team AVAA — ERC 2026 Phase 1 solution
+
+This is the organisers' `erc_sim_2026` workspace with Team AVAA's solution added. Our code is
+the **`avaa_solution`** package in [`src/avaa_solution`](src/avaa_solution). The organisers'
+original README follows after the line further down.
+
+**Team AVAA**, University of Wollongong in Dubai. The robot finds the book of a given colour
+under a given shelf column marker, takes it off the shelf and places it in the collection bin,
+with no manual intervention.
+
+## Build and run
+
+```bash
+# Host terminal, in the repository root
+./docker/up.sh --build
+./docker/attach.sh
+
+# Inside the container
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch erc_bringup simulation.launch.py
+
+# A second terminal: ./docker/attach.sh, then source install/setup.bash
+ros2 launch avaa_solution solution.launch.py shelf_column_number:=3 book_colour:=red
+```
+
+| Launch argument | Values | Meaning |
+|---|---|---|
+| `shelf_column_number` | `1`–`5` | Digit on the overhead marker of the target column (markers are shuffled every load) |
+| `book_colour` | `red`, `blue`, `green`, `yellow` | Colour of the target book (its row is found by the camera) |
+| `save_images` | `true` (default), `false` | Save the annotated identification images |
+| `rviz` | `false` (default), `true` | Open RViz with the planned and executed navigation paths |
+
+The mission node logs the trial time at every phase, the moment a book touches the bin
+(`/bin_contacts`), and `phase deliver -> done` when the arm is folded and the robot is still.
+
+## The `avaa_solution` package
+
+Perception, planning and execution run as separate nodes. The mission node alone decides
+when each controller may act (`/avaa/mission/phase`) and alone publishes the scoring topics.
+
+| Node (executable) | Role | Main interfaces |
+|---|---|---|
+| `avaa_mission` (`mission`) | Trial state machine: approach → grasp → deliver; trial clock; publishes the identifications as soon as they are confirmed | pub `/erc/shelf_column_identification`, `/erc/shelf_row_identification`, `/avaa/mission/phase`; sub `/bin_contacts` |
+| `avaa_perception` (`perception`) | Reads the marker digits (template matching against the simulator's own digit textures), finds books by HSV colour and shape, locates the target book and the bin from depth, saves annotated images | sub head camera RGB + depth; pub `/avaa/perception/*` |
+| `avaa_approach` (`approach`) | Tucks the arms, searches for the marker, centres on the column, drives in on the camera, squares up to the shelf | pub `/cmd_vel`, head, torso, arms, `/avaa/approach/state` |
+| `avaa_grasp` (`grasp`) | Analytic IK picks the arm posture, MoveIt plans collision-free motion, a 5 Hz servo closes the last centimetres, then clamp, lift, withdraw and stow | MoveIt `move_group`, left arm, torso, gripper, `/avaa/grasp/state` |
+| `avaa_deliver` (`deliver`) | Turns to find the bin, drives to it on the camera, squares up on the table legs (LiDAR), lowers the book into the bin, releases, folds the arm | pub `/cmd_vel`, left arm, gripper, `/avaa/deliver/state` |
+| `avaa_path_recorder` (`path_recorder`) | Only with `rviz:=true`: planned and executed paths for RViz (`rviz/nav_paths.rviz`) | pub `/avaa/nav/*` |
+
+Every controller checks its own progress and recovers where it can: the approach backs off
+and re-acquires (twice) when it loses the book, delivery backs off and retries when blocked,
+the grasp re-plans, and the mission refuses to deliver when the grasp reports failure.
+
+| Module | Purpose |
+|---|---|
+| `vision/marker_reader.py`, `vision/book_detector.py`, `vision/depth_locator.py`, `vision/shelf_plane.py` | Pure OpenCV/numpy, no ROS, unit tested on synthetic frames |
+| `kinematics/arm_chain.py` | Forward and inverse kinematics of the left arm and torso, from the URDF |
+| `moveit_client.py` | Small synchronous client for `move_group` (Humble has no MoveIt Python API) |
+| `table_frame.py`, `arena.py` | Bin position from the table legs; frame and height constants |
+| `moveit/`, `launch/moveit.launch.py` | SRDF and MoveIt configuration for TIAGo Pro (the image ships none) |
+| `config/gui.config` | Gazebo window layout used for our video (optional: `gz sim -g --gui-config ...`) |
+| `test/` | Unit tests, no simulator needed: `cd /opt/erc_ws/src/avaa_solution && python3 -m pytest -q test` |
+
+## Annotated images (`erc_images/`)
+
+During the trial `avaa_perception` saves images from the live camera, each with the UTC
+timestamp in the filename and burned into the picture:
+
+- `column_<marker>_<time>.png`: box around the target column's marker
+- `row_<row>_<colour>_<time>.png`: box around the target book
+
+They are written to `src/avaa_solution/erc_images/`, because the stock `docker-compose.yml`
+mounts only `src/` into the container. `erc_images` at the repository root links to that
+folder. The images saved during the run in our video are committed there.
+
+## Changes to the organisers' packages
+
+| Files | Change | Why |
+|---|---|---|
+| `src/erc_bringup/scripts/sim_grasp_fix.py` (new), `src/erc_bringup/launch/simulation.launch.py` | **Simulation grasp aid, on by default** (`ERC_GRASP_FIX=0` turns it off) | The simulated gripper is position-controlled through passive mimic joints, so it cannot squeeze a book and a correctly placed grasp slips. When the jaws close within 90 mm of a book (or of where a book knocked over by the fingers stood), the aid moves that book with the gripper until the jaws open. It never moves the robot and never places a book, so a grasp that misses still fails. Not used on the real robot. |
+| `src/erc_bringup/config/gazebo_controller_manager_cfg.yaml`, `src/gz_ros2_control/.../gz_ros2_control_plugin.cpp` | Arm position controller gain 0.1 → 5.0, and the plugin now reads its parameter file | At 0.1 the arm crawled and never reached its goals. Joint limits and effort ratings are unchanged. |
+| `src/erc_bringup/config/cyclonedds.xml` (new), `docker/docker-compose.yml`, `docker/up.sh` | 32 MB DDS receive buffers | One camera frame is 691 KB; with default buffers camera frames were dropped |
+
+---
+
 # Emirates Robotics Competition 2026
 
 Library Assistant Robot challenge: Autonomous book retrieval using a TIAGo Pro mobile manipulator.

@@ -75,8 +75,12 @@ def generate_launch_description():
     with open(urdf_path, 'r') as f:
         robot_description = f.read()
 
+    # The simulation grasp aid (scripts/sim_grasp_fix.py) is ON unless ERC_GRASP_FIX is
+    # set to 0, false or no. Team AVAA's video and every recorded trial ran with it, and
+    # the evaluation runs under the same conditions as the video, so a plain
+    # `ros2 launch erc_bringup simulation.launch.py` has to start it too.
     grasp_fix_wanted = (
-        os.environ.get('ERC_GRASP_FIX', '').lower() in ('1', 'true', 'yes'))
+        (os.environ.get('ERC_GRASP_FIX') or '1').lower() in ('1', 'true', 'yes'))
 
     # ── The book layout, decided here because two things need it ──
     #

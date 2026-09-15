@@ -27,6 +27,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
                             LogInfo)
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -65,6 +66,16 @@ def generate_launch_description() -> LaunchDescription:
         description=(
             "Write timestamped annotated frames to erc_images/ during the trial. "
             "Leave on for scored runs; the images are worth +2 per identification."
+        ),
+    )
+
+    rviz = LaunchConfiguration("rviz")
+    declare_rviz = DeclareLaunchArgument(
+        "rviz",
+        default_value="false",
+        description=(
+            "Open RViz with the planned and executed navigation paths. Off for scored "
+            "runs; it only watches, and the robot behaves the same either way."
         ),
     )
 
@@ -154,10 +165,36 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[sim_time, {"start_phase": "deliver"}],
     )
 
+    # Visualisation only, with rviz:=true: the path recorder publishes the planned and
+    # executed paths, and RViz draws them over the LiDAR scans in the odom frame.
+    path_recorder = Node(
+        package="avaa_solution",
+        executable="path_recorder",
+        name="avaa_path_recorder",
+        output="screen",
+        emulate_tty=True,
+        parameters=[sim_time],
+        condition=IfCondition(rviz),
+    )
+
+    rviz_node = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="avaa_rviz",
+        arguments=["-d", os.path.join(
+            get_package_share_directory("avaa_solution"), "rviz", "nav_paths.rviz")],
+        parameters=[sim_time],
+        output="log",
+        condition=IfCondition(rviz),
+    )
+
     return LaunchDescription([
         declare_column,
         declare_colour,
         declare_save_images,
+        declare_rviz,
+        path_recorder,
+        rviz_node,
         LogInfo(msg=[
             "[AVAA] target column marker=", shelf_column_number,
             "  book colour=", book_colour,

@@ -1,8 +1,9 @@
 """Fine approach — close the last stretch to the target column.
 
-Nav2 gets the robot to within about 0.3 m of a goal and then stops dead, so it is used for
-gross navigation only (see config/nav2_params.yaml). This node closes the remainder using
-the camera and the front LiDAR, which is what mobile manipulation needs anyway: the arm has
+There is no map and no global planner: the start pose is not guaranteed, and wheel odometry
+cannot see the base sliding (see deliver_node.py). Nav2 was tried and stops about 0.3 m short
+of a goal. This node closes the whole distance on the camera and the front LiDAR instead,
+which is what mobile manipulation needs anyway: the arm has
 to be placed relative to the book, not to an odometry coordinate that was only ever an
 estimate of where the book is.
 

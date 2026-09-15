@@ -11,17 +11,38 @@
   <maintainer email="psych.rest@gmail.com">Team AVAA</maintainer>
   <license>Apache-2.0</license>
 
+  <!-- ROS 2 client library and message packages imported by the nodes -->
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>shape_msgs</exec_depend>
   <exec_depend>vision_msgs</exec_depend>
+  <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>ros_gz_interfaces</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
+
+  <!-- Python libraries -->
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <!-- Launch: solution.launch.py starts move_group with the MoveIt config in moveit/ -->
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>moveit_ros_move_group</exec_depend>
+  <exec_depend>moveit_kinematics</exec_depend>
+  <exec_depend>moveit_planners_ompl</exec_depend>
+  <exec_depend>moveit_simple_controller_manager</exec_depend>
+
+  <!-- Only with rviz:=true, to view the planned and executed paths -->
+  <exec_depend>rviz2</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

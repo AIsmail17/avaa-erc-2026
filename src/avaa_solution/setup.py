@@ -22,6 +22,8 @@ setup(
         # with it. move_group reads these from the share directory at launch.
         (os.path.join("share", package_name, "moveit"),
          glob("moveit/*.srdf") + glob("moveit/*.yaml")),
+        # RViz layout for rviz:=true: planned against executed paths.
+        (os.path.join("share", package_name, "rviz"), glob("rviz/*.rviz")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -37,6 +39,7 @@ setup(
             "grasp = avaa_solution.grasp_node:main",
             "perception = avaa_solution.perception_node:main",
             "deliver = avaa_solution.deliver_node:main",
+            "path_recorder = avaa_solution.path_recorder_node:main",
         ],
     },
 )
